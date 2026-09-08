@@ -202,3 +202,13 @@ test('Windows popup shortcuts use the new defaults and safely migrate only the c
   assert.match(popupActions, /props\.canSubmit && !props\.submitting[\s\S]*?handleGoalSubmit\(\)/)
   assert.match(popupActions, /!props\.submitting[\s\S]*?handleContinue\(\)/)
 })
+
+test('Windows prevent-sleep uses SetThreadExecutionState on a dedicated guard thread', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const cargo = source('Cargo.toml')
+  assert.match(cargo, /"Win32_System_Power"/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\][\s\S]*?WindowsPreventSleepGuard/)
+  assert.match(commands, /SetThreadExecutionState\(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED\)/)
+  assert.match(commands, /name\("iterate-prevent-sleep"\.to_string\(\)\)/)
+  assert.match(commands, /SetThreadExecutionState\(ES_CONTINUOUS\)/)
+})

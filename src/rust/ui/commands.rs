@@ -4083,12 +4083,25 @@ pub async fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
 // ============ 防止睡眠功能 ============
 
 use once_cell::sync::Lazy;
+#[cfg(not(target_os = "windows"))]
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
 /// 存储 caffeinate 进程
+#[cfg(not(target_os = "windows"))]
 static CAFFEINATE_PROCESS: Lazy<Mutex<Option<Child>>> = Lazy::new(|| Mutex::new(None));
 
+#[cfg(target_os = "windows")]
+struct WindowsPreventSleepGuard {
+    stop_tx: std::sync::mpsc::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "windows")]
+static WINDOWS_PREVENT_SLEEP_GUARD: Lazy<Mutex<Option<WindowsPreventSleepGuard>>> =
+    Lazy::new(|| Mutex::new(None));
+
+#[cfg(not(target_os = "windows"))]
 fn reconcile_prevent_sleep_process(process_guard: &mut Option<Child>) -> bool {
     let Some(child) = process_guard.as_mut() else {
         return false;
@@ -4112,6 +4125,7 @@ fn reconcile_prevent_sleep_process(process_guard: &mut Option<Child>) -> bool {
 }
 
 /// 在当前进程开启合盖运行。仅供持有 8080 的 bridge 进程调用。
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn enable_prevent_sleep_local() -> Result<bool, String> {
     let mut process_guard = CAFFEINATE_PROCESS.lock().map_err(|e| e.to_string())?;
 
@@ -4137,7 +4151,62 @@ pub(crate) fn enable_prevent_sleep_local() -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn enable_prevent_sleep_local() -> Result<bool, String> {
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+    };
+
+    let mut guard = WINDOWS_PREVENT_SLEEP_GUARD
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if let Some(existing) = guard.as_ref() {
+        if !existing.join.is_finished() {
+            return Ok(true);
+        }
+    }
+    if let Some(stale) = guard.take() {
+        let _ = stale.join.join();
+    }
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    let join = std::thread::Builder::new()
+        .name("iterate-prevent-sleep".to_string())
+        .spawn(move || {
+            let previous = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+            if previous == 0 {
+                let _ = ready_tx.send(Err("SetThreadExecutionState 启用失败".to_string()));
+                return;
+            }
+            let _ = ready_tx.send(Ok(()));
+            let _ = stop_rx.recv();
+            unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS);
+            }
+        })
+        .map_err(|e| format!("启动 Windows 防睡眠线程失败: {}", e))?;
+
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(())) => {
+            *guard = Some(WindowsPreventSleepGuard { stop_tx, join });
+            log::info!("[PreventSleep] 已开启 Windows 系统防睡眠");
+            Ok(true)
+        }
+        Ok(Err(error)) => {
+            let _ = join.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = stop_tx.send(());
+            let _ = join.join();
+            Err(format!("等待 Windows 防睡眠线程启动超时: {}", error))
+        }
+    }
+}
+
 /// 在当前进程关闭合盖运行。仅供持有 8080 的 bridge 进程调用。
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn disable_prevent_sleep_local() -> Result<bool, String> {
     let mut process_guard = CAFFEINATE_PROCESS.lock().map_err(|e| e.to_string())?;
 
@@ -4147,6 +4216,20 @@ pub(crate) fn disable_prevent_sleep_local() -> Result<bool, String> {
     }
 
     log::info!("[PreventSleep] 已关闭合盖运行模式");
+    Ok(false)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn disable_prevent_sleep_local() -> Result<bool, String> {
+    let guard = WINDOWS_PREVENT_SLEEP_GUARD
+        .lock()
+        .map_err(|e| e.to_string())?
+        .take();
+    if let Some(guard) = guard {
+        let _ = guard.stop_tx.send(());
+        let _ = guard.join.join();
+    }
+    log::info!("[PreventSleep] 已关闭 Windows 系统防睡眠");
     Ok(false)
 }
 
@@ -4160,11 +4243,29 @@ pub(crate) fn toggle_prevent_sleep_local() -> Result<bool, String> {
 }
 
 /// 获取当前 bridge 进程持有的合盖运行状态。
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn get_prevent_sleep_status_local() -> bool {
     let Ok(mut process_guard) = CAFFEINATE_PROCESS.lock() else {
         return false;
     };
     reconcile_prevent_sleep_process(&mut process_guard)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn get_prevent_sleep_status_local() -> bool {
+    let Ok(mut guard) = WINDOWS_PREVENT_SLEEP_GUARD.lock() else {
+        return false;
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|entry| !entry.join.is_finished())
+    {
+        return true;
+    }
+    if let Some(stale) = guard.take() {
+        let _ = stale.join.join();
+    }
+    false
 }
 
 #[derive(Debug, Deserialize)]
