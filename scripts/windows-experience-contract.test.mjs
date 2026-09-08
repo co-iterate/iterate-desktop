@@ -135,7 +135,7 @@ test('explicit conversation end is exact and is normalized at the response bound
   )
 })
 
-test('popup close ends only the current interaction while the native titlebar still exits', () => {
+test('Windows native titlebar delegates interaction close and guards idle exit', () => {
   const header = source('src/frontend/components/popup/PopupHeader.vue')
   const content = source('src/frontend/components/AppContent.vue')
   const app = source('src/frontend/App.vue')
@@ -148,7 +148,10 @@ test('popup close ends only the current interaction while the native titlebar st
   assert.match(handler, /handleMcpCloseCurrentDialog/)
   assert.match(handler, /source: 'popup_closed'/)
   assert.match(handler, /resolvingRequestIds/)
-  assert.match(windowEvents, /handle_system_exit_request[\s\S]*?true/)
+  assert.match(handler, /nativeWindowCloseAction\(!!mcpRequest.value, resolvingRequestIds.size > 0, event.payload\)/)
+  assert.match(windowEvents, /native-mcp-close-requested/)
+  assert.match(windowEvents, /pub async fn close_idle_windows_window/)
+  assert.match(windowEvents, /is_standalone_mcp_interaction\(\) \|\| has_pending_resident_mcp_request\(&app\)/)
 })
 
 test('Windows bundle uses a current-user NSIS installer', () => {

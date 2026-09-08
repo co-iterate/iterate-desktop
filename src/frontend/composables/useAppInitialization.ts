@@ -44,6 +44,11 @@ export function useAppInitialization(mcpHandler: ReturnType<typeof import('./use
       // 检查是否为首次启动
       const isFirstRun = checkFirstRun()
 
+      const windowsPlatform = navigator.platform.toUpperCase().includes('WIN')
+      // Windows shell 保持隐藏，直到请求已接管、关闭监听器就绪且 popup 完成定位。
+      if (windowsPlatform)
+        await setupMcpEventListener()
+
       // MCP 弹窗必须优先确认 ready，避免被字体/窗口等非关键初始化拖到白屏超时。
       const { isMcp, mcpContent } = await checkMcpMode()
 
@@ -80,7 +85,8 @@ export function useAppInitialization(mcpHandler: ReturnType<typeof import('./use
       // 初始化MCP工具配置（在非MCP模式下）
       if (!isMcp) {
         await initMcpTools()
-        await setupMcpEventListener()
+        if (!windowsPlatform)
+          await setupMcpEventListener()
       }
 
       // 如果是首次启动，标记已初始化（主题已在上面加载过）

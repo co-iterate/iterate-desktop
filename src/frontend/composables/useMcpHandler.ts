@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ref } from 'vue'
 import { clearActiveMcpFatalContext, setActiveMcpFatalContext } from '../utils/mcpFatalError'
+import { nativeWindowCloseAction } from '../utils/nativeWindowClose'
 import { useNotification } from './useNotification'
 
 const MUTE_STORAGE_KEY = 'iterate.muted'
@@ -313,6 +314,7 @@ export function useMcpHandler() {
   const showMcpPopup = ref(false)
   const isMcpProcess = ref(false)
   const resolvingRequestIds = new Set<string>()
+  let mcpEventListenerInstalled = false
 
   function beginRequestResolution(request: any, response?: any): string | null {
     const key = resolveRequestId(request) ?? resolveRequestId(response) ?? '__unrouted_mcp_request__'
@@ -334,11 +336,11 @@ export function useMcpHandler() {
     hidStandaloneWindow: boolean
   }
 
-  async function dismissMcpUiImmediately(request: any): Promise<ImmediateMcpDismissal> {
+  async function dismissMcpUiImmediately(request: any, hideNativeWindow = false): Promise<ImmediateMcpDismissal> {
     const dismissal: ImmediateMcpDismissal = {
       request,
       closedInlinePopup: !isMcpProcess.value,
-      hidStandaloneWindow: isMcpProcess.value,
+      hidStandaloneWindow: isMcpProcess.value || hideNativeWindow,
     }
 
     if (dismissal.closedInlinePopup) {
@@ -395,7 +397,7 @@ export function useMcpHandler() {
   /**
    * 统一的MCP响应处理
    */
-  async function handleMcpResponse(response: any) {
+  async function handleMcpResponse(response: any, nativeClose = false) {
     const request = mcpRequest.value as any
     const resolutionKey = beginRequestResolution(request, response)
     if (!resolutionKey)
@@ -404,7 +406,7 @@ export function useMcpHandler() {
     const requestId = resolveRequestId(request)
     let dismissal: ImmediateMcpDismissal | null = null
     try {
-      dismissal = await dismissMcpUiImmediately(request)
+      dismissal = await dismissMcpUiImmediately(request, nativeClose === true)
       // 通过Tauri命令发送响应并退出应用
       const timelineRouteId = await resolveConversationRouteIdWithFallback(request, projectPath)
       console.info('[MCP] 发送响应', {
@@ -432,7 +434,7 @@ export function useMcpHandler() {
   /**
    * 结束当前 zhi/call_zhi，但保留 iterate 主程序和其他请求。
    */
-  async function handleMcpCloseCurrentDialog() {
+  async function handleMcpCloseCurrentDialog(nativeClose = false) {
     const request = mcpRequest.value as any
     const requestId = resolveRequestId(request)
     if (!request || !requestId)
@@ -449,7 +451,7 @@ export function useMcpHandler() {
         request_id: requestId,
         source: 'popup_closed',
       },
-    })
+    }, nativeClose === true)
   }
 
   /**
@@ -641,6 +643,9 @@ export function useMcpHandler() {
    * 设置MCP事件监听器
    */
   async function setupMcpEventListener() {
+    if (mcpEventListenerInstalled)
+      return
+
     try {
       await listen('mcp-request', (event) => {
         const payload = event.payload as any
@@ -664,6 +669,19 @@ export function useMcpHandler() {
 
         showMcpDialog(payload)
       })
+      if (navigator.platform.toUpperCase().includes('WIN')) {
+        await listen<boolean>('native-mcp-close-requested', async (event) => {
+          const action = nativeWindowCloseAction(!!mcpRequest.value, resolvingRequestIds.size > 0, event.payload)
+          if (action === 'cancel') {
+            await handleMcpCloseCurrentDialog(true)
+          }
+          else if (action === 'exit') {
+            await invoke('close_idle_windows_window').catch(console.error)
+          }
+        })
+        await invoke('mark_native_mcp_close_listener_ready')
+      }
+      mcpEventListenerInstalled = true
     }
     catch (error) {
       console.error('设置MCP事件监听器失败:', error)

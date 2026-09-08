@@ -7,12 +7,14 @@ const source = await readFile(new URL('./useMcpHandler.ts', import.meta.url), 'u
 const shortcutsSource = await readFile(new URL('./useShortcuts.ts', import.meta.url), 'utf8')
 const builderSource = await readFile(new URL('../../rust/app/builder.rs', import.meta.url), 'utf8')
 const commandsSource = await readFile(new URL('../../rust/ui/commands.rs', import.meta.url), 'utf8')
+const appInitializationSource = await readFile(new URL('./useAppInitialization.ts', import.meta.url), 'utf8')
+const windowEventsSource = await readFile(new URL('../../rust/ui/window_events.rs', import.meta.url), 'utf8')
 
 describe('MCP response immediate dismissal', () => {
   it('dismisses the popup before route lookup and response persistence', () => {
-    const responseHandler = source.match(/async function handleMcpResponse\(response: any\) \{([\s\S]*?)\n {2}\}/)?.[1]
+    const responseHandler = source.match(/async function handleMcpResponse\(response: any, nativeClose = false\) \{([\s\S]*?)\n {2}\}/)?.[1]
     assert.ok(responseHandler)
-    const dismissIndex = responseHandler.indexOf('await dismissMcpUiImmediately(request)')
+    const dismissIndex = responseHandler.indexOf('await dismissMcpUiImmediately(request, nativeClose === true)')
     const routeIndex = responseHandler.indexOf('await resolveConversationRouteIdWithFallback')
     const sendIndex = responseHandler.indexOf('send_mcp_response')
     assert.ok(dismissIndex >= 0)
@@ -41,5 +43,18 @@ describe('MCP response immediate dismissal', () => {
     assert.match(commandsSource, /capture_frontmost_application\(\)/)
     assert.match(commandsSource, /window\s+\.hide\(\)[\s\S]*restore_standalone_previous_frontmost_application\(\)/)
     assert.match(commandsSource, /activate_application\(&application\)/)
+  })
+
+  it('registers Windows native close handling before loading the cold request', () => {
+    const listenerIndex = appInitializationSource.indexOf('await setupMcpEventListener()')
+    const launchContextIndex = appInitializationSource.indexOf('await checkMcpMode()')
+    assert.ok(listenerIndex >= 0)
+    assert.ok(launchContextIndex > listenerIndex)
+    assert.match(source, /listen<boolean>\('native-mcp-close-requested'/)
+    assert.match(source, /await invoke\('mark_native_mcp_close_listener_ready'\)/)
+    assert.match(source, /await handleMcpCloseCurrentDialog\(true\)/)
+    assert.match(windowEventsSource, /has_pending_resident_mcp_request/)
+    assert.match(windowEventsSource, /native-mcp-close-requested/)
+    assert.match(windowEventsSource, /pub async fn close_idle_windows_window[\s\S]*?if is_standalone_mcp_interaction\(\) \|\| has_pending_resident_mcp_request/)
   })
 })

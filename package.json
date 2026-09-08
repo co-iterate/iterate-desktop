@@ -19,7 +19,7 @@
     "test:desktop-web-push-security": "node --test scripts/desktop-bridge-web-push-security.test.mjs",
     "test:desktop-build-targets": "node --test scripts/desktop-build-rs-target-gating.test.mjs",
     "test:desktop-community-activation": "node --test scripts/desktop-community-activation.test.mjs",
-    "test:windows-experience": "node --test scripts/windows-experience-contract.test.mjs",
+    "test:windows-experience": "node --test scripts/windows-experience-contract.test.mjs src/frontend/utils/nativeWindowClose.test.ts",
     "version:check": "node scripts/check-version-consistency.mjs",
     "tauri": "cargo tauri",
     "tauri:dev": "cargo tauri dev",

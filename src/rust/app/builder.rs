@@ -788,6 +788,10 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             handle_app_exit_request,
             force_exit_app,
             reset_exit_attempts_cmd,
+            #[cfg(target_os = "windows")]
+            crate::ui::window_events::mark_native_mcp_close_listener_ready,
+            #[cfg(target_os = "windows")]
+            crate::ui::window_events::close_idle_windows_window,
             // 更新命令
             check_for_updates,
             download_and_install_update,
