@@ -3891,6 +3891,22 @@ pub async fn activate_app_window(app: AppHandle) -> Result<(), String> {
             .unminimize()
             .map_err(|e| format!("恢复窗口失败: {}", e))?;
         window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                BringWindowToTop, SetForegroundWindow, ShowWindow, SW_RESTORE,
+            };
+
+            let hwnd = window
+                .hwnd()
+                .map_err(|e| format!("获取 Windows 窗口句柄失败: {}", e))?;
+            let raw_hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+            unsafe {
+                ShowWindow(raw_hwnd, SW_RESTORE);
+                BringWindowToTop(raw_hwnd);
+                SetForegroundWindow(raw_hwnd);
+            }
+        }
         window
             .set_focus()
             .map_err(|e| format!("聚焦窗口失败: {}", e))?;

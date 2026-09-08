@@ -594,9 +594,20 @@ async function scheduleInputFocus(
   }
 
   focusRetryTimer = setTimeout(() => {
-    attemptFocus()
+    if (options.activateWindow) {
+      void invoke('activate_app_window')
+        .catch((error) => {
+          console.log(`[McpPopup] 延迟激活窗口失败: ${reason}`, error)
+        })
+        .finally(() => {
+          attemptFocus()
+        })
+    }
+    else {
+      attemptFocus()
+    }
     focusRetryTimer = null
-  }, 180)
+  }, options.activateWindow ? 450 : 180)
 
   console.log(`[McpPopup] 已调度输入框聚焦: ${reason}`)
 }

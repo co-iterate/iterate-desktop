@@ -135,5 +135,6 @@ reqwest = { version = "0.12.24", default-features = false, features = [
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
-  "Win32_System_Threading"
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging"
 ] }

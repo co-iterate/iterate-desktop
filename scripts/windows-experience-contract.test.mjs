@@ -202,3 +202,14 @@ test('Windows popup shortcuts use the new defaults and safely migrate only the c
   assert.match(popupActions, /props\.canSubmit && !props\.submitting[\s\S]*?handleGoalSubmit\(\)/)
   assert.match(popupActions, /!props\.submitting[\s\S]*?handleContinue\(\)/)
 })
+
+test('Windows popup activation restores and foregrounds the native window before retrying input focus', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const popup = source('src/frontend/components/popup/McpPopup.vue')
+  const cargo = source('Cargo.toml')
+
+  assert.match(cargo, /"Win32_UI_WindowsAndMessaging"/)
+  assert.match(commands, /pub async fn activate_app_window[\s\S]*?ShowWindow\(raw_hwnd, SW_RESTORE\)[\s\S]*?BringWindowToTop\(raw_hwnd\)[\s\S]*?SetForegroundWindow\(raw_hwnd\)[\s\S]*?\.set_focus\(\)/)
+  assert.match(popup, /focusRetryTimer = setTimeout[\s\S]*?if \(options\.activateWindow\)[\s\S]*?invoke\('activate_app_window'\)[\s\S]*?\.finally\(\(\) => \{\s*attemptFocus\(\)/)
+  assert.match(popup, /options\.activateWindow \? 450 : 180/)
+})
