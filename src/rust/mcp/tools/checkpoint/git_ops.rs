@@ -1,4 +1,4 @@
-use super::auto_commit;
+use super::{auto_commit, background_command};
 use chrono::{DateTime, Duration, Utc};
 use ring::digest;
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use uuid::Uuid;
 
 const CHECKPOINT_SUBJECT_PREFIX: &str = "iterate-checkpoint:";
@@ -232,7 +231,7 @@ fn get_checkpoint_files_internal(
     project_path: &str,
     commit_hash: &str,
 ) -> Result<Vec<String>, String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["show", "--pretty=format:", "--name-only", commit_hash])
         .current_dir(project_path)
         .output()
@@ -264,7 +263,7 @@ fn is_valid_relative_checkpoint_path(path: &str) -> bool {
 }
 
 fn git_head_hash(project_path: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(project_path)
         .output()
@@ -283,7 +282,7 @@ fn git_head_hash(project_path: &str) -> Option<String> {
 }
 
 fn checkpoint_status_without_index_files(project_path: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(project_path)
         .output()
@@ -317,7 +316,7 @@ fn checkpoint_status_without_index_files(project_path: &str) -> Option<String> {
 
 fn commit_contains_file(project_path: &str, commit_hash: &str, rel: &str) -> bool {
     let object_spec = format!("{}:{}", commit_hash, rel);
-    Command::new("git")
+    background_command("git")
         .args(["cat-file", "-e", &object_spec])
         .current_dir(project_path)
         .output()
@@ -421,7 +420,7 @@ fn parse_checkpoint_id(message: &str) -> Option<String> {
 }
 
 fn read_checkpoint_commit(project_path: &str, commit_hash: &str) -> Option<Checkpoint> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args([
             "show",
             "-s",
@@ -464,7 +463,7 @@ fn read_checkpoint_commit(project_path: &str, commit_hash: &str) -> Option<Check
 }
 
 fn git_log_checkpoint_hashes(project_path: &str) -> Vec<String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args([
             "log",
             "--all",
@@ -487,7 +486,7 @@ fn git_log_checkpoint_hashes(project_path: &str) -> Vec<String> {
 }
 
 fn reflog_checkpoint_hashes(project_path: &str) -> Vec<String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args([
             "reflog",
             "--all",
@@ -658,7 +657,7 @@ pub fn restore_checkpoint_safe(
             let exists_in_commit = commit_contains_file(project_path, commit_hash, rel);
 
             if exists_in_commit {
-                let output = Command::new("git")
+                let output = background_command("git")
                     .args(["checkout", commit_hash, "--", rel])
                     .current_dir(project_path)
                     .output()
@@ -671,7 +670,7 @@ pub fn restore_checkpoint_safe(
             }
 
             let target = Path::new(project_path).join(rel);
-            let _ = Command::new("git")
+            let _ = background_command("git")
                 .args(["rm", "-f", "--cached", "--ignore-unmatch", "--", rel])
                 .current_dir(project_path)
                 .output();
@@ -747,7 +746,7 @@ pub fn has_uncommitted_changes(project_path: &str) -> bool {
         return false;
     }
 
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["status", "--porcelain"])
         .current_dir(project_path)
         .output();

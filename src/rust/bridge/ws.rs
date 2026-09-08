@@ -11787,32 +11787,42 @@ fn root_tunnel_supervisor_fields_from_status(
     })
 }
 
+fn parse_root_tunnel_ha_connections(metrics: &str) -> Option<f64> {
+    const METRIC_NAME: &str = concat!("cloudflared_", "tunnel_ha_connections");
+    metrics.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != METRIC_NAME {
+            return None;
+        }
+        fields.next()?.parse::<f64>().ok()
+    })
+}
+
+async fn probe_root_tunnel_ha_connections(url: &str) -> Option<f64> {
+    let timeout_secs = http_probe_timeout_secs(url);
+    let client = build_probe_client(timeout_secs).ok()?;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    parse_root_tunnel_ha_connections(&body)
+}
+
 async fn inspect_root_tunnel_runtime() -> serde_json::Value {
     let status_file = std::fs::read_to_string(ROOT_TUNNEL_STATUS_FILE)
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
     let (metrics_probe, metrics_http_ok) = probe_http_endpoint(ROOT_TUNNEL_METRICS_URL).await;
-    let ha_connections = diagnostic_command_stdout(
-        "sh",
-        &[
-            "-lc".to_string(),
-            format!(
-                "curl --noproxy '*' -sS -m 2 {} 2>/dev/null | awk '/^cloudflared_tunnel_ha_connections / {{print $2; exit}}'",
-                ROOT_TUNNEL_METRICS_URL
-            ),
-        ],
-    )
-    .await;
+    let live_ha_connection_count = probe_root_tunnel_ha_connections(ROOT_TUNNEL_METRICS_URL).await;
+    let ha_connections = live_ha_connection_count.map(|value| value.to_string());
+    let ha_connection_count = live_ha_connection_count.unwrap_or(0.0);
     let root_launchctl =
         debug_launchctl_label("system/xin.tobooks.cunzhi.cloudflared-proxied.root").await;
     let status_age_secs = root_tunnel_status_age_secs(status_file.as_ref());
     let status_fresh = status_age_secs
         .map(|age| age <= ROOT_TUNNEL_STATUS_MAX_AGE_SECS)
         .unwrap_or(false);
-    let ha_connection_count = ha_connections
-        .as_deref()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.0);
     let status_expected_ha_connections = status_file
         .as_ref()
         .filter(|_| status_fresh)
@@ -11936,9 +11946,18 @@ async fn diagnostic_command_stdout(program: &str, args: &[String]) -> Option<Str
         "lsof" | "ps" => 5,
         _ => 2,
     };
+    let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        tokio::process::Command::new(program).args(args).output(),
+        command.output(),
     )
     .await
     .ok()?

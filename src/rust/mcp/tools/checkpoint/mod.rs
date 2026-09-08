@@ -12,6 +12,19 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub(super) fn background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CheckpointMetadata {
     pub checkpoint_id: String,
@@ -70,7 +83,7 @@ fn monitor_ttl() -> Duration {
 }
 
 fn git_status_porcelain(project_path: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(project_path)
         .output()

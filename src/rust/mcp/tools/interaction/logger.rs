@@ -6,6 +6,19 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// 对话日志条目
 pub struct ConversationEntry {
     pub conversation_id: Option<String>,
@@ -127,7 +140,7 @@ fn resolve_project_name(project_path: Option<&str>) -> String {
 }
 
 fn resolve_device_id() -> String {
-    let raw = Command::new("hostname")
+    let raw = background_command("hostname")
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -276,11 +289,11 @@ fn write_git_checkpoint(
         return;
     };
 
-    let _ = Command::new("git")
+    let _ = background_command("git")
         .args(["add", conv_file_str])
         .current_dir(knowledge_dir)
         .output();
-    let _ = Command::new("git")
+    let _ = background_command("git")
         .args([
             "commit",
             "-m",

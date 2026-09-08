@@ -18,6 +18,56 @@ test('bridge health probe uses reqwest only on Windows and preserves the Unix cu
   assert.match(setup, /#\[cfg\(not\(target_os = "windows"\)\)\]\s*fn bridge_http_healthy[\s\S]*?command_stdout\("curl"/)
 })
 
+test('Windows root tunnel diagnostics use native HTTP and hide fallback child consoles', () => {
+  const bridge = source('src/rust/bridge/ws.rs')
+  const start = bridge.indexOf('async fn inspect_root_tunnel_runtime()')
+  const end = bridge.indexOf('async fn diagnostic_command_stdout', start)
+  assert.ok(start >= 0 && end > start)
+  const rootTunnel = bridge.slice(start, end)
+
+  assert.match(rootTunnel, /probe_root_tunnel_ha_connections\(ROOT_TUNNEL_METRICS_URL\)/)
+  assert.doesNotMatch(rootTunnel, /diagnostic_command_stdout\(\s*"sh"/)
+  assert.match(bridge, /fn parse_root_tunnel_ha_connections[\s\S]*?tunnel_ha_connections/)
+  assert.match(bridge, /async fn diagnostic_command_stdout[\s\S]*?#\[cfg\(target_os = "windows"\)\][\s\S]*?CREATE_NO_WINDOW[\s\S]*?as_std_mut\(\)\.creation_flags/)
+})
+
+test('Windows MCP stdio server and serve child do not open user-visible console windows', () => {
+  const server = source('src/bin/mcp-server.rs')
+  assert.match(server, /#!\[cfg_attr\(target_os = "windows", windows_subsystem = "windows"\)\]/)
+  assert.match(server, /fn background_command\(program: &Path\) -> Command[\s\S]*?creation_flags\(CREATE_NO_WINDOW\)/)
+  assert.match(server, /for launcher in launchers[\s\S]*?background_command\(&launcher\)[\s\S]*?\.args\(&args\)[\s\S]*?\.spawn\(\)/)
+})
+
+test('Windows cold-start knowledge sync never opens a Git console before the popup', () => {
+  const server = source('src/bin/mcp-server.rs')
+  const start = server.indexOf('// 进程启动后第一次 call_zhi 时拉取 .cunzhi-knowledge')
+  const end = server.indexOf('LAST_KNOWLEDGE_PULL.store(1, Ordering::SeqCst)', start)
+  assert.ok(start >= 0 && end > start)
+  const coldStartSync = server.slice(start, end)
+  assert.match(coldStartSync, /background_command\(Path::new\("git"\)\)[\s\S]*?"pull", "--rebase", "--autostash", "--quiet"/)
+  assert.doesNotMatch(coldStartSync, /Command::new\("git"\)/)
+})
+
+test('Windows checkpoint production Git commands never open user-visible consoles', () => {
+  const checkpoint = source('src/rust/mcp/tools/checkpoint/mod.rs')
+  const autoCommit = source('src/rust/mcp/tools/checkpoint/auto_commit.rs').split('#[cfg(test)]')[0]
+  const gitOps = source('src/rust/mcp/tools/checkpoint/git_ops.rs').split('#[cfg(test)]')[0]
+  assert.match(checkpoint, /const CREATE_NO_WINDOW: u32 = 0x0800_0000/)
+  assert.match(checkpoint, /pub\(super\) fn background_command\(program: &str\) -> Command[\s\S]*?creation_flags\(CREATE_NO_WINDOW\)/)
+  assert.match(checkpoint, /background_command\("git"\)[\s\S]*?"status", "--porcelain", "--untracked-files=all"/)
+  assert.doesNotMatch(autoCommit, /Command::new\("git"\)/)
+  assert.doesNotMatch(gitOps, /Command::new\("git"\)/)
+  assert.match(autoCommit, /background_command\("git"\)[\s\S]*?"commit"/)
+  assert.match(gitOps, /background_command\("git"\)[\s\S]*?"checkout"/)
+})
+
+test('Windows conversation logging hides hostname and git checkpoint consoles', () => {
+  const logger = source('src/rust/mcp/tools/interaction/logger.rs')
+  assert.match(logger, /fn background_command\(program: &str\) -> Command[\s\S]*?creation_flags\(CREATE_NO_WINDOW\)/)
+  assert.match(logger, /let raw = background_command\("hostname"\)/)
+  assert.match(logger, /fn write_git_checkpoint[\s\S]*?background_command\("git"\)[\s\S]*?args\(\["add", conv_file_str\]\)[\s\S]*?background_command\("git"\)[\s\S]*?"commit"/)
+})
+
 test('Windows shows the main window before background setup while non-Windows keeps blocking setup', () => {
   const builder = source('src/rust/app/builder.rs')
   const showIndex = builder.indexOf('window.show()')

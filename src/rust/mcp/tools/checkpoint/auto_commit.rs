@@ -1,11 +1,11 @@
 use chrono::{Local, Utc};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
-use super::{is_checkpoint_index_path, CheckpointMetadata};
+use super::{background_command, is_checkpoint_index_path, CheckpointMetadata};
 
 const INDEX_LOCK_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(150),
@@ -25,7 +25,7 @@ fn generate_checkpoint_id() -> String {
 }
 
 fn maybe_auto_push(workspace: &str) -> String {
-    let remote_check = Command::new("git")
+    let remote_check = background_command("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(workspace)
         .output();
@@ -38,7 +38,7 @@ fn maybe_auto_push(workspace: &str) -> String {
         return "not_configured".to_string();
     }
 
-    let push_result = Command::new("git")
+    let push_result = background_command("git")
         .args(["push", "origin", "HEAD", "--quiet"])
         .current_dir(workspace)
         .output();
@@ -51,7 +51,7 @@ fn maybe_auto_push(workspace: &str) -> String {
 }
 
 fn is_gitlink_path(workspace: &str, rel_path: &str) -> bool {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["ls-files", "--stage", "--", rel_path])
         .current_dir(workspace)
         .output();
@@ -102,7 +102,7 @@ fn run_git_with_index_lock_retry(
     action: &str,
 ) -> Result<Output, String> {
     for attempt in 0..=INDEX_LOCK_RETRY_DELAYS.len() {
-        let output = Command::new("git")
+        let output = background_command("git")
             .args(args)
             .args(pathspecs)
             .current_dir(workspace)
@@ -152,7 +152,7 @@ fn create_checkpoint_with_subject(
         return Ok(None);
     }
 
-    let status = Command::new("git")
+    let status = background_command("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(workspace)
         .output()
@@ -206,7 +206,7 @@ fn create_checkpoint_with_subject(
         ));
     }
 
-    let hash_result = Command::new("git")
+    let hash_result = background_command("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(workspace)
         .output()
