@@ -719,6 +719,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_new_windsurf_chat_with_content,
             open_codex_project,
             open_codex_thread,
+            open_new_codex_chat,
             open_new_codex_chat_with_text,
             ack_mcp_request_ready,
             build_mcp_send_response,

@@ -254,6 +254,8 @@ function isDisplayableProjectPath(projectPath: string | null | undefined): proje
     return false
 
   return trimmed.startsWith('/')
+    || /^[a-z]:[\\/]/i.test(trimmed)
+    || trimmed.startsWith('\\\\')
 }
 
 function resolveDisplayProjectPath(request: any): string | null {
@@ -405,6 +407,25 @@ function normalizeRequestId(request: any): string | null {
     request?.requestId,
     request?.metadata?.request_id,
     request?.metadata?.requestId,
+  ]
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string')
+      continue
+    const trimmed = candidate.trim()
+    if (trimmed.length > 0)
+      return trimmed
+  }
+
+  return null
+}
+
+function normalizeCodexThreadId(request: any): string | null {
+  const candidates = [
+    request?.codex_thread_id,
+    request?.codexThreadId,
+    request?.metadata?.codex_thread_id,
+    request?.metadata?.codexThreadId,
   ]
 
   for (const candidate of candidates) {
@@ -1120,15 +1141,27 @@ function handleGlobalKeyup(event: KeyboardEvent) {
   shiftKeyAlone = false
 }
 
-// 处理顶部 + 按钮：免权限打开 Codex（优先带当前项目）
+// 处理顶部 + 按钮：Windows 先锚定当前 Codex thread 再原生新建会话；macOS 保持新会话 + zhi 自动化。
 async function handleNewChat() {
   const projectPath = reliableRequestProjectPath.value
-  if (!projectPath) {
+  const codexThreadId = normalizeCodexThreadId(props.mcpRequest)
+  const windowsPlatform = navigator.platform.toUpperCase().includes('WIN')
+
+  if (windowsPlatform && !codexThreadId) {
+    message.warning('当前请求没有可靠 Codex 会话 ID，未创建新对话')
+    return
+  }
+  if (!windowsPlatform && !projectPath) {
     message.warning('当前请求没有可靠项目路径，未打开 Codex')
     return
   }
 
   try {
+    if (windowsPlatform) {
+      await invoke('open_new_codex_chat', { threadId: codexThreadId })
+      return
+    }
+
     const result = await invoke<{
       ok: boolean
       sent: boolean

@@ -202,3 +202,38 @@ test('Windows popup shortcuts use the new defaults and safely migrate only the c
   assert.match(popupActions, /props\.canSubmit && !props\.submitting[\s\S]*?handleGoalSubmit\(\)/)
   assert.match(popupActions, /!props\.submitting[\s\S]*?handleContinue\(\)/)
 })
+
+test('Windows Codex Desktop supports project, thread, and foreground-gated new-chat routes', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const appContent = source('src/frontend/components/AppContent.vue')
+  const builder = source('src/rust/app/builder.rs')
+  const cargo = source('Cargo.toml')
+
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*fn codex_desktop_cli_candidates/)
+  assert.match(commands, /var_os\("LOCALAPPDATA"\)[\s\S]*?\.join\("OpenAI"\)[\s\S]*?\.join\("Codex"\)[\s\S]*?\.join\("bin"\)/)
+  assert.match(commands, /directory\.join\("codex\.exe"\)/)
+  assert.match(commands, /fn codex_desktop_app_candidates\(\)[\s\S]*?var_os\("ProgramFiles"\)[\s\S]*?\.join\("WindowsApps"\)/)
+  assert.match(commands, /starts_with\("openai\.codex_"\)[\s\S]*?\.join\("app"\)\.join\("ChatGPT\.exe"\)/)
+  assert.match(commands, /Get-AppxPackage -Name OpenAI\.Codex[\s\S]*?Select-Object -First 1 -ExpandProperty InstallLocation/)
+  assert.match(commands, /fn launch_codex_desktop_project[\s\S]*?\.arg\(project_path\)[\s\S]*?\.args\(\["app", project_path\]\)/)
+  assert.match(commands, /fn launch_codex_desktop_deeplink[\s\S]*?resolve_codex_desktop_app_exe\(\)[\s\S]*?\.arg\(url\)/)
+
+  assert.match(commands, /fn windows_foreground_executable_path[\s\S]*?GetForegroundWindow[\s\S]*?GetWindowThreadProcessId[\s\S]*?QueryFullProcessImageNameW/)
+  assert.match(commands, /fn is_codex_desktop_foreground_path[\s\S]*?file_name\.as_deref\(\) != Some\("chatgpt\.exe"\)[\s\S]*?contains\("\/windowsapps\/openai\.codex_"\)/)
+  assert.match(commands, /Codex 未成为前台窗口，为避免误发按键已取消自动发送/)
+  assert.match(commands, /post_return_keypress_to_codex[\s\S]*?keybd_event\(VK_RETURN as u8/)
+  assert.match(commands, /post_new_task_keypress_to_codex[\s\S]*?VK_CONTROL[\s\S]*?const VK_N: u8 = b'N'[\s\S]*?keybd_event\(VK_N/)
+
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_codex_project/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_codex_thread/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_new_codex_chat\(thread_id: String\)[\s\S]*?codex_thread_deeplink\(&thread_id\)[\s\S]*?from_millis\(300\)[\s\S]*?post_new_task_keypress_to_codex\(\)/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_new_codex_chat_with_text[\s\S]*?build_codex_new_thread_deeplink[\s\S]*?post_return_keypress_to_codex/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn probe_codex_automation_permission[\s\S]*?resolve_codex_desktop_app_exe/)
+  assert.match(builder, /open_codex_thread,[\s\S]*?open_new_codex_chat,[\s\S]*?open_new_codex_chat_with_text,/)
+
+  assert.match(appContent, /return trimmed\.startsWith\('\/'\)[\s\S]*?\^\[a-z\]:\[\\\\\/\]\/i\.test\(trimmed\)[\s\S]*?trimmed\.startsWith\('\\\\\\\\'\)/)
+  assert.match(appContent, /function normalizeCodexThreadId[\s\S]*?codex_thread_id[\s\S]*?codexThreadId/)
+  assert.match(appContent, /const codexThreadId = normalizeCodexThreadId\(props\.mcpRequest\)[\s\S]*?if \(windowsPlatform && !codexThreadId\)[\s\S]*?invoke\('open_new_codex_chat', \{ threadId: codexThreadId \}\)/)
+  assert.match(cargo, /"Win32_UI_Input_KeyboardAndMouse"/)
+  assert.match(cargo, /"Win32_UI_WindowsAndMessaging"/)
+})
