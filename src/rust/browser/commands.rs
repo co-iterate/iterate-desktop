@@ -8,7 +8,8 @@ use tokio::sync::RwLock;
 
 use super::detector::AiCompletionEvent;
 use super::websocket::{
-    ensure_browser_ws_pairing_token, send_to_browser, start_ws_server, stop_ws_server,
+    browser_extension_connected, browser_ws_server_running, ensure_browser_ws_pairing_token,
+    send_to_browser, start_ws_server, stop_ws_server,
 };
 use crate::mcp::handlers::create_tauri_popup;
 use crate::mcp::types::PopupRequest;
@@ -195,10 +196,9 @@ pub async fn stop_browser_monitoring() -> Result<String, String> {
 /// 获取浏览器监控状态
 #[tauri::command]
 pub async fn get_browser_monitor_status() -> Result<BrowserMonitorStatus, String> {
-    // WebSocket 模式下简化状态返回
     Ok(BrowserMonitorStatus {
-        connected: true,
-        monitoring: true,
+        connected: browser_extension_connected().await,
+        monitoring: browser_ws_server_running().await,
     })
 }
 

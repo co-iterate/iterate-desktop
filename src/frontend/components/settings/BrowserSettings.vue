@@ -12,6 +12,11 @@ interface AiCompletionEvent {
   timestamp: string
 }
 
+interface BrowserMonitorStatus {
+  connected: boolean
+  monitoring: boolean
+}
+
 const message = useMessage()
 const isMonitoring = ref(false)
 const isConnecting = ref(false)
@@ -61,11 +66,21 @@ function browserWsTokenPreview() {
   return `${browserWsToken.value.slice(0, 9)}...${browserWsToken.value.slice(-6)}`
 }
 
+async function syncMonitoringStatus() {
+  try {
+    const status = await invoke<BrowserMonitorStatus>('get_browser_monitor_status')
+    isMonitoring.value = status.monitoring
+  }
+  catch (error: any) {
+    message.error(`读取监控状态失败: ${error}`)
+  }
+}
+
 async function startMonitoring() {
   isConnecting.value = true
   try {
     const result = await invoke('start_browser_monitoring', {})
-    isMonitoring.value = true
+    await syncMonitoringStatus()
     message.success(result as string)
   }
   catch (error: any) {
@@ -79,7 +94,7 @@ async function startMonitoring() {
 async function stopMonitoring() {
   try {
     await invoke('stop_browser_monitoring')
-    isMonitoring.value = false
+    await syncMonitoringStatus()
     message.info('浏览器监控已停止')
   }
   catch (error: any) {
@@ -106,6 +121,7 @@ function formatTime(timestamp: string) {
 
 onMounted(async () => {
   await loadBrowserWsPairingToken()
+  await syncMonitoringStatus()
   unlistenCompletion = await listen<AiCompletionEvent>('browser-ai-completed', (event) => {
     completionEvents.value.unshift(event.payload)
     if (completionEvents.value.length > 20) {
