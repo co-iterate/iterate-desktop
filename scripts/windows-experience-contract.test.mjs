@@ -202,3 +202,28 @@ test('Windows popup shortcuts use the new defaults and safely migrate only the c
   assert.match(popupActions, /props\.canSubmit && !props\.submitting[\s\S]*?handleGoalSubmit\(\)/)
   assert.match(popupActions, /!props\.submitting[\s\S]*?handleContinue\(\)/)
 })
+
+test('Windows popup accepts Explorer file clipboard data and drive-letter paths', () => {
+  const popup = source('src/frontend/components/popup/PopupInput.vue')
+  const commands = source('src/rust/ui/commands.rs')
+  const cargo = source('Cargo.toml')
+
+  assert.match(popup, /Explorer copies absolute paths with drive letters or UNC prefixes/)
+  assert.match(popup, /decodedPath\.slice\(1\)/)
+  assert.match(popup, /path\.split\(\/\[\\\\\/\]\//)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\][\s\S]*?read_clipboard_file_paths[\s\S]*?CF_HDROP[\s\S]*?DragQueryFileW/)
+  assert.match(commands, /CLIPBOARD_OPEN_ATTEMPTS:\s*usize\s*=\s*5/)
+  assert.match(commands, /CLIPBOARD_RETRY_DELAY_MS:\s*u64\s*=\s*20/)
+  assert.match(commands, /for attempt in 0\.\.CLIPBOARD_OPEN_ATTEMPTS[\s\S]*?OpenClipboard[\s\S]*?std::thread::sleep/)
+  assert.match(commands, /#\[cfg\(not\(any\(target_os = "macos", target_os = "windows"\)\)\)\]/)
+  assert.match(cargo, /"Win32_System_DataExchange"/)
+  assert.match(cargo, /"Win32_System_Ole"/)
+  assert.match(cargo, /"Win32_UI_Shell"/)
+})
+
+test('Windows file and folder selection uses the native dialog plugin instead of an empty stub', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const windowsSelector = /#\[cfg\(not\(target_os = "macos"\)\)\]\s*#\[tauri::command\]\s*pub async fn select_files_and_folders[\s\S]*?\.blocking_pick_folder\(\)[\s\S]*?\.blocking_pick_files\(\)/
+  assert.match(commands, windowsSelector)
+  assert.doesNotMatch(commands, /pub async fn select_files_and_folders\([\s\S]{0,240}?Ok\(vec!\[\]\)/)
+})
