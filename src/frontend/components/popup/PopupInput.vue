@@ -1317,6 +1317,8 @@ async function focusInput(options: { registerSpeechTarget?: boolean } = {}) {
   try {
     const webview = getCurrentWebviewWindow()
     await webview.setFocus()
+    if (typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN'))
+      await getCurrentWebview().setFocus()
 
     const inputElement = getTextareaElement()
 

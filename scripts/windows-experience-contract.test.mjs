@@ -202,3 +202,18 @@ test('Windows popup shortcuts use the new defaults and safely migrate only the c
   assert.match(popupActions, /props\.canSubmit && !props\.submitting[\s\S]*?handleGoalSubmit\(\)/)
   assert.match(popupActions, /!props\.submitting[\s\S]*?handleContinue\(\)/)
 })
+
+test('Windows popup transfers input focus to WebView2 before focusing the textarea', () => {
+  const popupInput = source('src/frontend/components/popup/PopupInput.vue')
+  const start = popupInput.indexOf('async function focusInput(')
+  const end = popupInput.indexOf('const scrollableAncestors:', start)
+  assert.ok(start >= 0 && end > start)
+  const focusBody = popupInput.slice(start, end)
+
+  assert.match(focusBody, /const webview = getCurrentWebviewWindow\(\)[\s\S]*?await webview\.setFocus\(\)/)
+  assert.match(focusBody, /navigator\.platform\.toUpperCase\(\)\.includes\('WIN'\)[\s\S]*?await getCurrentWebview\(\)\.setFocus\(\)/)
+  assert.ok(
+    focusBody.indexOf('await getCurrentWebview().setFocus()') < focusBody.indexOf('const inputElement = getTextareaElement()'),
+    'WebView2 focus must be transferred before the DOM textarea is focused',
+  )
+})
