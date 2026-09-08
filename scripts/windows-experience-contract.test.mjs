@@ -202,3 +202,10 @@ test('Windows popup shortcuts use the new defaults and safely migrate only the c
   assert.match(popupActions, /props\.canSubmit && !props\.submitting[\s\S]*?handleGoalSubmit\(\)/)
   assert.match(popupActions, /!props\.submitting[\s\S]*?handleContinue\(\)/)
 })
+
+test('Windows centers the initial main window before showing it', () => {
+  const builder = source('src/rust/app/builder.rs')
+
+  assert.match(builder, /if should_show_main_window_on_launch\(&args\)[\s\S]*?#\[cfg\(target_os = "windows"\)\][\s\S]*?if !is_standalone_mcp_launch\(&args\)[\s\S]*?center_window\(app_handle\.clone\(\)\)/)
+  assert.match(builder, /#\[cfg\(not\(target_os = "windows"\)\)\][\s\S]*?window\.show\(\)[\s\S]*?window\.set_focus\(\)/)
+})

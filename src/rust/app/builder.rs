@@ -884,6 +884,16 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             let args: Vec<String> = std::env::args().collect();
 
             if should_show_main_window_on_launch(&args) {
+                #[cfg(target_os = "windows")]
+                if !is_standalone_mcp_launch(&args) {
+                    if let Err(error) = tauri::async_runtime::block_on(
+                        crate::ui::commands::center_window(app_handle.clone()),
+                    ) {
+                        log::warn!("首次显示窗口前定位失败: {error}");
+                    }
+                }
+
+                #[cfg(not(target_os = "windows"))]
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
