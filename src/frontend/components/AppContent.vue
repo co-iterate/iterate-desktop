@@ -6,7 +6,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
 import { useMessage } from 'naive-ui'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { setupExitWarningListener } from '../composables/useExitWarning'
 import { useKeyboard } from '../composables/useKeyboard'
 import { useVersionCheck } from '../composables/useVersionCheck'
@@ -125,6 +125,7 @@ interface UsageProvider {
 
 interface McpPopupRef {
   applyTimelinePrefill: (payload: TimelinePrefillPayload) => void
+  getDraft: () => TimelinePrefillPayload
 }
 
 const props = defineProps<Props>()
@@ -145,6 +146,7 @@ const conversationTreeId = ref<string | null>(null)
 const currentConversationNodeId = ref<string | null>(null)
 const activeConversationRouteKey = ref<string | null>(null)
 const mcpPopupRef = ref<McpPopupRef | null>(null)
+let popupSettingsDraft: TimelinePrefillPayload | null = null
 const activeArtifact = ref<PopupArtifact | null>(null)
 const activeArtifactContent = computed(() => activeArtifact.value?.content || '')
 let skipNextBridgePush = false
@@ -1012,12 +1014,24 @@ async function triggerShortcutToggle() {
 }
 
 // 切换弹窗设置显示
-function togglePopupSettings() {
-  showPopupSettings.value = !showPopupSettings.value
+async function togglePopupSettings() {
+  if (!showPopupSettings.value) {
+    popupSettingsDraft = mcpPopupRef.value?.getDraft() ?? null
+    showPopupSettings.value = true
+    return
+  }
+
+  showPopupSettings.value = false
+  await nextTick()
+  if (popupSettingsDraft) {
+    mcpPopupRef.value?.applyTimelinePrefill(popupSettingsDraft)
+    popupSettingsDraft = null
+  }
 }
 
 // 监听 MCP 请求变化，当有新请求时重置设置页面状态并更新窗口注册
 watch(() => props.mcpRequest, async (newRequest) => {
+  popupSettingsDraft = null
   const timelinePayload = {
     hasRequest: !!newRequest,
     requestId: normalizeRequestId(newRequest),
@@ -1687,6 +1701,7 @@ onUnmounted(async () => {
           :shortcut-enabled="localShortcutEnabled"
           :project-path="effectiveProjectPath"
           :codex-thread-id="props.mcpRequest?.codex_thread_id"
+          :conversation-title="props.mcpRequest?.conversation_title"
           :link-url="props.mcpRequest?.link_url"
           :link-title="props.mcpRequest?.link_title"
           :quota-providers="quotaProviders"

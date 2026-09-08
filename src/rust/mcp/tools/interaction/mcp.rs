@@ -22,12 +22,9 @@ pub struct InteractionTool;
 impl InteractionTool {
     pub async fn zhi(request: ZhiRequest) -> Result<CallToolResult, McpError> {
         #[cfg(target_os = "windows")]
-        if crate::app::windows_lifecycle::is_manually_stopped() {
-            return Err(McpError::internal_error(
-                crate::app::windows_lifecycle::MANUALLY_STOPPED_MESSAGE.to_string(),
-                None,
-            ));
-        }
+        crate::app::windows_lifecycle::activate_mcp_launch().map_err(|error| {
+            McpError::internal_error(format!("重新启动 iterate 失败: {error}"), None)
+        })?;
 
         let ai_message = normalize_zhi_message(&request.message);
         let project_path = request.project_path.clone();

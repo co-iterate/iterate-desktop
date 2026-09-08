@@ -117,6 +117,8 @@ pub struct AudioConfig {
 pub struct ReplyConfig {
     #[serde(default = "default_enable_continue_reply")]
     pub enable_continue_reply: bool,
+    #[serde(default = "default_copy_submission_to_clipboard")]
+    pub copy_submission_to_clipboard: bool,
     #[serde(default = "default_auto_continue_threshold")]
     pub auto_continue_threshold: u32, // 字符数阈值
     #[serde(default = "default_continue_prompt")]
@@ -553,6 +555,7 @@ pub fn default_window_config() -> WindowConfig {
 pub fn default_reply_config() -> ReplyConfig {
     ReplyConfig {
         enable_continue_reply: mcp::DEFAULT_CONTINUE_REPLY_ENABLED,
+        copy_submission_to_clipboard: mcp::DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD,
         auto_continue_threshold: mcp::DEFAULT_AUTO_CONTINUE_THRESHOLD,
         continue_prompt: mcp::DEFAULT_CONTINUE_PROMPT.to_string(),
         loop_prompt: mcp::DEFAULT_LOOP_PROMPT.to_string(),
@@ -582,6 +585,10 @@ pub fn default_min_height() -> f64 {
 
 pub fn default_enable_continue_reply() -> bool {
     mcp::DEFAULT_CONTINUE_REPLY_ENABLED
+}
+
+pub fn default_copy_submission_to_clipboard() -> bool {
+    mcp::DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD
 }
 
 pub fn default_auto_continue_threshold() -> u32 {
@@ -989,6 +996,13 @@ pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_config_defaults_clipboard_backup_to_disabled() {
+        let config: ReplyConfig = serde_json::from_str("{}").expect("reply config");
+
+        assert!(!config.copy_submission_to_clipboard);
+    }
 
     #[test]
     fn usage_provider_config_defaults_to_no_accounts() {

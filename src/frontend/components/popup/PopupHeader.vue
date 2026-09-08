@@ -35,6 +35,7 @@ interface Props {
   shortcutEnabled?: boolean
   projectPath?: string
   codexThreadId?: string
+  conversationTitle?: string
   linkUrl?: string
   linkTitle?: string
   quotaProviders?: UsageProvider[]
@@ -163,6 +164,8 @@ const projectPathTitle = computed(() => {
 
   return `${props.projectPath}\n(点击复制完整路径)\n(${cmdAction})`
 })
+
+const displayConversationTitle = computed(() => props.conversationTitle?.trim() || null)
 
 async function openCodexTarget() {
   if (props.codexThreadId)
@@ -563,6 +566,26 @@ function handleCodexLiveClick() {
           </template>
         </n-button>
       </n-space>
+    </div>
+    <div
+      v-if="displayConversationTitle"
+      class="conversation-title-row mt-2 flex min-w-0 items-center gap-2 border-t pt-2"
+      :class="props.currentTheme === 'light' ? 'border-gray-200' : 'border-white/10'"
+      :title="displayConversationTitle"
+      data-guide="conversation-title"
+    >
+      <span
+        class="flex-shrink-0 text-xs"
+        :style="{ color: props.currentTheme === 'light' ? '#374151' : '#e5e7eb' }"
+      >标题</span>
+      <span
+        class="truncate text-sm font-medium"
+        :style="{
+          color: props.currentTheme === 'light' ? '#111827' : '#f9fafb',
+          textDecoration: 'underline',
+          textUnderlineOffset: '3px',
+        }"
+      >{{ displayConversationTitle }}</span>
     </div>
   </div>
 </template>

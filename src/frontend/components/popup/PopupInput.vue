@@ -73,6 +73,7 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const emit = defineEmits<Emits>()
+const CONTEXT_INJECTION_START = '<!-- CONTEXT_INJECTION_START -->'
 
 let customPromptConfigCache: CustomPromptConfigSnapshot | null = null
 let customPromptConfigPromise: Promise<CustomPromptConfigSnapshot | null> | null = null
@@ -343,6 +344,7 @@ function emitUpdate() {
 
   emit('update', {
     userInput: finalUserInput,
+    rawUserInput: userInput.value,
     selectedOptions: selectedOptions.value,
     draggedImages: uploadedImages.value,
     attachedFiles: attachedFiles.value,
@@ -1635,7 +1637,9 @@ function generateConditionalContent(): string {
     }
   })
 
-  return conditionalTexts.length > 0 ? `\n\n${conditionalTexts.join('\n')}` : ''
+  return conditionalTexts.length > 0
+    ? `\n\n${CONTEXT_INJECTION_START}\n${conditionalTexts.join('\n')}`
+    : ''
 }
 
 // 获取条件性prompt的自适应描述

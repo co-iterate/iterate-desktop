@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +78,8 @@ struct DialogRequest {
     #[serde(default)]
     codex_deeplink: Option<String>,
     #[serde(default)]
+    conversation_title: Option<String>,
+    #[serde(default)]
     checkpoint_id: Option<String>,
     #[serde(default)]
     checkpoint_commit: Option<String>,
@@ -106,6 +108,39 @@ fn default_codex_home() -> Option<PathBuf> {
     codex_home_from_env()
         .map(PathBuf::from)
         .or_else(|| iterate_home_dir().map(|home| home.join(".codex")))
+}
+
+fn normalize_conversation_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn codex_thread_title_from_session_index(codex_home: &Path, thread_id: &str) -> Option<String> {
+    let file = std::fs::File::open(codex_home.join("session_index.jsonl")).ok()?;
+    let mut matched_title = None;
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("id").and_then(|value| value.as_str()) != Some(thread_id) {
+            continue;
+        }
+
+        if let Some(title) =
+            normalize_conversation_title(entry.get("thread_name").and_then(|value| value.as_str()))
+        {
+            matched_title = Some(title);
+        }
+    }
+
+    matched_title
+}
+
+fn codex_thread_title(thread_id: &str) -> Option<String> {
+    default_codex_home().and_then(|home| codex_thread_title_from_session_index(&home, thread_id))
 }
 
 fn codex_state_db_candidates(codex_home: &Path) -> Vec<PathBuf> {
@@ -497,6 +532,9 @@ struct CallZhiArgs {
     /// 调用本次 MCP 的 Codex 会话 deep link（可选；通常自动生成）
     #[serde(default)]
     codex_deeplink: Option<String>,
+    /// 调用本次 MCP 的对话标题（可选；未提供时按 Codex 会话 ID 自动提取）
+    #[serde(default)]
+    conversation_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1614,12 +1652,9 @@ async fn call_zhi(
     argument_codex_thread_id: Option<String>,
 ) -> Result<CallToolResult, ErrorData> {
     #[cfg(target_os = "windows")]
-    if cunzhi::app::windows_lifecycle::is_manually_stopped() {
-        return Err(ErrorData::internal_error(
-            cunzhi::app::windows_lifecycle::MANUALLY_STOPPED_MESSAGE.to_string(),
-            None,
-        ));
-    }
+    cunzhi::app::windows_lifecycle::activate_mcp_launch().map_err(|error| {
+        ErrorData::internal_error(format!("重新启动 iterate 失败: {error}"), None)
+    })?;
 
     // 进程启动后第一次 call_zhi 时拉取 .cunzhi-knowledge（cold start，只拉一次）
     // 0=未拉，u64::MAX=进行中，1=已拉
@@ -1713,6 +1748,8 @@ async fn call_zhi(
         .as_deref()
         .and_then(normalize_codex_thread_deeplink)
         .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_deeplink));
+    let conversation_title = normalize_conversation_title(args.conversation_title.as_deref())
+        .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_title));
     checkpoint::touch_auto_checkpoint_monitor(&args.project_path, Some(&request_id));
     let workspace_checkpoint =
         checkpoint::maybe_auto_checkpoint(&args.project_path, Some(&request_id));
@@ -1756,6 +1793,7 @@ async fn call_zhi(
         codex_home: codex_home_from_env(),
         codex_thread_id,
         codex_deeplink,
+        conversation_title,
         checkpoint_id: workspace_checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.checkpoint_id.clone()),
@@ -1772,9 +1810,8 @@ async fn call_zhi(
         &dialog_response.user_input,
         &dialog_response.selected_options,
     );
-    let popup_closed = cunzhi::conversation::is_popup_closed_response_source(
-        &dialog_response.response_source,
-    );
+    let popup_closed =
+        cunzhi::conversation::is_popup_closed_response_source(&dialog_response.response_source);
     if explicit_end || popup_closed {
         let end_source = if explicit_end {
             cunzhi::conversation::EXPLICIT_CONVERSATION_END_SOURCE
@@ -2616,6 +2653,10 @@ impl ServerHandler for IterateZhiServer {
                 "is_markdown": {
                     "type": "boolean",
                     "description": "消息是否使用 Markdown 格式（默认 true）"
+                },
+                "conversation_title": {
+                    "type": "string",
+                    "description": "当前对话标题（可选；Codex 会话未传时会自动提取）"
                 }
             },
             "required": ["message", "project_path"]
@@ -3544,5 +3585,30 @@ mod tests {
             latest_codex_thread_fallback_for_project(workspace_str).expect("thread fallback");
         assert_eq!(fallback.thread_id, "019ec000-0000-7000-8000-000000000006");
         assert_eq!(fallback.state_db_path, root_state_db);
+    }
+
+    #[test]
+    fn codex_thread_title_uses_latest_non_empty_session_index_name() {
+        let codex_home = tempdir().expect("temp codex home");
+        std::fs::write(
+            codex_home.path().join("session_index.jsonl"),
+            concat!(
+                "not-json\n",
+                "{\"id\":\"thread-a\",\"thread_name\":\"旧标题\"}\n",
+                "{\"id\":\"thread-b\",\"thread_name\":\"其他标题\"}\n",
+                "{\"id\":\"thread-a\",\"thread_name\":\"   \"}\n",
+                "{\"id\":\"thread-a\",\"thread_name\":\" 当前对话标题 \"}\n",
+            ),
+        )
+        .expect("write session index");
+
+        assert_eq!(
+            codex_thread_title_from_session_index(codex_home.path(), "thread-a").as_deref(),
+            Some("当前对话标题")
+        );
+        assert_eq!(
+            codex_thread_title_from_session_index(codex_home.path(), "missing"),
+            None
+        );
     }
 }

@@ -200,6 +200,7 @@ fn notify_bridge_apns_on_popup_ready(request_id: String, request: &DialogRequest
         "is_markdown": request.is_markdown,
         "codex_thread_id": request.codex_thread_id,
         "codex_deeplink": request.codex_deeplink,
+        "conversation_title": request.conversation_title,
         "loop_active": request.loop_active,
         "force_popup": request.force_popup,
         "source": "desktop_popup_ready",
@@ -1390,6 +1391,7 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
         "codex_home": request.codex_home,
         "codex_thread_id": request.codex_thread_id,
         "codex_deeplink": request.codex_deeplink,
+        "conversation_title": request.conversation_title,
         "checkpoint_id": request.checkpoint_id,
         "checkpoint_commit": request.checkpoint_commit,
         "checkpoint_message": request.checkpoint_message,
@@ -1667,9 +1669,7 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                                 &submitted_options,
                             );
                         let popup_closed =
-                            crate::conversation::is_popup_closed_response_source(
-                                &submitted_source,
-                            );
+                            crate::conversation::is_popup_closed_response_source(&submitted_source);
                         let interaction_ended = explicit_end || popup_closed;
 
                         // 结束当前交互时不携带选项或附件进入业务响应。

@@ -304,6 +304,9 @@ pub struct DialogRequest {
     /// 调用本次 MCP 的 Codex 会话 deep link
     #[serde(default)]
     pub codex_deeplink: Option<String>,
+    /// 调用本次 MCP 的对话标题
+    #[serde(default)]
+    pub conversation_title: Option<String>,
     /// 当前请求对应的 checkpoint ID
     #[serde(default)]
     pub checkpoint_id: Option<String>,

@@ -573,6 +573,7 @@ fn forward_macos_native_text_drop(window: &tauri::Window<tauri::Wry>, event: &ta
 pub fn build_tauri_app() -> Builder<tauri::Wry> {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init());
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
