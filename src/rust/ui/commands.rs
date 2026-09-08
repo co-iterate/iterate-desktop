@@ -4969,35 +4969,162 @@ pub fn read_text_file(file_path: String) -> Result<String, String> {
     std::fs::read_to_string(&file_path).map_err(|e| format!("读取文件失败 {}: {}", file_path, e))
 }
 
-/// 截取全屏并返回 base64 图片
+/// 截取全屏并返回 base64 图片。
 #[tauri::command]
 pub async fn capture_screenshot() -> Result<String, String> {
-    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
 
-    // 临时文件路径
-    let temp_path = "/tmp/iterate_screenshot.png";
+        let temp_path = "/tmp/iterate_screenshot.png";
+        let output = Command::new("screencapture")
+            .arg("-x")
+            .arg(temp_path)
+            .output()
+            .map_err(|e| format!("执行 screencapture 失败: {}", e))?;
 
-    // 使用 screencapture 截取全屏（-x 参数表示不播放快门声音）
-    let output = Command::new("screencapture")
-        .arg("-x")
-        .arg(temp_path)
-        .output()
-        .map_err(|e| format!("执行 screencapture 失败: {}", e))?;
+        if !output.status.success() {
+            return Err(format!("screencapture 命令失败: {:?}", output.stderr));
+        }
 
-    if !output.status.success() {
-        return Err(format!("screencapture 命令失败: {:?}", output.stderr));
+        let data = std::fs::read(temp_path).map_err(|e| format!("读取截图文件失败: {}", e))?;
+        let _ = std::fs::remove_file(temp_path);
+        return Ok(format!(
+            "data:image/png;base64,{}",
+            base64_013::encode(&data)
+        ));
     }
 
-    // 读取截图文件
-    let data = std::fs::read(temp_path).map_err(|e| format!("读取截图文件失败: {}", e))?;
+    #[cfg(target_os = "windows")]
+    {
+        use image::codecs::png::PngEncoder;
+        use image::{ExtendedColorType, ImageEncoder};
+        use std::ffi::c_void;
+        use windows_sys::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
+            SRCCOPY,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
 
-    // 转换为 base64
-    let b64 = base64_013::encode(&data);
+        let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if width <= 0 || height <= 0 {
+            return Err(format!("Windows 虚拟桌面尺寸无效: {}x{}", width, height));
+        }
 
-    // 删除临时文件
-    let _ = std::fs::remove_file(temp_path);
+        let screen_dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if screen_dc.is_null() {
+            return Err("获取 Windows 屏幕 DC 失败".to_string());
+        }
 
-    Ok(format!("data:image/png;base64,{}", b64))
+        let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        if memory_dc.is_null() {
+            unsafe {
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("创建 Windows 截图内存 DC 失败".to_string());
+        }
+
+        let mut bitmap_info = BITMAPINFO::default();
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                screen_dc,
+                &bitmap_info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if bitmap.is_null() || bits.is_null() {
+            unsafe {
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("创建 Windows 截图 DIB 失败".to_string());
+        }
+
+        let previous_object = unsafe { SelectObject(memory_dc, bitmap) };
+        if previous_object.is_null() {
+            unsafe {
+                DeleteObject(bitmap);
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("选择 Windows 截图位图失败".to_string());
+        }
+
+        let copied = unsafe {
+            BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                screen_dc,
+                left,
+                top,
+                SRCCOPY | CAPTUREBLT,
+            )
+        };
+        if copied == 0 {
+            unsafe {
+                SelectObject(memory_dc, previous_object);
+                DeleteObject(bitmap);
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("Windows BitBlt 截图失败".to_string());
+        }
+
+        let byte_len = width as usize * height as usize * 4;
+        let bgra = unsafe { std::slice::from_raw_parts(bits as *const u8, byte_len) };
+        let mut rgba = vec![0u8; byte_len];
+        for (source, target) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+            target[0] = source[2];
+            target[1] = source[1];
+            target[2] = source[0];
+            target[3] = 255;
+        }
+
+        unsafe {
+            SelectObject(memory_dc, previous_object);
+            DeleteObject(bitmap);
+            DeleteDC(memory_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+        }
+
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, width as u32, height as u32, ExtendedColorType::Rgba8)
+            .map_err(|e| format!("编码 Windows 截图 PNG 失败: {}", e))?;
+
+        return Ok(format!(
+            "data:image/png;base64,{}",
+            base64_013::encode(&png)
+        ));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("当前平台暂不支持截图".to_string())
+    }
 }
 
 #[cfg(test)]
