@@ -17,6 +17,11 @@ interface ProcessTranscriptPayload {
   text: string
 }
 
+interface WindowsTranscriptPayload {
+  targetToken: string
+  text: string
+}
+
 export function useGlobalSpeechRuntimeHost() {
   const guard = new GlobalSpeechSessionGuard()
   let muscleMemoryEntries: SpeechMemoryEntry[] = []
@@ -25,6 +30,8 @@ export function useGlobalSpeechRuntimeHost() {
   let contextualStrings: string[] = []
   let unlistenSnapshot: (() => void) | null = null
   let unlistenTranscript: (() => void) | null = null
+  let unlistenWindowsTranscript: (() => void) | null = null
+  let unlistenWindowsError: (() => void) | null = null
   let resourcesReady: Promise<void> = Promise.resolve()
   let initialized = false
 
@@ -173,11 +180,45 @@ export function useGlobalSpeechRuntimeHost() {
     }).catch(() => undefined)
   }
 
+  async function processWindowsTranscript(payload: WindowsTranscriptPayload) {
+    const rawText = payload.text.trim()
+    if (!rawText || !payload.targetToken)
+      return
+
+    let finalText = rawText
+    try {
+      await resourcesReady
+      const processed = applySpeechPostprocess({
+        text: rawText,
+        muscleMemoryEntries,
+        correctionMemoryEntries,
+        contextTerms: buildCorrectionEligibilityTerms(),
+      })
+      finalText = processed.text
+      await persistMemoryWriteback(processed)
+    }
+    catch {
+      finalText = rawText
+    }
+
+    await invoke('commit_windows_speech_text', {
+      targetToken: payload.targetToken,
+      text: finalText,
+    }).catch(error => console.error('Windows 语音写回失败:', error))
+  }
+
   async function initialize() {
     if (initialized)
       return
     initialized = true
+    const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
     resourcesReady = refreshRecognitionResources()
+
+    if (windowsPlatform) {
+      unlistenWindowsTranscript = await listen<WindowsTranscriptPayload>('speech://windows-transcript', event => void processWindowsTranscript(event.payload))
+      unlistenWindowsError = await listen<string>('speech://windows-error', event => console.warn('Windows 语音识别失败:', event.payload))
+      return
+    }
     unlistenSnapshot = await listen<SpeechSnapshot>('speech://session-snapshot', event => acceptSnapshot(event.payload))
     unlistenTranscript = await listen<ProcessTranscriptPayload>('speech://process-transcript', event => void processTranscript(event.payload))
     const snapshot = await invoke<SpeechSnapshot>('get_speech_control_snapshot')
@@ -188,8 +229,12 @@ export function useGlobalSpeechRuntimeHost() {
   function dispose() {
     unlistenSnapshot?.()
     unlistenTranscript?.()
+    unlistenWindowsTranscript?.()
+    unlistenWindowsError?.()
     unlistenSnapshot = null
     unlistenTranscript = null
+    unlistenWindowsTranscript = null
+    unlistenWindowsError = null
     initialized = false
   }
 

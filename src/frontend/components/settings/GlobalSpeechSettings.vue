@@ -22,6 +22,14 @@ interface PermissionRow {
   restartHint?: string
 }
 
+interface WindowsSpeechCapability {
+  available: boolean
+  recognizerName: string | null
+  culture: string | null
+  shortcut: string
+  details: string
+}
+
 interface SpeechRuntimeStatus {
   permissions: {
     microphone: boolean
@@ -85,6 +93,8 @@ const OWN_BUNDLE_ID = 'com.kexin94yyds.iterate'
 const LOG_PATH = '/tmp/iterate-native-speech.log'
 
 const message = useMessage()
+const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
+const windowsCapability = ref<WindowsSpeechCapability | null>(null)
 const loading = ref(false)
 const actionLoading = ref<string | null>(null)
 const overlayLoading = ref<string | null>(null)
@@ -333,6 +343,16 @@ async function refreshStatus(showSuccess = false) {
   loading.value = true
   lastError.value = ''
   try {
+    if (windowsPlatform) {
+      windowsCapability.value = await invoke<WindowsSpeechCapability>('get_windows_speech_capability')
+      runtimeStatus.value = null
+      targetBundleId.value = null
+      lastRefreshedAt.value = new Date().toLocaleTimeString()
+      if (showSuccess)
+        message.success('Windows 语音状态已刷新')
+      return
+    }
+
     const runtime = await invoke<SpeechRuntimeStatus>('get_speech_runtime_status')
     runtimeStatus.value = runtime
 
@@ -423,7 +443,71 @@ onMounted(() => {
 
 <template>
   <div class="space-y-4">
-    <div class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
+    <template v-if="windowsPlatform">
+      <div class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div class="text-base font-medium">
+              Windows 全局语音输入
+            </div>
+            <div class="text-sm opacity-70 mt-1">
+              使用 Windows 本地 System.Speech 识别，识别结果继续经过 iterate 的纠错、肌肉记忆与词汇记忆后处理。
+            </div>
+          </div>
+          <n-button size="small" :loading="loading" @click="refreshStatus(true)">
+            <template #icon>
+              <div class="i-carbon-renew w-4 h-4" />
+            </template>
+            刷新
+          </n-button>
+        </div>
+
+        <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div class="rounded-lg border border-dashed border-[var(--n-border-color)] p-3">
+            <div class="text-xs opacity-60">
+              本地识别器
+            </div>
+            <div class="mt-1 text-sm font-medium">
+              {{ windowsCapability?.recognizerName || '未检测到' }}
+            </div>
+            <div class="mt-1 text-xs opacity-60">
+              {{ windowsCapability?.culture || 'unknown' }}
+            </div>
+          </div>
+          <div class="rounded-lg border border-dashed border-[var(--n-border-color)] p-3">
+            <div class="text-xs opacity-60">
+              全局快捷键
+            </div>
+            <div class="mt-1 text-sm font-medium">
+              {{ windowsCapability?.shortcut || 'Shift+Ctrl+Space' }}
+            </div>
+            <div class="mt-1 text-xs opacity-60">
+              在任意输入窗口按下后开始一次听写；识别结束后写回原窗口。
+            </div>
+          </div>
+        </div>
+
+        <n-alert
+          class="mt-4"
+          :type="windowsCapability?.available ? 'success' : 'warning'"
+          :bordered="false"
+        >
+          {{ windowsCapability?.details || '正在检测 Windows 本地语音识别能力…' }}
+        </n-alert>
+        <div v-if="lastRefreshedAt" class="text-xs opacity-60 mt-3">
+          最近刷新：{{ lastRefreshedAt }}
+        </div>
+      </div>
+
+      <n-alert type="info" :bordered="false">
+        Windows 不使用 macOS 的 Fn / Speech / Accessibility 权限模型，因此这里不会伪装显示“4/4 已授权”。全局快捷键总开关仍沿用 iterate 的“全局快捷键”设置。
+      </n-alert>
+      <n-alert v-if="lastError" type="error" :bordered="false">
+        {{ lastError }}
+      </n-alert>
+    </template>
+
+    <div v-if="!windowsPlatform" class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div class="text-base font-medium">
@@ -469,7 +553,7 @@ onMounted(() => {
       </n-alert>
     </div>
 
-    <div class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
+    <div v-if="!windowsPlatform" class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="min-w-0">
           <div class="text-sm font-medium">
@@ -491,7 +575,7 @@ onMounted(() => {
       </n-alert>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+    <div v-if="!windowsPlatform" class="grid grid-cols-1 md:grid-cols-2 gap-3">
       <div
         v-for="row in permissionRows"
         :key="row.key"
@@ -531,7 +615,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <div class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
+    <div v-if="!windowsPlatform" class="rounded-lg border border-[var(--n-border-color)] bg-[var(--n-card-color)] p-4">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div class="text-sm font-medium">
@@ -629,11 +713,11 @@ onMounted(() => {
       </n-alert>
     </div>
 
-    <n-alert v-if="lastError" type="error" :bordered="false">
+    <n-alert v-if="!windowsPlatform && lastError" type="error" :bordered="false">
       {{ lastError }}
     </n-alert>
 
-    <n-alert type="info" :bordered="false">
+    <n-alert v-if="!windowsPlatform" type="info" :bordered="false">
       运行日志：<code>{{ displayedLogPath }}</code>。runtime status 会显示 Fn owner、overlay ready、pending toggle、speech active 与最近写回状态。
     </n-alert>
   </div>

@@ -36,6 +36,8 @@ pub mod runtime_paths;
 pub mod session;
 pub mod target;
 pub mod trace;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use phase1::{
     ack_speech_overlay_visibility, complete_speech_processing, configure_speech_recognition,

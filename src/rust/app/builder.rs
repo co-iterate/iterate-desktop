@@ -712,6 +712,12 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::native_speech::set_codex_live_audio_reserved,
             crate::native_speech::commit_speech_text,
             crate::native_speech::paste_text,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::get_windows_speech_capability,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::start_windows_speech_dictation,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::commit_windows_speech_text,
             crate::ui::commands::list_prompt_files,
             crate::ui::commands::read_text_file,
             crate::ui::commands::capture_screenshot,
