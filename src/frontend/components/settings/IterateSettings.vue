@@ -221,35 +221,7 @@ interface BridgeDiagnostics {
   }
 }
 
-interface PhoneActionPublishResponse {
-  ok: boolean
-  id: string
-  sent: number
-  subscribers: number
-}
-
-interface PhoneActionResultEntry {
-  id: string
-  status: string
-  message?: string | null
-  received_at: string
-  source_client_id?: string | null
-  source_device_id?: string | null
-}
-
-interface PhoneActionResultResponse {
-  ok: boolean
-  result?: PhoneActionResultEntry | null
-}
-
-type PhoneActionName = 'set_clipboard' | 'show_message' | 'start_voice' | 'open_url' | 'open_browser' | 'share_text' | 'run_shortcut'
-
-type PhoneActionBrowser = 'default' | 'safari' | 'chrome' | 'google'
-
 const cloudflareVerificationFreshnessMs = 10 * 60 * 1000
-const phoneActionPendingStatuses = new Set(['waiting_for_foreground', 'pending'])
-const phoneActionResultPollMaxAttempts = 16
-const phoneActionForegroundPollMaxAttempts = 1200
 
 const defaultCloudflareConfig: CloudflareGuidedConfig = {
   guided_setup_enabled: false,
@@ -317,9 +289,6 @@ const showQuickTunnelDeveloperControls = import.meta.env.DEV
 const showLogs = ref(false)
 const showQrCode = ref(false)
 const copySuccess = ref(false)
-const ghostSuggestionWritebackEnabled = ref(false)
-const isMobileConfigLoading = ref(false)
-const mobileConfigError = ref('')
 const pairedFileRootDevices = ref<PairedDeviceFileRoots[]>([])
 const selectedFileRootDeviceId = ref('')
 const isFileRootLoading = ref(false)
@@ -327,23 +296,8 @@ const fileRootError = ref('')
 const bridgeDiagnostics = ref<BridgeDiagnostics | null>(null)
 const diagnosticsError = ref('')
 const isDiagnosticsLoading = ref(false)
-const selectedPhoneDeviceId = ref('')
-const phoneActionText = ref('')
-const phoneActionUrl = ref('')
-const phoneActionBrowser = ref<PhoneActionBrowser>('default')
-const phoneActionShortcutName = ref('iterate')
-const phoneActionLoading = ref('')
-const phoneActionError = ref('')
-const phoneActionLastResult = ref<PhoneActionPublishResponse | null>(null)
-const phoneActionResult = ref<PhoneActionResultEntry | null>(null)
-const phoneActionResultLoading = ref(false)
-const phoneActionResultTimedOut = ref(false)
-const phoneActionPendingId = ref('')
-
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let diagnosticsPollTimer: ReturnType<typeof setInterval> | null = null
-let phoneActionResultPollTimer: ReturnType<typeof setInterval> | null = null
-let phoneActionResultPollAttempts = 0
 let mobileQrImageLoadStartedAt = 0
 
 function elapsedMs(startedAt: number) {
@@ -447,49 +401,8 @@ const cloudflareVerificationText = computed(() => {
   return `${verification.state}${verification.error_code ? ` · ${verification.error_code}` : ''}`
 })
 
-function urlHost(value?: string | null) {
-  if (!value)
-    return ''
-  try {
-    return new URL(value).hostname.toLowerCase()
-  }
-  catch {
-    return value.toLowerCase()
-  }
-}
-
-function isTailscaleFunnelUrl(value?: string | null) {
-  return urlHost(value).endsWith('.ts.net')
-}
-
-function isCloudflareUrl(value?: string | null) {
-  const host = urlHost(value)
-  return host.includes('cloudflare') || host.endsWith('trycloudflare.com')
-}
-
-function transportLabel(mode: string, url?: string | null) {
-  switch (mode) {
-    case 'tailscale':
-      return 'Tailscale'
-    case 'public_tunnel':
-      if (isTailscaleFunnelUrl(url))
-        return 'Tailscale Funnel'
-      if (isCloudflareUrl(url))
-        return 'Cloudflare 公网'
-      return '公网通道'
-    case 'cloudflare_tunnel':
-      return 'Cloudflare 公网'
-    case 'lan_fallback':
-      return 'LAN 同网备用'
-    case 'loopback_fallback':
-      return '本机调试'
-    default:
-      return mode
-  }
-}
-
 const fileRootDeviceOptions = computed(() => pairedFileRootDevices.value.map(device => ({
-  label: `${device.device_name || 'iPhone'} · ${shortDeviceId(device.device_id)} · ${formatClientSeenAt(device.last_seen_at)}`,
+  label: `${device.device_name || 'Android'} · ${shortDeviceId(device.device_id)} · ${formatClientSeenAt(device.last_seen_at)}`,
   value: device.device_id,
 })))
 
@@ -546,11 +459,11 @@ const cacheMetricRows = computed(() => {
   ]
 })
 
-const connectedPhoneClients = computed(() => {
+const connectedAndroidClients = computed(() => {
   const clients = bridgeDiagnostics.value?.websocket?.clients || []
   return clients.filter((client) => {
     const kind = (client.client_kind || '').toLowerCase()
-    return kind === 'ios' || kind.includes('ios')
+    return kind === 'android' || kind.includes('android')
   })
 })
 
@@ -566,7 +479,7 @@ const connectionStatusSnapshot = computed<ConnectionStatusSnapshot | null>(() =>
 })
 
 const tailscaleClientOnline = computed(() =>
-  connectedPhoneClients.value.some(client => client.selected_transport_mode === 'tailscale'),
+  connectedAndroidClients.value.some(client => client.selected_transport_mode === 'tailscale'),
 )
 
 const tailscaleCandidateAvailable = computed(() => false)
@@ -577,36 +490,6 @@ const connectionRouteView = computed(() => buildConnectionRouteView({
   tailscaleClientOnline: tailscaleClientOnline.value,
   tailscaleCandidateAvailable: tailscaleCandidateAvailable.value,
 }))
-
-const phoneDeviceOptions = computed(() => [
-  {
-    label: '全部已连接 iPhone',
-    value: '',
-  },
-  ...connectedPhoneClients.value
-    .filter(client => Boolean(client.device_id))
-    .map((client, index) => ({
-      label: phoneClientLabel(client, index),
-      value: client.device_id || '',
-    })),
-])
-
-const selectedPhoneDeviceLabel = computed(() => {
-  if (!selectedPhoneDeviceId.value)
-    return '全部已连接 iPhone'
-
-  const client = connectedPhoneClients.value.find(
-    item => item.device_id === selectedPhoneDeviceId.value,
-  )
-  return client ? phoneClientLabel(client, 0) : selectedPhoneDeviceId.value
-})
-
-const phoneActionBrowserOptions = [
-  { label: '默认浏览器', value: 'default' },
-  { label: 'Safari', value: 'safari' },
-  { label: 'Chrome', value: 'chrome' },
-  { label: 'Google 搜索', value: 'google' },
-]
 
 const {
   dataUrl: qrCodeUrl,
@@ -979,56 +862,6 @@ function startTunnel() {
   showMobileConnectionWizard.value = true
 }
 
-async function refreshMobileConfig() {
-  isMobileConfigLoading.value = true
-  mobileConfigError.value = ''
-  try {
-    const response = await bridgeFetch('http://127.0.0.1:8080/api/config')
-    const data = await response.json()
-    if (!response.ok || data.error)
-      throw new Error(data.error || '移动端权限配置读取失败')
-    ghostSuggestionWritebackEnabled.value = Boolean(data.mobile_config?.allow_ghost_suggestions_write)
-  }
-  catch (error: any) {
-    mobileConfigError.value = String(error?.message || error || '移动端权限配置读取失败')
-  }
-  finally {
-    isMobileConfigLoading.value = false
-  }
-}
-
-async function updateGhostSuggestionWriteback(value: boolean) {
-  const previous = ghostSuggestionWritebackEnabled.value
-  ghostSuggestionWritebackEnabled.value = value
-  isMobileConfigLoading.value = true
-  mobileConfigError.value = ''
-  try {
-    const response = await bridgeFetch('http://127.0.0.1:8080/api/config', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        mobile_config: {
-          allow_ghost_suggestions_write: value,
-        },
-      }),
-    })
-    const data = await response.json()
-    if (!response.ok || data.error || !data.success)
-      throw new Error(data.error || '移动端权限配置保存失败')
-    message.success(value ? '已允许新配对设备回写词表' : '已关闭新配对设备词表回写')
-  }
-  catch (error: any) {
-    ghostSuggestionWritebackEnabled.value = previous
-    mobileConfigError.value = String(error?.message || error || '移动端权限配置保存失败')
-    message.error(mobileConfigError.value)
-  }
-  finally {
-    isMobileConfigLoading.value = false
-  }
-}
-
 async function refreshPairedDeviceFileRoots() {
   isFileRootLoading.value = true
   fileRootError.value = ''
@@ -1041,7 +874,7 @@ async function refreshPairedDeviceFileRoots() {
       throw new Error(data.error || '设备目录授权读取失败')
 
     pairedFileRootDevices.value = (data.devices || []).filter(
-      device => device.client_kind.toLowerCase() === 'ios',
+      device => device.client_kind.toLowerCase() === 'android',
     )
     if (!pairedFileRootDevices.value.some(device => device.device_id === selectedFileRootDeviceId.value))
       selectedFileRootDeviceId.value = pairedFileRootDevices.value[0]?.device_id || ''
@@ -1059,7 +892,7 @@ async function refreshPairedDeviceFileRoots() {
 async function saveSelectedDeviceFileRoots(roots: string[]) {
   const deviceId = selectedFileRootDeviceId.value
   if (!deviceId) {
-    fileRootError.value = '请先选择要授权的 iPhone'
+    fileRootError.value = '请先选择要授权的 Android 设备'
     return
   }
 
@@ -1080,7 +913,7 @@ async function saveSelectedDeviceFileRoots(roots: string[]) {
     if (!response.ok || !data.ok)
       throw new Error(data.error || '设备目录授权保存失败')
     await refreshPairedDeviceFileRoots()
-    message.success(roots.length ? '已更新这台 iPhone 的目录授权' : '已撤销这台 iPhone 的目录授权')
+    message.success(roots.length ? '已更新这台 Android 设备的目录授权' : '已撤销这台 Android 设备的目录授权')
   }
   catch (error: any) {
     fileRootError.value = String(error?.message || error || '设备目录授权保存失败')
@@ -1199,272 +1032,6 @@ function formatClientSeenAt(value?: string) {
   return date.toLocaleTimeString()
 }
 
-function phoneClientLabel(client: BridgeWebSocketClient, index: number) {
-  return `iPhone ${index + 1} · ${shortDeviceId(client.device_id)}`
-}
-
-function phoneClientMeta(client: BridgeWebSocketClient) {
-  const parts = [
-    client.selected_transport_mode ? transportLabel(client.selected_transport_mode, client.selected_ws_url) : null,
-    client.selected_ws_url || null,
-    `活跃 ${formatClientSeenAt(client.last_seen_at)}`,
-  ].filter(Boolean)
-  return parts.join(' · ')
-}
-
-function buildPhoneActionId(action: string) {
-  const suffix = Math.random().toString(36).slice(2, 8)
-  return `desktop-${action}-${Date.now().toString(36)}-${suffix}`
-}
-
-function phoneActionResultStatusText(status: string) {
-  const normalized = status.toLowerCase()
-  if (['success', 'ok', 'completed'].includes(normalized))
-    return '已执行'
-  if (normalized === 'waiting_for_foreground')
-    return '等待手机打开'
-  if (normalized === 'pending')
-    return '等待执行'
-  if (normalized === 'expired')
-    return '已过期'
-  if (normalized === 'cancelled')
-    return '已取消'
-  if (['failed', 'failure', 'error'].includes(normalized))
-    return '执行失败'
-  return status || '已回执'
-}
-
-function phoneActionResultStatusClass(status: string) {
-  const normalized = status.toLowerCase()
-  if (['success', 'ok', 'completed'].includes(normalized))
-    return 'text-success'
-  if (phoneActionPendingStatuses.has(normalized))
-    return 'text-warning'
-  if (['failed', 'failure', 'error'].includes(normalized))
-    return 'text-error'
-  return 'text-warning'
-}
-
-function isPhoneActionPendingStatus(status: string) {
-  return phoneActionPendingStatuses.has(status.toLowerCase())
-}
-
-function formatPhoneActionResultTime(value?: string) {
-  if (!value)
-    return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime()))
-    return ''
-  return date.toLocaleTimeString()
-}
-
-function clearPhoneActionResultPolling() {
-  if (phoneActionResultPollTimer) {
-    clearInterval(phoneActionResultPollTimer)
-    phoneActionResultPollTimer = null
-  }
-  phoneActionResultLoading.value = false
-  phoneActionResultPollAttempts = 0
-}
-
-function resetPhoneActionResultState() {
-  clearPhoneActionResultPolling()
-  phoneActionResult.value = null
-  phoneActionResultTimedOut.value = false
-  phoneActionPendingId.value = ''
-}
-
-async function fetchPhoneActionResult(id: string) {
-  const response = await bridgeFetch(`http://127.0.0.1:8080/api/phone-action-result?id=${encodeURIComponent(id)}`, {
-    cache: 'no-store',
-  })
-  const data = await response.json()
-  if (!response.ok)
-    throw new Error(data?.error || `HTTP ${response.status}`)
-  return data as PhoneActionResultResponse
-}
-
-async function pollPhoneActionResult(id: string) {
-  if (!phoneActionResultLoading.value || phoneActionPendingId.value !== id)
-    return
-
-  try {
-    const data = await fetchPhoneActionResult(id)
-    if (data.result) {
-      phoneActionResult.value = data.result
-      if (!isPhoneActionPendingStatus(data.result.status)) {
-        clearPhoneActionResultPolling()
-        return
-      }
-    }
-  }
-  catch (error: any) {
-    phoneActionError.value = String(error?.message || error || '手机动作回执读取失败')
-    clearPhoneActionResultPolling()
-    return
-  }
-
-  phoneActionResultPollAttempts += 1
-  const maxAttempts = phoneActionResult.value && isPhoneActionPendingStatus(phoneActionResult.value.status)
-    ? phoneActionForegroundPollMaxAttempts
-    : phoneActionResultPollMaxAttempts
-  if (phoneActionResultPollAttempts >= maxAttempts) {
-    phoneActionResultTimedOut.value = true
-    clearPhoneActionResultPolling()
-  }
-}
-
-function startPhoneActionResultPolling(id: string) {
-  clearPhoneActionResultPolling()
-  phoneActionResult.value = null
-  phoneActionResultTimedOut.value = false
-  phoneActionPendingId.value = id
-  phoneActionResultLoading.value = true
-  void pollPhoneActionResult(id)
-  phoneActionResultPollTimer = setInterval(() => {
-    void pollPhoneActionResult(id)
-  }, 500)
-}
-
-function requirePhoneActionText(actionLabel: string) {
-  const text = phoneActionText.value.trim()
-  if (!text) {
-    message.warning(`${actionLabel}需要先填写文本`)
-    return null
-  }
-  return text
-}
-
-function validatePhoneActionUrl(url: string, actionLabel: string, allowedProtocols: string[]) {
-  try {
-    const parsed = new URL(url)
-    if (!allowedProtocols.includes(parsed.protocol))
-      throw new Error('unsupported protocol')
-  }
-  catch {
-    message.warning(`${actionLabel} URL 格式无效`)
-    return null
-  }
-  return url
-}
-
-function requirePhoneActionUrl(actionLabel: string, allowedProtocols: string[]) {
-  const url = phoneActionUrl.value.trim()
-  if (!url) {
-    message.warning(`${actionLabel}需要先填写链接`)
-    return null
-  }
-  return validatePhoneActionUrl(url, actionLabel, allowedProtocols)
-}
-
-function optionalPhoneActionUrl(actionLabel: string, allowedProtocols: string[]) {
-  const url = phoneActionUrl.value.trim()
-  if (!url)
-    return ''
-  return validatePhoneActionUrl(url, actionLabel, allowedProtocols)
-}
-
-async function sendPhoneAction(action: PhoneActionName) {
-  if (phoneActionLoading.value)
-    return
-
-  const request: Record<string, unknown> = {
-    id: buildPhoneActionId(action),
-    action,
-    source: 'desktop_settings',
-  }
-  if (selectedPhoneDeviceId.value)
-    request.targetDeviceId = selectedPhoneDeviceId.value
-
-  if (action === 'set_clipboard') {
-    const text = requirePhoneActionText('写入剪贴板')
-    if (text == null)
-      return
-    request.text = text
-  }
-  else if (action === 'show_message') {
-    const text = requirePhoneActionText('显示消息')
-    if (text == null)
-      return
-    request.text = text
-  }
-  else if (action === 'open_url') {
-    const url = requirePhoneActionUrl('打开 URL', ['http:', 'https:', 'iterate:'])
-    if (url == null)
-      return
-    request.url = url
-  }
-  else if (action === 'open_browser') {
-    const url = requirePhoneActionUrl('打开浏览器', ['http:', 'https:'])
-    if (url == null)
-      return
-    request.url = url
-    request.browser = phoneActionBrowser.value
-  }
-  else if (action === 'share_text') {
-    const text = phoneActionText.value.trim()
-    const url = optionalPhoneActionUrl('分享文本', ['http:', 'https:'])
-    if (url == null)
-      return
-    if (!text && !url) {
-      message.warning('分享文本需要先填写文本或 http(s) 链接')
-      return
-    }
-    if (text)
-      request.text = text
-    if (url)
-      request.url = url
-  }
-  else if (action === 'run_shortcut') {
-    const shortcutName = phoneActionShortcutName.value.trim()
-    if (!shortcutName) {
-      message.warning('运行快捷指令需要先填写快捷指令名')
-      return
-    }
-    if (!shortcutName.toLowerCase().startsWith('iterate')) {
-      message.warning('快捷指令名必须以 iterate 开头')
-      return
-    }
-    request.shortcut_name = shortcutName
-
-    const text = phoneActionText.value.trim()
-    if (text) {
-      request.text = text
-    }
-    else {
-      const url = optionalPhoneActionUrl('运行快捷指令', ['http:', 'https:'])
-      if (url == null)
-        return
-      if (url)
-        request.url = url
-    }
-  }
-
-  phoneActionLoading.value = action
-  phoneActionError.value = ''
-  phoneActionLastResult.value = null
-  resetPhoneActionResultState()
-  try {
-    const result = await invoke('send_phone_action_request', { request }) as PhoneActionPublishResponse
-    phoneActionLastResult.value = result
-    if (result.ok) {
-      message.success(`${selectedPhoneDeviceLabel.value} 动作已发送`)
-      startPhoneActionResultPolling(result.id)
-    }
-    else {
-      message.warning('没有匹配的在线 iPhone')
-    }
-    await refreshBridgeDiagnostics()
-  }
-  catch (error: any) {
-    phoneActionError.value = String(error?.message || error || '手机动作发送失败')
-    message.error(phoneActionError.value)
-  }
-  finally {
-    phoneActionLoading.value = ''
-  }
-}
-
 async function copyDomain() {
   if (!mobileUrl.value)
     return
@@ -1501,15 +1068,6 @@ function onMobileQrImageError() {
   })
 }
 
-watch(connectedPhoneClients, (clients) => {
-  if (!selectedPhoneDeviceId.value)
-    return
-
-  const stillConnected = clients.some(client => client.device_id === selectedPhoneDeviceId.value)
-  if (!stillConnected)
-    selectedPhoneDeviceId.value = ''
-})
-
 watch(qrCodeUrl, (url) => {
   if (!url)
     return
@@ -1533,7 +1091,6 @@ onMounted(async () => {
   await refreshRelayMacClientConfig()
   await refreshCloudflareWebLoginSessions()
   await checkHealth()
-  await refreshMobileConfig()
   if (status.value.origin_healthy)
     await refreshPairedDeviceFileRoots()
   await refreshBridgeDiagnostics()
@@ -1548,7 +1105,6 @@ onMounted(async () => {
 onUnmounted(() => {
   stopPolling()
   stopDiagnosticsPolling()
-  clearPhoneActionResultPolling()
 })
 </script>
 
@@ -1587,7 +1143,7 @@ onUnmounted(() => {
             Mac Relay Client
           </div>
           <div class="text-xs opacity-60">
-            常驻 Mac 出站 WebSocket，用于 iPhone 通过 Relay 下发受限恢复命令。
+            常驻 Mac 出站 WebSocket，用于已授权的移动设备通过 Relay 下发受限恢复命令。
           </div>
         </div>
         <div class="flex flex-col items-end gap-1">
@@ -2110,7 +1666,7 @@ onUnmounted(() => {
             :loading="isLoading"
             @click="startTunnel"
           >
-            安全连接 iPhone
+            安全连接 Android
           </n-button>
           <n-button
             v-else
@@ -2174,40 +1730,24 @@ onUnmounted(() => {
       <div class="flex items-center justify-between mb-2">
         <div>
           <div class="text-sm font-medium text-primary">
-            iPhone 安全连接
+            Android 安全连接
           </div>
           <div class="text-xs opacity-60">
             使用已登记并验证的正式公网路线；尚未配置时会提供安全的 AI 配置提示词。
           </div>
         </div>
         <n-button size="small" type="primary" @click="showMobileConnectionWizard = true">
-          连接 iPhone
+          连接 Android
         </n-button>
       </div>
       <div class="text-[11px] opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
         正式配置与瞬时健康分开保存；暂时故障会先自动恢复，不会退回测试通道。
       </div>
-      <div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-black-200/70">
-        <div class="min-w-0">
-          <div class="text-xs font-medium leading-relaxed">
-            iOS 回写幽灵补全词表
-          </div>
-          <div class="text-[11px] opacity-60 leading-relaxed">
-            仅影响之后配对的设备；已配对设备需重新配对。
-          </div>
-        </div>
-        <n-switch
-          :value="ghostSuggestionWritebackEnabled"
-          :loading="isMobileConfigLoading"
-          :disabled="!status.origin_healthy"
-          @update:value="updateGhostSuggestionWriteback"
-        />
-      </div>
       <div class="grid gap-2 mt-3 pt-3 border-t border-black-200/70">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
             <div class="text-xs font-medium leading-relaxed">
-              iPhone 目录浏览授权
+              Android 目录浏览授权
             </div>
             <div class="text-[11px] opacity-60 leading-relaxed">
               只授权选中的设备；文件系统根 / 永不允许。
@@ -2223,10 +1763,10 @@ onUnmounted(() => {
           v-model:value="selectedFileRootDeviceId"
           size="small"
           :options="fileRootDeviceOptions"
-          placeholder="选择 iPhone"
+          placeholder="选择 Android 设备"
         />
         <div v-else class="text-[11px] opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
-          暂无可授权的 iPhone 配对记录。
+          暂无可授权的 Android 配对记录。
         </div>
 
         <div
@@ -2265,204 +1805,8 @@ onUnmounted(() => {
           </n-button>
         </div>
       </div>
-      <div v-if="mobileConfigError" class="text-xs text-error leading-relaxed mt-2">
-        {{ mobileConfigError }}
-      </div>
       <div v-if="fileRootError" class="text-xs text-error leading-relaxed mt-2">
         {{ fileRootError }}
-      </div>
-    </div>
-
-    <div
-      v-if="status.origin_healthy"
-      class="p-3 bg-black-100 rounded-lg"
-    >
-      <div class="flex items-start justify-between gap-3 mb-3">
-        <div>
-          <div class="text-sm font-medium text-primary">
-            iPhone 快捷动作
-          </div>
-          <div class="text-xs opacity-60">
-            {{ connectedPhoneClients.length ? `${connectedPhoneClients.length} 台在线` : '暂无在线 iPhone' }}
-          </div>
-        </div>
-        <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="refreshBridgeDiagnostics">
-          刷新
-        </n-button>
-      </div>
-
-      <div class="grid gap-3">
-        <n-select
-          v-model:value="selectedPhoneDeviceId"
-          size="small"
-          :options="phoneDeviceOptions"
-        />
-
-        <div v-if="connectedPhoneClients.length" class="grid gap-2">
-          <div
-            v-for="(client, index) in connectedPhoneClients"
-            :key="client.client_id"
-            class="flex items-start justify-between gap-3 text-xs bg-black-200/70 px-2 py-1.5 rounded"
-          >
-            <div class="min-w-0">
-              <div class="font-medium truncate">
-                {{ phoneClientLabel(client, index) }}
-              </div>
-              <div class="opacity-55 truncate">
-                {{ phoneClientMeta(client) }}
-              </div>
-            </div>
-            <div
-              v-if="client.device_id === selectedPhoneDeviceId"
-              class="i-carbon-checkmark-filled text-success flex-shrink-0 mt-0.5"
-            />
-          </div>
-        </div>
-
-        <div v-else class="text-xs opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
-          iPhone 连接后会出现在这里；也可以先使用“全部已连接 iPhone”广播动作。
-        </div>
-
-        <n-input
-          v-model:value="phoneActionText"
-          size="small"
-          type="textarea"
-          :autosize="{ minRows: 2, maxRows: 4 }"
-          placeholder="文本：写入剪贴板或显示消息"
-        />
-
-        <n-input
-          v-model:value="phoneActionUrl"
-          size="small"
-          placeholder="URL：http(s)://；打开 URL 可用 iterate://"
-        />
-
-        <div class="grid grid-cols-2 gap-2">
-          <n-select
-            v-model:value="phoneActionBrowser"
-            size="small"
-            :options="phoneActionBrowserOptions"
-          />
-          <n-input
-            v-model:value="phoneActionShortcutName"
-            size="small"
-            placeholder="快捷指令：iterate..."
-          />
-        </div>
-
-        <div class="grid grid-cols-2 gap-2">
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'set_clipboard'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('set_clipboard')"
-          >
-            <template #icon>
-              <div class="i-carbon-copy" />
-            </template>
-            写剪贴板
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'show_message'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('show_message')"
-          >
-            <template #icon>
-              <div class="i-carbon-chat" />
-            </template>
-            显示消息
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'start_voice'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('start_voice')"
-          >
-            <template #icon>
-              <div class="i-carbon-voice-activate" />
-            </template>
-            启动语音
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'open_url'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('open_url')"
-          >
-            <template #icon>
-              <div class="i-carbon-launch" />
-            </template>
-            打开 URL
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'open_browser'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('open_browser')"
-          >
-            <template #icon>
-              <div class="i-carbon-browser" />
-            </template>
-            打开浏览器
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'share_text'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('share_text')"
-          >
-            <template #icon>
-              <div class="i-carbon-share" />
-            </template>
-            分享文本
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'run_shortcut'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('run_shortcut')"
-          >
-            <template #icon>
-              <div class="i-carbon-play" />
-            </template>
-            快捷指令
-          </n-button>
-        </div>
-
-        <div
-          v-if="phoneActionLastResult"
-          class="text-xs opacity-60 leading-relaxed"
-        >
-          最近发送：{{ phoneActionLastResult.ok ? '已投递' : '未投递' }} · sent {{ phoneActionLastResult.sent }}/{{ phoneActionLastResult.subscribers }}
-        </div>
-        <div
-          v-if="phoneActionResultLoading || phoneActionResult || phoneActionResultTimedOut"
-          class="text-xs leading-relaxed bg-black-200/70 px-2 py-1.5 rounded"
-        >
-          <div v-if="phoneActionResult" class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
-              <div :class="phoneActionResultStatusClass(phoneActionResult.status)" class="font-medium">
-                回执：{{ phoneActionResultStatusText(phoneActionResult.status) }}
-              </div>
-              <div class="opacity-60 truncate">
-                {{ phoneActionResult.message || 'iPhone 已返回执行结果' }}
-              </div>
-            </div>
-            <div class="opacity-50 tabular-nums flex-shrink-0">
-              {{ formatPhoneActionResultTime(phoneActionResult.received_at) }}
-            </div>
-          </div>
-          <div v-else-if="phoneActionResultLoading" class="opacity-70">
-            等待 iPhone 回执 · {{ phoneActionPendingId }}
-          </div>
-          <div v-else class="text-warning">
-            回执超时 · 动作可能已送达，但暂未收到 iPhone 执行结果
-          </div>
-        </div>
-        <div v-if="phoneActionError" class="text-xs text-error leading-relaxed">
-          {{ phoneActionError }}
-        </div>
       </div>
     </div>
 

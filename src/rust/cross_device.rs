@@ -267,6 +267,136 @@ fn commit(reg: &Registration, response: &Value, remote: bool) -> Result<()> {
     Ok(())
 }
 
+// Android is paired to the local Bridge, while the source popup can live in a
+// different process. Resolve only the original serve request, never a project
+// fallback, and use the same receipt lock as desktop/peer submissions.
+fn android_registration(request_id: &str, project_path: &str) -> Result<Option<Registration>> {
+    let dir = directory()?;
+    let mut mismatch = false;
+    for folder in ["requests", "deferred-requests"] {
+        let Ok(entries) = fs::read_dir(dir.join(folder)) else { continue };
+        for entry in entries.flatten() {
+            let Ok(reg) = read_json::<Registration>(&entry.path()) else { continue };
+            if reg.request.get("id").and_then(Value::as_str) != Some(request_id) {
+                continue;
+            }
+            let registered_project = reg.request.get("project_path").and_then(Value::as_str)
+                .map(normalize_project_path);
+            if registered_project.as_deref() == Some(project_path) {
+                return Ok(Some(reg));
+            }
+            mismatch = true;
+        }
+    }
+    if mismatch { Err("target_project_mismatch".into()) } else { Ok(None) }
+}
+
+fn normalize_project_path(raw: &str) -> String {
+    let path = Path::new(raw);
+    if path.is_relative() {
+        fs::canonicalize(path).map(|value| value.to_string_lossy().to_string()).unwrap_or_else(|_| {
+            std::env::current_dir().map(|cwd| cwd.join(path).to_string_lossy().to_string())
+                .unwrap_or_else(|_| raw.to_string())
+        })
+    } else { raw.to_string() }
+}
+
+fn android_action_response(payload: &Value, request_id: &str, project_path: &str) -> Result<Value> {
+    if has_attachments(payload) { return Err("attachments_not_supported".into()); }
+    let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
+    let action_id = payload.get("client_action_id").and_then(Value::as_str)
+        .filter(|value| !value.is_empty()).ok_or("missing_client_action_id")?;
+    let options = payload.get("selected_options").cloned().unwrap_or_else(|| json!([]));
+    let mut metadata = json!({"source":"android_cross_device","request_id":request_id,
+        "client_action_id":action_id});
+    let input = match action {
+        "submit" => payload.get("user_input").cloned().unwrap_or(Value::Null),
+        "cancel" => {
+            metadata["source"] = json!("popup_closed");
+            Value::Null
+        },
+        "continue" => Value::Null,
+        "enhance" => payload.get("user_input").cloned().unwrap_or(Value::Null),
+        "goal" | "goal_start" => {
+            let (goal, title, _) = crate::bridge::android_goal_payload_parts(payload);
+            if goal.is_empty() { return Err("goal_input_missing".into()); }
+            metadata["mode"] = json!("goalrun_takeover");
+            metadata["goal_title"] = json!(title);
+            json!(crate::bridge::android_goal_submit_prompt(&goal))
+        }
+        _ => return Err("unsupported_mcp_action".into()),
+    };
+    let options = match action {
+        "continue" => json!(["继续"]),
+        "enhance" => json!(["增强"]),
+        _ => options,
+    };
+    Ok(json!({"user_input":input,"selected_options":options,"images":[],
+        "project_path":project_path,"metadata":metadata}))
+}
+
+// None means this is not a cross-device source and the existing local route
+// may handle it. A committed response must never fall through to that route.
+pub async fn submit_android_action(payload: &Value, request_id: &str, project_path: &str)
+    -> Option<Result<bool>> {
+    let reg = match android_registration(request_id, project_path) {
+        Ok(Some(reg)) => reg,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let response = match android_action_response(payload, request_id, project_path) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error)),
+    };
+    if let Err(error) = commit(&reg, &response, true) { return Some(Err(error)); }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let delivered = (|| {
+            let _guard = reg.request_lock().ok()?;
+            let receipt = read_json::<Value>(&reg.result_path().ok()?).ok()?;
+            Some(receipt.get("response") == Some(&response)
+                && receipt.get("source_consumed").and_then(Value::as_bool) == Some(true))
+        })().unwrap_or(false);
+        if delivered { return Some(Ok(true)); }
+        if tokio::time::Instant::now() >= deadline { return Some(Ok(false)); }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn response_contains(accepted: &Value, observed: &Value) -> bool {
+    match (accepted, observed) {
+        (Value::Object(a), Value::Object(b)) => a.iter().all(|(key, value)|
+            b.get(key).is_some_and(|actual| response_contains(value, actual))),
+        _ => accepted == observed,
+    }
+}
+
+pub fn mark_source_prepared(reg: &Registration, response: &Value) -> Result<()> {
+    let _guard = reg.request_lock()?;
+    let path = reg.result_path()?;
+    let mut receipt: Value = read_json(&path)?;
+    if !receipt.get("response").is_some_and(|accepted| response_contains(accepted, response)) {
+        return Err("源端消费的回复与获胜回复不一致".into());
+    }
+    receipt["source_prepared"] = json!(true);
+    atomic_json(&path, &receipt)
+}
+
+// Called only by the HTTP handler after its response channel delivered the
+// prepared reply and a successful response body has been constructed.
+pub fn mark_source_handed_off(request_id: &str, project_path: &str) -> Result<()> {
+    let reg = android_registration(request_id, &normalize_project_path(project_path))?
+        .ok_or("源请求不存在")?;
+    let _guard = reg.request_lock()?;
+    let path = reg.result_path()?;
+    let mut receipt: Value = read_json(&path)?;
+    if receipt.get("source_prepared").and_then(Value::as_bool) != Some(true) {
+        return Err("源回复尚未准备完成".into());
+    }
+    receipt["source_consumed"] = json!(true);
+    atomic_json(&path, &receipt)
+}
+
 pub async fn submit(response: &Value) -> Result<bool> {
     if let Ok(key) = std::env::var("ITERATE_CROSS_DEVICE_MIRROR") {
         if response.as_str() == Some("CANCELLED")
@@ -336,15 +466,25 @@ pub async fn get_cross_device_status() -> Value {
             return json!({"enabled":false,"connected":false,"mirror":mirror,"error":error})
         }
     };
+    // The source popup polls this every two seconds. Deliver an accepted
+    // response immediately, even if its registration was never published or
+    // the paired desktop is offline; network health checks can take seconds.
+    let source_pending = std::env::var("ITERATE_CROSS_DEVICE_SOURCE").ok().filter(|key|!key.is_empty())
+        .and_then(|key|load_registration(&key).ok()).filter(|reg|!reg.response_file.exists())
+        .and_then(|reg|read_json::<Value>(&reg.result_path().ok()?).ok()
+            .filter(|receipt| receipt.get("source_prepared").and_then(Value::as_bool) != Some(true)
+                && receipt.get("source_consumed").and_then(Value::as_bool) != Some(true))
+            .and_then(|receipt|receipt.get("response").cloned())
+            .map(|response|json!({"response":response,"request_id":reg.request.get("id"),"project_path":reg.request.get("project_path")})));
+    if source_pending.is_some() {
+        return json!({"enabled":local.enabled,"device_id":local.device_id,"mirror":mirror,
+            "source_pending":source_pending});
+    }
     let remote = peer("/snapshot", None).await;
     let local_ready = local_daemon_ready().await;
     let mirror_key = std::env::var("ITERATE_CROSS_DEVICE_MIRROR").ok();
     let local_only =
         std::env::var("ITERATE_CROSS_DEVICE_SOURCE").is_ok_and(|key| key.is_empty()) && !mirror;
-    let source_pending = std::env::var("ITERATE_CROSS_DEVICE_SOURCE").ok().filter(|key|!key.is_empty())
-        .and_then(|key|load_registration(&key).ok()).filter(|reg|!reg.response_file.exists())
-        .and_then(|reg|read_json::<Value>(&reg.result_path().ok()?).ok().and_then(|receipt|receipt.get("response").cloned())
-            .map(|response|json!({"response":response,"request_id":reg.request.get("id"),"project_path":reg.request.get("project_path")})));
     let resolved = mirror_key.as_ref().is_some_and(|key| {
         remote
             .as_ref()
@@ -1143,6 +1283,62 @@ mod tests {
             exiting.response_file.exists(),
             "an accepted peer reply must survive source exit"
         );
+        match previous {
+            Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR", value),
+            None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn android_deferred_source_requires_matching_consumed_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ITERATE_CROSS_DEVICE_DIR");
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR", temp.path());
+        let request_id = format!("serve-test-{}", uuid::Uuid::new_v4());
+        let project = temp.path().to_string_lossy().to_string();
+        let request_file = temp.path().join("request.json");
+        fs::write(&request_file, b"{}").unwrap();
+        let reg = Registration {
+            key: uuid::Uuid::new_v4().to_string(),
+            origin_device_id: "origin".into(), origin_name: "test".into(),
+            request: json!({"id":request_id,"project_path":project}),
+            request_file, response_file: temp.path().join("response.json"), published: false,
+        };
+        atomic_json(&reg.path().unwrap(), &reg).unwrap();
+        reg.renew();
+        let payload = json!({"action":"submit","request_id":request_id,"project_path":project,
+            "client_action_id":"android-action-1","user_input":"from phone"});
+        assert!(android_registration(&request_id, "C:/wrong-project").is_err());
+        let task = tokio::spawn({
+            let payload = payload.clone(); let request_id = request_id.clone(); let project = project.clone();
+            async move { submit_android_action(&payload, &request_id, &project).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !reg.result_path().unwrap().exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let accepted = read_json::<Value>(&reg.result_path().unwrap()).unwrap()["response"].clone();
+        assert!(mark_source_handed_off(&request_id, &project).is_err(),
+            "HTTP handoff cannot confirm an unprepared reply");
+        let previous_source = std::env::var_os("ITERATE_CROSS_DEVICE_SOURCE");
+        std::env::set_var("ITERATE_CROSS_DEVICE_SOURCE", &reg.key);
+        let source_status = get_cross_device_status().await;
+        assert_eq!(source_status["source_pending"]["response"], accepted);
+        match previous_source {
+            Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_SOURCE", value),
+            None => std::env::remove_var("ITERATE_CROSS_DEVICE_SOURCE"),
+        }
+        assert!(mark_source_prepared(&reg, &json!({"user_input":"other reply"})).is_err());
+        assert!(!task.is_finished());
+        let mut observed = accepted.clone();
+        observed["metadata"]["conversation_id"] = json!("recorded-by-source");
+        mark_source_prepared(&reg, &observed).unwrap();
+        assert!(!task.is_finished(), "preparation alone cannot confirm delivery");
+        mark_source_handed_off(&request_id, &project).unwrap();
+        assert!(task.await.unwrap().unwrap().unwrap());
+        assert_eq!(submit_android_action(&payload, &request_id, &project).await.unwrap().unwrap(), true);
+        let other = json!({"action":"submit","client_action_id":"android-action-2","user_input":"other"});
+        assert!(submit_android_action(&other, &request_id, &project).await.unwrap().is_err());
         match previous {
             Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR", value),
             None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR"),

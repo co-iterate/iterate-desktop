@@ -28,7 +28,7 @@ fn instance_debug_log(tag: &str, message: impl AsRef<str>) {
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/iterate-instance-debug.log")
+        .open(std::env::temp_dir().join("iterate-instance-debug.log"))
     {
         let _ = file.write_all(line.as_bytes());
     }
@@ -375,6 +375,95 @@ async fn kill_child_best_effort(
     }
 
     wait_child_exit_with_timeout(child, request_id, child_pid, reason).await
+}
+
+fn supervise_retained_dialog_child(
+    mut child: std::process::Child,
+    delivery: std::sync::Arc<crate::delivery::Delivery>,
+    close_after_remote_response: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    response_claim_path: std::path::PathBuf,
+    request_id: String,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _claim_cleanup = RetainedResponseClaimCleanup(response_claim_path);
+        let child_pid = child.id();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    instance_debug_log(
+                        "[serve-request-retained-child-monitor-failed]",
+                        format!("request_id={request_id}, child_pid={child_pid}, error={error}"),
+                    );
+                    let _ = child.wait();
+                    return;
+                }
+            }
+            if delivery.was_returned()
+                && close_after_remote_response.load(std::sync::atomic::Ordering::Acquire)
+            {
+                // The remote reply was parsed successfully. This GUI child did
+                // not submit locally, so it has no local cleanup to finish.
+                // Give it a brief chance to close itself first.
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if child.try_wait().ok().flatten().is_some() {
+                        return;
+                    }
+                }
+                if child.try_wait().ok().flatten().is_none() {
+                    instance_debug_log(
+                        "[serve-request-retained-child-close]",
+                        format!("request_id={request_id}, child_pid={child_pid}, reason=delivery_returned"),
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return;
+            }
+            if delivery.disconnected() {
+                // A failed handoff is recoverable in the existing window.
+                let _ = child.wait();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    })
+}
+
+struct RetainedResponseClaimCleanup(std::path::PathBuf);
+
+impl Drop for RetainedResponseClaimCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn is_bridge_written_response(response_file: &std::path::Path, content: &str) -> bool {
+    let marker_file = response_file.with_extension("bridge-response.sha256");
+    let Ok(recorded_hash) = std::fs::read_to_string(marker_file) else {
+        return false;
+    };
+    let actual_hash = hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        content.as_bytes(),
+    ));
+    recorded_hash == actual_hash
+}
+
+fn read_response_file_with_retry(response_file: &std::path::Path) -> std::io::Result<String> {
+    let mut last_content = None;
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(response_file) {
+            if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
+                return Ok(content);
+            }
+            last_content = Some(content);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    last_content.map(Ok).unwrap_or_else(|| std::fs::read_to_string(response_file))
 }
 
 /// 将 base64 图片保存为文件，返回文件路径列表
@@ -1410,6 +1499,8 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
     let temp_dir = std::env::temp_dir();
     let request_file = temp_dir.join(format!("iterate_request_{}.json", request_id));
     let response_file = temp_dir.join(format!("iterate_response_{}.json", request_id));
+    let response_claim_path = response_file.with_extension("response.claim");
+    let retain_response_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ready_file = temp_dir.join(format!("iterate_ready_{}.json", request_id));
 
     if let Err(e) = std::fs::write(
@@ -1427,11 +1518,10 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
         };
     }
     let cross_registration = crate::cross_device::register(&mcp_request, &request_file, &response_file).await;
-    // Every HTTP dialog has a Delivery. Deferred registration must retain that
-    // local disconnect/handoff tracking while adding later window synchronization.
-    let delivery = request.delivery.as_ref().filter(|_| {
-        !cross_registration.as_ref().is_some_and(|registration| registration.is_published())
-    });
+    // Every cross-device source popup must wait for the HTTP handler to accept
+    // the response before its frontend can publish a closed state. This also
+    // applies to registrations already published to the paired desktop.
+    let delivery = request.delivery.as_ref();
     // Legacy bridge writers do not understand arbitration. Do not publish a
     // directly writable response-file route for a cross-device request.
     let response_route_file = if cross_registration.is_none() {
@@ -1459,6 +1549,10 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
         if let Some(registration) = &cross_registration { registration.finish(); }
         let _ = std::fs::remove_file(&ready_file);
         let _ = std::fs::remove_file(&response_file);
+        let _ = std::fs::remove_file(response_file.with_extension("bridge-response.sha256"));
+        if !retain_response_claim.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = std::fs::remove_file(&response_claim_path);
+        }
         let _ = std::fs::remove_file(&request_file);
         let _ = std::fs::remove_file(&response_route_file);
     };
@@ -1477,387 +1571,487 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
             response_file.display()
         ),
     );
-    let child = std::process::Command::new(&exe_path)
-        .env("ITERATE_DELIVERY_FILE", delivery.map(|d| d.path.as_os_str()).unwrap_or_default())
-        .env("ITERATE_CROSS_DEVICE_SOURCE", cross_registration.as_ref().map(|r| r.key()).unwrap_or(""))
-        .env(
-            "ITERATE_MCP_REQUEST_FILE",
-            request_file.to_string_lossy().to_string(),
-        )
-        .env(
-            "ITERATE_RESPONSE_FILE",
-            response_file.to_string_lossy().to_string(),
-        )
-        .env(
-            "ITERATE_READY_FILE",
-            ready_file.to_string_lossy().to_string(),
-        )
-        .env("ITERATE_STANDALONE_MODE", "1")
-        .env("RUST_LOG", "off") // 禁用子进程日志
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-
-    match child {
-        Ok(mut child) => {
-            instance_debug_log(
-                "[serve-request-spawn-success]",
-                format!(
-                    "request_id={}, parent_request_id={}, child_pid={}",
-                    request_id,
-                    parent_request_id,
-                    child.id()
-                ),
-            );
-            let ready_timeout = dialog_gui_ready_timeout();
-            let startup_deadline = std::time::Instant::now() + ready_timeout;
-            let mut wait_result = None;
-
-            loop {
-                if let Some(registration) = &cross_registration { registration.renew(); }
-                if ready_file.exists() || response_file.exists() {
-                    let ready_file_exists = ready_file.exists();
-                    let response_file_exists = response_file.exists();
-                    instance_debug_log(
-                        "[serve-request-ready-observed]",
-                        format!(
-                            "request_id={}, child_pid={}, ready_file_exists={}, response_file_exists={}",
-                            request_id,
-                            child.id(),
-                            ready_file_exists,
-                            response_file_exists
-                        ),
-                    );
-                    if ready_file_exists && !response_file_exists {
-                        emit_interaction_phase(request, InteractionPhase::WaitingUser, &request_id);
-                        notify_bridge_apns_on_popup_ready(request_id.clone(), request);
-                    } else if response_file_exists {
-                        emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
-                    }
-                    break;
-                }
-
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        wait_result = Some(Ok(Some(status)));
-                        instance_debug_log(
-                            "[serve-request-child-exit-before-ready]",
-                            format!(
-                                "request_id={}, child_pid={}, status={:?}",
-                                request_id,
-                                child.id(),
-                                status
-                            ),
-                        );
-                        break;
-                    }
-                    Ok(None) => {
-                        if std::time::Instant::now() >= startup_deadline {
-                            instance_debug_log(
-                                "[serve-request-ready-timeout]",
-                                format!(
-                                    "request_id={}, child_pid={}, timeout_ms={}, ready_file={}, response_file={}",
-                                    request_id,
-                                    child.id(),
-                                    ready_timeout.as_millis(),
-                                    ready_file.display(),
-                                    response_file.display()
-                                ),
-                            );
-                            let child_pid = child.id();
-                            emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
-                            let reap_result =
-                                kill_child_best_effort(&mut child, &request_id, "ready_timeout")
-                                    .await;
-                            instance_debug_log(
-                                "[serve-request-ready-timeout-reaped]",
-                                format!(
-                                    "request_id={}, child_pid={}, reap_result={:?}",
-                                    request_id, child_pid, reap_result
-                                ),
-                            );
-                            cleanup_temp_files();
-                            return DialogResponse {
-                                keep_going: false,
-                                error: Some("GUI failed to become ready".to_string()),
-                                ..Default::default()
-                            };
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
-                    Err(err) => {
-                        instance_debug_log(
-                            "[serve-request-try-wait-failed]",
-                            format!(
-                                "request_id={}, child_pid={}, error={}",
-                                request_id,
-                                child.id(),
-                                err
-                            ),
-                        );
-                        cleanup_temp_files();
-                        emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
-                        return DialogResponse {
-                            keep_going: false,
-                            error: Some(format!("Failed to monitor GUI process: {}", err)),
-                            ..Default::default()
-                        };
-                    }
-                }
+    #[cfg(target_os = "windows")]
+    let mut webview_recovery_attempts = 0;
+    'popup_recovery: loop {
+        #[cfg(target_os = "windows")]
+        let startup_guard = match crate::ui::webview_recovery::startup_lock().await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                instance_debug_log("[serve-request-startup-lock-failed]", error);
+                None
             }
+        };
+        let popup_stderr = std::fs::OpenOptions::new().create(true).append(true)
+            .open(request_file.with_extension("stderr.log"))
+            .map(std::process::Stdio::from)
+            .unwrap_or_else(|error| {
+                instance_debug_log("[serve-request-log-open-failed]", error.to_string());
+                std::process::Stdio::null()
+            });
+        let child = std::process::Command::new(&exe_path)
+            .env("ITERATE_DELIVERY_FILE", delivery.map(|d| d.path.as_os_str()).unwrap_or_default())
+            .env("ITERATE_CROSS_DEVICE_SOURCE", cross_registration.as_ref().map(|r| r.key()).unwrap_or(""))
+            .env(
+                "ITERATE_MCP_REQUEST_FILE",
+                request_file.to_string_lossy().to_string(),
+            )
+            .env(
+                "ITERATE_RESPONSE_FILE",
+                response_file.to_string_lossy().to_string(),
+            )
+            .env(
+                "ITERATE_READY_FILE",
+                ready_file.to_string_lossy().to_string(),
+            )
+            .env("ITERATE_STANDALONE_MODE", "1")
+            .env("RUST_LOG", "warn") // Preserve failure diagnostics without logging request content.
+            .env("ITERATE_WEBVIEW_SUPERVISED", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(popup_stderr)
+            .spawn();
 
-            let wait_result = match wait_result {
-                Some(result) => result,
-                None => loop {
+        return match child {
+            Ok(mut child) => {
+                instance_debug_log(
+                    "[serve-request-spawn-success]",
+                    format!(
+                        "request_id={}, parent_request_id={}, child_pid={}",
+                        request_id,
+                        parent_request_id,
+                        child.id()
+                    ),
+                );
+                let ready_timeout = dialog_gui_ready_timeout();
+                #[cfg(target_os = "windows")]
+                let ready_timeout = if webview_recovery_attempts > 0 {
+                    ready_timeout.min(std::time::Duration::from_secs(10))
+                } else {
+                    ready_timeout
+                };
+                let startup_deadline = std::time::Instant::now() + ready_timeout;
+                let mut wait_result = None;
+
+                loop {
                     if let Some(registration) = &cross_registration { registration.renew(); }
-                    if delivery.is_some_and(|d| d.disconnected()) {
-                        break Ok(None);
-                    }
-                    if response_file.exists() {
-                        emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
+                    if ready_file.exists() || response_file.exists() {
+                        let ready_file_exists = ready_file.exists();
+                        let response_file_exists = response_file.exists();
                         instance_debug_log(
-                            "[serve-request-response-file-observed]",
-                            format!("request_id={}, child_pid={}", request_id, child.id()),
+                            "[serve-request-ready-observed]",
+                            format!(
+                                "request_id={}, child_pid={}, ready_file_exists={}, response_file_exists={}",
+                                request_id,
+                                child.id(),
+                                ready_file_exists,
+                                response_file_exists
+                            ),
                         );
-                        // The hidden window awaits local handoff and can still recover.
-                        if delivery.is_some() { break Ok(None); }
-                        break match kill_child_best_effort(
-                            &mut child,
-                            &request_id,
-                            "response_file_observed",
-                        )
-                        .await
-                        {
-                            Some(status) => Ok(Some(status)),
-                            None => Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "GUI child did not exit after kill",
-                            )),
-                        };
+                        if ready_file_exists && !response_file_exists {
+                            emit_interaction_phase(request, InteractionPhase::WaitingUser, &request_id);
+                            notify_bridge_apns_on_popup_ready(request_id.clone(), request);
+                        } else if response_file_exists {
+                            emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
+                        }
+                        break;
                     }
 
                     match child.try_wait() {
-                        Ok(Some(status)) => break Ok(Some(status)),
-                        Ok(None) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
-                        Err(err) => break Err(err),
-                    }
-                },
-            };
-            if matches!(&wait_result, Ok(None)) {
-                // Reap the retained GUI after it exits; never kill a failure window.
-                let retained_delivery = delivery.cloned();
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                    drop(retained_delivery);
-                });
-            }
-            instance_debug_log(
-                "[serve-request-child-exit]",
-                format!("request_id={}, wait_result={:?}", request_id, wait_result),
-            );
-
-            // 读取响应文件
-            if let Some(registration) = &cross_registration { registration.recover_accepted_response(); }
-            let response_file_exists = response_file.exists();
-            let ready_file_exists = ready_file.exists();
-            if response_file_exists {
-                emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
-                if let Ok(content) = std::fs::read_to_string(&response_file) {
-                    if let Ok(response) = serde_json::from_str::<serde_json::Value>(&content) {
-                        instance_debug_log(
-                            "[serve-request-response-loaded]",
-                            format!(
-                                "request_id={}, parent_request_id={}, content_len={}, response_source={:?}",
-                                request_id,
-                                parent_request_id,
-                                content.len(),
-                                response
-                                    .get("metadata")
-                                    .and_then(|v| v.get("source"))
-                                    .and_then(|v| v.as_str())
-                            ),
-                        );
-                        cleanup_temp_files();
-                        emit_interaction_phase(request, InteractionPhase::Cleaning, &request_id);
-
-                        let raw_user_input = response
-                            .get("user_input")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let submitted_options: Vec<String> = response
-                            .get("selected_options")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let submitted_source = response
-                            .get("metadata")
-                            .and_then(|v| v.get("source"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let explicit_end =
-                            crate::conversation::is_explicit_conversation_end_response(
-                                &raw_user_input,
-                                &submitted_options,
+                        Ok(Some(status)) => {
+                            wait_result = Some(Ok(Some(status)));
+                            instance_debug_log(
+                                "[serve-request-child-exit-before-ready]",
+                                format!(
+                                    "request_id={}, child_pid={}, status={:?}",
+                                    request_id,
+                                    child.id(),
+                                    status
+                                ),
                             );
-                        let popup_closed =
-                            crate::conversation::is_popup_closed_response_source(&submitted_source);
-                        let interaction_ended = explicit_end || popup_closed;
+                            break;
+                        }
+                        Ok(None) => {
+                            if std::time::Instant::now() >= startup_deadline {
+                                instance_debug_log(
+                                    "[serve-request-ready-timeout]",
+                                    format!(
+                                        "request_id={}, child_pid={}, timeout_ms={}, ready_file={}, response_file={}",
+                                        request_id,
+                                        child.id(),
+                                        ready_timeout.as_millis(),
+                                        ready_file.display(),
+                                        response_file.display()
+                                    ),
+                                );
+                                let child_pid = child.id();
+                                let reap_result =
+                                    kill_child_best_effort(&mut child, &request_id, "ready_timeout")
+                                        .await;
+                                instance_debug_log(
+                                    "[serve-request-ready-timeout-reaped]",
+                                    format!(
+                                        "request_id={}, child_pid={}, reap_result={:?}",
+                                        request_id, child_pid, reap_result
+                                    ),
+                                );
+                                #[cfg(target_os = "windows")]
+                                if webview_recovery_attempts > 0 && webview_recovery_attempts < 3
+                                    && reap_result.is_some() && !response_file.exists()
+                                    && !delivery.is_some_and(|d| d.disconnected())
+                                {
+                                    webview_recovery_attempts += 1;
+                                    instance_debug_log("[serve-request-webview-startup-retry]", format!(
+                                        "request_id={}, attempt={}", request_id, webview_recovery_attempts));
+                                    drop(startup_guard);
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                    continue 'popup_recovery;
+                                }
+                                emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
+                                cleanup_temp_files();
+                                return DialogResponse {
+                                    keep_going: false,
+                                    error: Some("GUI failed to become ready".to_string()),
+                                    ..Default::default()
+                                };
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                        Err(err) => {
+                            instance_debug_log(
+                                "[serve-request-try-wait-failed]",
+                                format!(
+                                    "request_id={}, child_pid={}, error={}",
+                                    request_id,
+                                    child.id(),
+                                    err
+                                ),
+                            );
+                            cleanup_temp_files();
+                            emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
+                            return DialogResponse {
+                                keep_going: false,
+                                error: Some(format!("Failed to monitor GUI process: {}", err)),
+                                ..Default::default()
+                            };
+                        }
+                    }
+                }
 
-                        // 结束当前交互时不携带选项或附件进入业务响应。
-                        let image_paths = if interaction_ended {
-                            vec![]
-                        } else if let Some(images) =
-                            response.get("images").and_then(|v| v.as_array())
-                        {
-                            save_images_to_files(images)
-                        } else {
-                            vec![]
-                        };
+                #[cfg(target_os = "windows")]
+                drop(startup_guard);
+                let wait_result = match wait_result {
+                    Some(result) => result,
+                    None => loop {
+                        if let Some(registration) = &cross_registration { registration.renew(); }
+                        if delivery.is_some_and(|d| d.disconnected()) {
+                            break Ok(None);
+                        }
+                        if response_file.exists() {
+                            emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
+                            instance_debug_log(
+                                "[serve-request-response-file-observed]",
+                                format!("request_id={}, child_pid={}", request_id, child.id()),
+                            );
+                            // The hidden window awaits local handoff and can still recover.
+                            if delivery.is_some() { break Ok(None); }
+                            break match kill_child_best_effort(
+                                &mut child,
+                                &request_id,
+                                "response_file_observed",
+                            )
+                            .await
+                            {
+                                Some(status) => Ok(Some(status)),
+                                None => Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "GUI child did not exit after kill",
+                                )),
+                            };
+                        }
 
-                        let response_source = if explicit_end {
-                            crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE.to_string()
-                        } else if popup_closed {
-                            crate::conversation::POPUP_CLOSED_SOURCE.to_string()
-                        } else {
-                            submitted_source
-                        };
-                        let file_paths: Vec<String> = if interaction_ended {
-                            vec![]
-                        } else {
-                            response
-                                .get("file_paths")
+                        match child.try_wait() {
+                            Ok(Some(status)) => break Ok(Some(status)),
+                            Ok(None) => {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    },
+                };
+                #[cfg(target_os = "windows")]
+                if wait_result.as_ref().ok().and_then(|s| s.as_ref()).and_then(|s| s.code())
+                    == Some(crate::ui::webview_recovery::RECOVERY_EXIT_CODE)
+                    && !response_file.exists()
+                    && webview_recovery_attempts < 3
+                    && !delivery.is_some_and(|d| d.disconnected())
+                {
+                    webview_recovery_attempts += 1;
+                    instance_debug_log("[serve-request-webview-recovery]", format!(
+                        "request_id={}, child_pid={}, attempt={}", request_id, child.id(), webview_recovery_attempts));
+                    // Keep the original request and response route. A replacement must
+                    // publish its own readiness before this request is waiting again.
+                    let _ = std::fs::remove_file(&ready_file);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                let close_after_remote_response =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if matches!(&wait_result, Ok(None)) {
+                    retain_response_claim.store(true, std::sync::atomic::Ordering::Release);
+                    if let Some(retained_delivery) = delivery.cloned() {
+                        let _ = supervise_retained_dialog_child(
+                            child, retained_delivery, close_after_remote_response.clone(),
+                            response_claim_path.clone(),
+                            request_id.clone(),
+                        );
+                    } else {
+                        // Disconnected calls without a handoff tracker retain
+                        // the existing reap-only behavior.
+                        let claim_path = response_claim_path.clone();
+                        std::thread::spawn(move || {
+                            let _claim_cleanup = RetainedResponseClaimCleanup(claim_path);
+                            let _ = child.wait();
+                        });
+                    }
+                }
+                instance_debug_log(
+                    "[serve-request-child-exit]",
+                    format!("request_id={}, wait_result={:?}", request_id, wait_result),
+                );
+
+                // 读取响应文件
+                if let Some(registration) = &cross_registration { registration.recover_accepted_response(); }
+                let response_file_exists = response_file.exists();
+                let ready_file_exists = ready_file.exists();
+                if response_file_exists {
+                    emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
+                    if let Ok(content) = read_response_file_with_retry(&response_file) {
+                        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let bridge_written_response =
+                                is_bridge_written_response(&response_file, &content);
+                            instance_debug_log(
+                                "[serve-request-response-loaded]",
+                                format!(
+                                    "request_id={}, parent_request_id={}, content_len={}, response_source={:?}",
+                                    request_id,
+                                    parent_request_id,
+                                    content.len(),
+                                    response
+                                        .get("metadata")
+                                        .and_then(|v| v.get("source"))
+                                        .and_then(|v| v.as_str())
+                                ),
+                            );
+                            cleanup_temp_files();
+                            emit_interaction_phase(request, InteractionPhase::Cleaning, &request_id);
+
+                            if response.as_str() == Some("CANCELLED") {
+                                if bridge_written_response {
+                                    close_after_remote_response
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                }
+                                return DialogResponse {
+                                    keep_going: false,
+                                    response_source: crate::conversation::POPUP_CLOSED_SOURCE.to_string(),
+                                    error: None,
+                                    ..Default::default()
+                                };
+                            }
+
+                            let raw_user_input = response
+                                .get("user_input")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let submitted_options: Vec<String> = response
+                                .get("selected_options")
                                 .and_then(|v| v.as_array())
                                 .map(|arr| {
                                     arr.iter()
                                         .filter_map(|v| v.as_str().map(String::from))
                                         .collect()
                                 })
-                                .unwrap_or_default()
-                        };
-                        let mut metadata = response
-                            .get("metadata")
-                            .cloned()
-                            .and_then(|value| {
-                                serde_json::from_value::<crate::mcp::ResponseMetadata>(value).ok()
-                            })
-                            .unwrap_or_default();
-                        if interaction_ended {
-                            metadata.source = Some(response_source.clone());
-                        }
-                        let user_input = enrich_goal_user_input_with_attachment_paths(
-                            raw_user_input,
-                            &response_source,
-                            &file_paths,
-                            &image_paths,
-                        );
+                                .unwrap_or_default();
+                            let submitted_source = response
+                                .get("metadata")
+                                .and_then(|v| v.get("source"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if bridge_written_response {
+                                close_after_remote_response
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            let explicit_end =
+                                crate::conversation::is_explicit_conversation_end_response(
+                                    &raw_user_input,
+                                    &submitted_options,
+                                );
+                            let popup_closed =
+                                crate::conversation::is_popup_closed_response_source(&submitted_source);
+                            let interaction_ended = explicit_end || popup_closed;
 
-                        return DialogResponse {
-                            keep_going: !interaction_ended,
-                            user_input,
-                            response_source,
-                            selected_options: if interaction_ended {
+                            // 结束当前交互时不携带选项或附件进入业务响应。
+                            let image_paths = if interaction_ended {
+                                vec![]
+                            } else if let Some(images) =
+                                response.get("images").and_then(|v| v.as_array())
+                            {
+                                save_images_to_files(images)
+                            } else {
+                                vec![]
+                            };
+
+                            let response_source = if explicit_end {
+                                crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE.to_string()
+                            } else if popup_closed {
+                                crate::conversation::POPUP_CLOSED_SOURCE.to_string()
+                            } else {
+                                submitted_source
+                            };
+                            let file_paths: Vec<String> = if interaction_ended {
                                 vec![]
                             } else {
-                                submitted_options
-                            },
-                            file_paths,
-                            image_paths,
-                            metadata,
-                            error: None,
-                        };
+                                response
+                                    .get("file_paths")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let mut metadata = response
+                                .get("metadata")
+                                .cloned()
+                                .and_then(|value| {
+                                    serde_json::from_value::<crate::mcp::ResponseMetadata>(value).ok()
+                                })
+                                .unwrap_or_default();
+                            // The HTTP handler must confirm the registration
+                            // belonging to this serve request, never an ID
+                            // supplied inside a remote response body.
+                            if cross_registration.is_some() {
+                                metadata.request_id = Some(request_id.clone());
+                            }
+                            if interaction_ended {
+                                metadata.source = Some(response_source.clone());
+                            }
+                            let user_input = enrich_goal_user_input_with_attachment_paths(
+                                raw_user_input,
+                                &response_source,
+                                &file_paths,
+                                &image_paths,
+                            );
+
+                            let dialog_response = DialogResponse {
+                                keep_going: !interaction_ended,
+                                user_input,
+                                response_source,
+                                selected_options: if interaction_ended {
+                                    vec![]
+                                } else {
+                                    submitted_options
+                                },
+                                file_paths,
+                                image_paths,
+                                metadata,
+                                source_request_id: cross_registration.as_ref().map(|_| request_id.clone()),
+                                error: None,
+                            };
+                            if let Some(registration) = &cross_registration {
+                                if let Err(error) = crate::cross_device::mark_source_prepared(registration, &response) {
+                                    instance_debug_log("[serve-request-cross-device-prepare-failed]", format!("request_id={}, error={}", request_id, error));
+                                }
+                            }
+                            return dialog_response;
+                        }
+                        instance_debug_log(
+                            "[serve-request-response-parse-failed]",
+                            format!(
+                                "request_id={}, parent_request_id={}, content_len={}",
+                                request_id,
+                                parent_request_id,
+                                content.len()
+                            ),
+                        );
+                    } else {
+                        instance_debug_log(
+                            "[serve-request-response-read-failed]",
+                            format!(
+                                "request_id={}, parent_request_id={}, response_file={}",
+                                request_id,
+                                parent_request_id,
+                                response_file.display()
+                            ),
+                        );
                     }
-                    instance_debug_log(
-                        "[serve-request-response-parse-failed]",
-                        format!(
-                            "request_id={}, parent_request_id={}, content_len={}",
-                            request_id,
-                            parent_request_id,
-                            content.len()
-                        ),
-                    );
                 } else {
                     instance_debug_log(
-                        "[serve-request-response-read-failed]",
+                        "[serve-request-response-missing]",
                         format!(
-                            "request_id={}, parent_request_id={}, response_file={}",
+                            "request_id={}, parent_request_id={}, response_file={}, ready_file_exists={}, response_route_file_exists={}",
                             request_id,
                             parent_request_id,
-                            response_file.display()
+                            response_file.display(),
+                            ready_file_exists,
+                            response_route_file.exists()
                         ),
                     );
                 }
-            } else {
-                instance_debug_log(
-                    "[serve-request-response-missing]",
-                    format!(
-                        "request_id={}, parent_request_id={}, response_file={}, ready_file_exists={}, response_route_file_exists={}",
-                        request_id,
-                        parent_request_id,
-                        response_file.display(),
-                        ready_file_exists,
-                        response_route_file.exists()
-                    ),
-                );
-            }
 
-            let child_exited_successfully =
-                wait_result.as_ref().is_ok_and(|status| status.as_ref().is_some_and(|s| s.success()));
-            if let Some(dismissal_response) = clean_dialog_dismissal_response(
-                ready_file_exists,
-                response_file_exists,
-                child_exited_successfully,
-            ) {
+                let child_exited_successfully =
+                    wait_result.as_ref().is_ok_and(|status| status.as_ref().is_some_and(|s| s.success()));
+                if let Some(dismissal_response) = clean_dialog_dismissal_response(
+                    ready_file_exists,
+                    response_file_exists,
+                    child_exited_successfully,
+                ) {
+                    cleanup_temp_files();
+                    emit_interaction_phase(request, InteractionPhase::Cleaning, &request_id);
+                    instance_debug_log(
+                        "[serve-request-finish-dismissed]",
+                        format!(
+                            "request_id={}, parent_request_id={}, returning_keep_going_false",
+                            request_id, parent_request_id
+                        ),
+                    );
+
+                    return dismissal_response;
+                }
+
+                // 清理临时文件
                 cleanup_temp_files();
-                emit_interaction_phase(request, InteractionPhase::Cleaning, &request_id);
+                emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
                 instance_debug_log(
-                    "[serve-request-finish-dismissed]",
+                    "[serve-request-finish-no-response]",
                     format!(
-                        "request_id={}, parent_request_id={}, returning_keep_going_false",
+                        "request_id={}, parent_request_id={}, returning_no_response_from_gui",
                         request_id, parent_request_id
                     ),
                 );
 
-                return dismissal_response;
+                DialogResponse {
+                    keep_going: false,
+                    error: Some("No response from GUI".to_string()),
+                    ..Default::default()
+                }
             }
-
-            // 清理临时文件
-            cleanup_temp_files();
-            emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
-            instance_debug_log(
-                "[serve-request-finish-no-response]",
-                format!(
-                    "request_id={}, parent_request_id={}, returning_no_response_from_gui",
-                    request_id, parent_request_id
-                ),
-            );
-
-            DialogResponse {
-                keep_going: false,
-                error: Some("No response from GUI".to_string()),
-                ..Default::default()
+            Err(e) => {
+                instance_debug_log(
+                    "[serve-request-spawn-failed]",
+                    format!("request_id={}, error={}", request_id, e),
+                );
+                cleanup_temp_files();
+                emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
+                DialogResponse {
+                    keep_going: false,
+                    error: Some(format!("Failed to start GUI: {}", e)),
+                    ..Default::default()
+                }
             }
-        }
-        Err(e) => {
-            instance_debug_log(
-                "[serve-request-spawn-failed]",
-                format!("request_id={}, error={}", request_id, e),
-            );
-            cleanup_temp_files();
-            emit_interaction_phase(request, InteractionPhase::Failed, &request_id);
-            DialogResponse {
-                keep_going: false,
-                error: Some(format!("Failed to start GUI: {}", e)),
-                ..Default::default()
-            }
-        }
+        };
     }
 }
 
@@ -2317,7 +2511,7 @@ fn print_help() {
         "  iterate --relay-mac-client --relay-url URL [--device-id ID] [--relay-token-env ENV]\n",
         "  iterate --cloudflare-auto-setup-smoke --zone Z --subdomain S --api-token-env ENV\n",
         "  iterate --mobile-route-status 读取脱敏的正式手机公网配置与健康状态\n",
-        "  iterate --mobile-route-register --base-url URL [--transport cloudflare_named_tunnel]\n",
+        "  iterate --mobile-route-register --base-url URL [--transport cloudflare_named_tunnel|aliyun_ssh_reverse_tunnel]\n",
         "  iterate --mobile-route-verify  重新验证已登记的正式手机公网路线\n",
         "  iterate --mcp-request <文件>  处理 MCP 请求\n",
         "  iterate --check-frontend-assets [--frontend-dist dist]  检查生产包前端资源\n",
@@ -2344,8 +2538,8 @@ fn print_help() {
         "  --access-email E    可选，创建 Access allow policy；多个邮箱用逗号分隔\n",
         "\n",
         "--mobile-route-register 模式（只保存脱敏回执；登记前强制验证本机归属）:\n",
-        "  --base-url U        当前 Mac 自己的稳定 HTTPS origin\n",
-        "  --transport T       当前仅支持 cloudflare_named_tunnel\n",
+        "  --base-url U        当前电脑自己的稳定 HTTPS origin\n",
+        "  --transport T       cloudflare_named_tunnel / aliyun_ssh_reverse_tunnel\n",
         "  --source S          ai_configured / manual_adopt / legacy_migration\n",
         "\n",
         "--bridge 模式（替代 cunzhi.py）:\n",
@@ -2382,6 +2576,86 @@ fn write_stdout_lossy(text: &str) {
 mod tests {
     use super::*;
     use std::fs::File;
+
+    fn spawn_retained_child_for_test() -> std::process::Child {
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                "-Command", "Start-Sleep -Seconds 2"]);
+            command
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut command = {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("2");
+            command
+        };
+        command.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().unwrap()
+    }
+
+    #[test]
+    fn retained_child_closes_after_delivery_returned() {
+        let delivery = std::sync::Arc::new(crate::delivery::Delivery::new().unwrap());
+        let close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child = spawn_retained_child_for_test();
+        let claim_path = std::env::temp_dir().join(format!("test-claim-{}", uuid::Uuid::new_v4()));
+        let monitor = supervise_retained_dialog_child(child, delivery.clone(), close, claim_path,
+            "test-returned".to_string());
+        delivery.returned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while !monitor.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(monitor.is_finished(), "returned delivery should close its child promptly");
+        monitor.join().unwrap();
+    }
+
+    #[test]
+    fn retained_child_survives_delivery_failed_until_it_exits_itself() {
+        let delivery = std::sync::Arc::new(crate::delivery::Delivery::new().unwrap());
+        let close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child = spawn_retained_child_for_test();
+        let claim_path = std::env::temp_dir().join(format!("test-claim-{}", uuid::Uuid::new_v4()));
+        let monitor = supervise_retained_dialog_child(child, delivery.clone(), close, claim_path,
+            "test-failed".to_string());
+        delivery.failed();
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        assert!(!monitor.is_finished(), "failed handoff must leave the child available");
+        monitor.join().unwrap();
+    }
+
+    #[test]
+    fn retained_child_is_not_killed_for_local_or_invalid_response() {
+        let delivery = std::sync::Arc::new(crate::delivery::Delivery::new().unwrap());
+        let close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child = spawn_retained_child_for_test();
+        let claim_path = std::env::temp_dir().join(format!("test-claim-{}", uuid::Uuid::new_v4()));
+        let monitor = supervise_retained_dialog_child(child, delivery.clone(), close, claim_path,
+            "test-no-remote-response".to_string());
+        delivery.returned();
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        assert!(!monitor.is_finished(), "local cleanup or invalid response must not be cut off");
+        monitor.join().unwrap();
+    }
+
+    #[test]
+    fn bridge_written_response_requires_matching_file_marker() {
+        let response_file = std::env::temp_dir()
+            .join(format!("iterate_response_{}.json", uuid::Uuid::new_v4()));
+        let marker_file = response_file.with_extension("bridge-response.sha256");
+        let content = r#"{"user_input":"phone reply"}"#;
+        assert!(!is_bridge_written_response(&response_file, content));
+        let hash = hex::encode(ring::digest::digest(
+            &ring::digest::SHA256, content.as_bytes(),
+        ));
+        std::fs::write(&marker_file, hash).unwrap();
+        assert!(is_bridge_written_response(&response_file, content));
+        assert!(!is_bridge_written_response(&response_file, r#"{"user_input":"local reply"}"#));
+        std::fs::remove_file(marker_file).unwrap();
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

@@ -179,7 +179,7 @@ test('pairing freshness enforces a minimum lifetime', () => {
   assert.equal(pairingPayloadIsFresh({ expires_at: new Date(now + 30_000).toISOString() }, now, 30), false)
 })
 
-test('compact QR payload keeps only fields required by iPhone import', () => {
+test('compact QR payload keeps only fields required by Android import', () => {
   const payload = buildCompactMobilePairingPayload({
     version: 2,
     device_id: 'mac',
@@ -234,6 +234,9 @@ test('production wizard exposes formal setup and repair prompts without Quick or
   assert.match(setup, /登录 Cloudflare[\s\S]*必须暂停/)
   assert.match(setup, /禁止[\s\S]*token/)
   assert.match(wizard, /复制 AI 配置提示词/)
+  assert.match(wizard, /title="连接 Android"/)
+  assert.match(wizard, /Android 一次性连接二维码/)
+  assert.doesNotMatch(wizard, /iPhone/)
   assert.match(wizard, /修复现有配置/)
   assert.match(wizard, /state\.stage === 'setup_required'/)
   assert.match(wizard, /state\.stage === 'repair_required'/)
@@ -250,7 +253,13 @@ test('production wizard exposes formal setup and repair prompts without Quick or
 
 test('formal AI prompts are redacted, route-scoped, and contain no developer hostname', async () => {
   const prompt = await readFile(new URL('./useMobileConnectionSetup.ts', import.meta.url), 'utf8')
+  const aliyunSetup = prompt.slice(prompt.indexOf('export function buildAliyunIpRouteSetupPrompt()'), prompt.indexOf('export function buildFormalRouteSetupPrompt()'))
 
+  assert.match(aliyunSetup, /公网 Host（含端口）/)
+  assert.match(aliyunSetup, /X-Forwarded-For/)
+  assert.match(aliyunSetup, /X-Forwarded-Proto/)
+  assert.match(aliyunSetup, /\/api\/config、\/api\/active-sessions 及 \/ws WebSocket Upgrade 都必须返回 401/)
+  assert.match(aliyunSetup, /不得关闭 Bridge 鉴权/)
   assert.match(prompt, /buildFormalRouteSetupPrompt/)
   assert.match(prompt, /buildFormalRouteRepairPrompt/)
   assert.match(prompt, /\$\{safeBaseUrl\}/)
@@ -270,6 +279,25 @@ test('bootstrap branches only on persisted formal route status', async () => {
   assert.ok(pairingRead > bootstrapStart)
   assert.ok(formalDecision > pairingRead)
   assert.doesNotMatch(setup.slice(bootstrapStart), /readQuickTunnelStatus/)
+  assert.match(setup, /\/api\/android\/pairing\/status/)
+  assert.match(setup, /\/api\/android\/pairing\/sessions\//)
+  assert.match(setup, /\/api\/android\/pairing`/)
+  assert.doesNotMatch(setup, /\/api\/mobile\/pairing/)
+})
+
+test('verified Aliyun IP route permits a matching secure Android pairing candidate', () => {
+  assert.equal(resolveMobileConnectionBootstrap({
+    formal_route: {
+      ...healthyFormalRoute,
+      transport: 'aliyun_ssh_reverse_tunnel',
+      base_url: 'https://8.129.82.226:8443',
+    },
+    candidates: [{
+      ...healthyPublic,
+      base_url: 'https://8.129.82.226:8443',
+      ws_url: 'wss://8.129.82.226:8443/ws',
+    }],
+  }), 'issue_pairing')
 })
 
 test('wizard reopens only an unclaimed fresh QR without preparing the bridge again', async () => {

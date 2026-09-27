@@ -492,10 +492,12 @@ async function openLocalMarkdownHref(href: string, event: MouseEvent) {
   }
 
   if (isOutsideCurrentProject(target, projectPath)) {
+    const platform = navigator.platform.toUpperCase()
+    const fileManager = platform.includes('WIN') ? '资源管理器' : platform.includes('MAC') ? 'Finder' : '文件管理器'
     dialog.warning({
-      title: '打开跨项目文件？',
-      content: `将在 Finder 中定位此文件，不会直接打开、执行或交给编辑器：\n${target.path}`,
-      positiveText: '在 Finder 中定位',
+      title: '打开跨项目文件或文件夹？',
+      content: `将在${fileManager}中打开文件夹或定位文件，不会执行文件或交给编辑器：\n${target.path}`,
+      positiveText: `在${fileManager}中打开`,
       negativeText: '取消',
       onPositiveClick: () => {
         void openConfirmedExternalLocalFile(target.path)

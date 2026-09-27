@@ -2,7 +2,40 @@
  * 事件处理器封装
  * 将复杂的事件传递简化为可复用的处理器
  */
-export function useEventHandlers(actions: any, _mcpRequest?: any) {
+function nonEmptyRoutePart(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function requestIdForWindow(request: any): string | null {
+  return nonEmptyRoutePart(request?.id)
+    ?? nonEmptyRoutePart(request?.request_id)
+    ?? nonEmptyRoutePart(request?.requestId)
+    ?? nonEmptyRoutePart(request?.metadata?.request_id)
+    ?? nonEmptyRoutePart(request?.metadata?.requestId)
+}
+
+/** A Bridge action may affect only the exact request displayed by this window. */
+export function isBridgeActionForWindow(payload: any, request: any): boolean {
+  const targetRequestId = nonEmptyRoutePart(payload?.request_id)
+    ?? nonEmptyRoutePart(payload?.requestId)
+    ?? nonEmptyRoutePart(payload?.metadata?.request_id)
+    ?? nonEmptyRoutePart(payload?.metadata?.requestId)
+  const targetProjectPath = nonEmptyRoutePart(payload?.project_path)
+    ?? nonEmptyRoutePart(payload?.projectPath)
+  const currentRequestId = requestIdForWindow(request)
+  const currentProjectPath = nonEmptyRoutePart(request?.project_path)
+    ?? nonEmptyRoutePart(request?.projectPath)
+
+  if (!targetProjectPath || targetProjectPath !== currentProjectPath)
+    return false
+
+  // Legacy project-only actions are for windows without a bound request.
+  // Authenticated Android actions require both route fields in the Bridge and
+  // never reach this frontend fallback.
+  return targetRequestId ? targetRequestId === currentRequestId : currentRequestId === null
+}
+
+export function useEventHandlers(actions: any, getMcpRequest: () => any) {
   return {
     // MCP 事件
     onMcpResponse: actions.mcp.handleResponse,
@@ -31,6 +64,10 @@ export function useEventHandlers(actions: any, _mcpRequest?: any) {
 
     // Bridge 事件
     onBridgeAction: async (payload: any) => {
+      if (!isBridgeActionForWindow(payload, getMcpRequest())) {
+        console.warn('[useEventHandlers] 忽略目标请求不匹配的 Bridge 动作')
+        return
+      }
       console.log('🎯 [useEventHandlers] 收到 Bridge 动作:', payload)
       const {
         action,

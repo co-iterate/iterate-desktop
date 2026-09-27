@@ -7,6 +7,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
 import { useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { isBridgeActionForWindow } from '../composables/useEventHandlers'
 import { setupExitWarningListener } from '../composables/useExitWarning'
 import { useKeyboard } from '../composables/useKeyboard'
 import { useVersionCheck } from '../composables/useVersionCheck'
@@ -977,8 +978,10 @@ async function pullCachedBridgeAction(reason: string) {
       return
     const data = await res.json()
     const action = data?.action
-    if (action && !handleWindowConditionalAction(action))
-      emit('bridgeAction', action)
+    if (action && isBridgeActionForWindow(action, props.mcpRequest)) {
+      if (!handleWindowConditionalAction(action))
+        emit('bridgeAction', action)
+    }
   }
   catch (e) {
     const now = Date.now()
@@ -1398,6 +1401,8 @@ onMounted(async () => {
     }
     else if (message_type === 'mcp_action') {
       // 转发 Web 端的动作到本地处理逻辑
+      if (!isBridgeActionForWindow(payload, props.mcpRequest))
+        return
       if (handleWindowConditionalAction(payload))
         return
       emit('bridgeAction', payload)

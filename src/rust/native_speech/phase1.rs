@@ -26,6 +26,22 @@ pub const SESSION_SNAPSHOT_EVENT: &str = "speech://session-snapshot";
 pub const PROCESS_TRANSCRIPT_EVENT: &str = "speech://process-transcript";
 
 static PHASE1_RUNTIME: OnceLock<Arc<Phase1Runtime>> = OnceLock::new();
+static DIAGNOSTIC_OWNER_EPOCH: Mutex<Option<OwnerEpoch>> = Mutex::new(None);
+
+pub(crate) fn diagnostic_owner_epoch() -> Option<OwnerEpoch> {
+    DIAGNOSTIC_OWNER_EPOCH.lock().ok().and_then(|value| *value)
+}
+
+/// Tracks the existing supervisor's lease lifetime for status display only.
+struct DiagnosticOwnerLease;
+
+impl Drop for DiagnosticOwnerLease {
+    fn drop(&mut self) {
+        if let Ok(mut value) = DIAGNOSTIC_OWNER_EPOCH.lock() {
+            *value = None;
+        }
+    }
+}
 #[cfg(target_os = "macos")]
 static PHASE1_SUPERVISOR_STARTED: AtomicBool = AtomicBool::new(false);
 static PENDING_POPUP_INSERT: OnceLock<Mutex<Option<PendingPopupInsert>>> = OnceLock::new();
@@ -247,6 +263,9 @@ impl SpeechEffectExecutor for Phase1EffectExecutor {
                 });
             }
             SpeechEffect::ProcessTranscript { identity, text } => {
+                super::debug_log("[transcript-processing-start]", format!(
+                    "session={} revision={} text_len={}",
+                    identity.session_sequence, identity.revision, text.chars().count()));
                 if self
                     .app
                     .emit(
@@ -255,13 +274,28 @@ impl SpeechEffectExecutor for Phase1EffectExecutor {
                     )
                     .is_err()
                 {
+                    super::debug_log("[transcript-processing-emit-failed]", format!(
+                        "session={} revision={}", identity.session_sequence, identity.revision));
                     let _ = completion.send(SpeechControlInput::ProcessingFailed { identity });
                 }
             }
             SpeechEffect::DispatchWriteback { identity, text } => {
+                super::debug_log("[writeback-dispatch-start]", format!(
+                    "session={} revision={}", identity.session_sequence, identity.revision));
                 let app = self.app.clone();
                 std::thread::spawn(move || {
-                    match super::dispatch_speech_writeback(identity, text) {
+                    let result = super::dispatch_speech_writeback(identity, text);
+                    let outcome = match &result {
+                        Ok(super::SpeechWritebackDispatch::ExternalAcknowledged) => "acknowledged",
+                        Ok(super::SpeechWritebackDispatch::ExternalDispatchedUnverified) => "dispatched-unverified",
+                        Ok(super::SpeechWritebackDispatch::ExternalUnknownAfterDispatch) => "unknown-after-dispatch",
+                        Ok(super::SpeechWritebackDispatch::Popup(_)) => "popup-awaiting-ack",
+                        Err(_) => "dispatch-failed",
+                    };
+                    // Do not log transcripts or arbitrary downstream error strings.
+                    super::debug_log("[writeback-dispatch-result]", format!(
+                        "session={} revision={} outcome={outcome}", identity.session_sequence, identity.revision));
+                    match result {
                         Ok(super::SpeechWritebackDispatch::ExternalAcknowledged) => {
                             let _ = completion
                                 .send(SpeechControlInput::WritebackDispatched { identity });
@@ -499,6 +533,10 @@ fn run_owner_supervisor(app: AppHandle, role: SpeechProcessRole) {
         });
         if let Some(epoch) = acquired {
             if initialize_runtime(&app, role, epoch).is_ok() {
+                if let Ok(mut value) = DIAGNOSTIC_OWNER_EPOCH.lock() {
+                    *value = Some(epoch);
+                }
+                let _diagnostic_lease = DiagnosticOwnerLease;
                 run_fn_transport(&mut supervisor);
                 return;
             }
@@ -878,8 +916,19 @@ pub fn complete_speech_processing(
     identity: SpeechLayerIdentity,
     text: String,
 ) -> Result<(), String> {
-    validate(identity)?;
-    send_control_input(SpeechControlInput::TranscriptProcessed { identity, text })
+    super::debug_log("[transcript-processing-complete-received]", format!(
+        "session={} revision={} text_len={}",
+        identity.session_sequence, identity.revision, text.chars().count()));
+    if let Err(error) = validate(identity) {
+        super::debug_log("[transcript-processing-complete-result]", format!(
+            "session={} revision={} outcome=identity-rejected", identity.session_sequence, identity.revision));
+        return Err(error);
+    }
+    let result = send_control_input(SpeechControlInput::TranscriptProcessed { identity, text });
+    super::debug_log("[transcript-processing-complete-result]", format!(
+        "session={} revision={} outcome={}", identity.session_sequence, identity.revision,
+        if result.is_ok() { "queued" } else { "queue-failed" }));
+    result
 }
 
 fn start_native(identity: SpeechLayerIdentity, configuration: RecognitionConfiguration) {
@@ -913,6 +962,23 @@ fn start_native(identity: SpeechLayerIdentity, configuration: RecognitionConfigu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_diagnostics_never_include_transcript_or_arbitrary_errors() {
+        let secret = "private dictated text";
+        for event in ["started", "partial", "final", "error"] {
+            assert!(!native_callback_diagnostic(event, secret).unwrap().contains(secret));
+        }
+        assert_eq!(native_callback_diagnostic("diag-error",
+            "stage=recognition-task domain=kAFAssistantErrorDomain code=1101").as_deref(),
+            Some("event=error-detail stage=recognition-task domain=kAFAssistantErrorDomain code=1101"));
+        for text in ["stage=private domain=none code=0",
+            "stage=recognition-task domain=private code=0",
+            "stage=recognition-task domain=none code=private",
+            "stage=recognition-task domain=none code=0 private"] {
+            assert!(native_callback_diagnostic("diag-error", text).is_none());
+        }
+    }
 
     #[test]
     fn recognition_configuration_follows_the_session_across_revision_changes() {
@@ -991,6 +1057,29 @@ mod tests {
     }
 }
 
+fn native_callback_diagnostic(event: &str, text: &str) -> Option<String> {
+    match event {
+        "started" | "partial" | "final" | "error" => {
+            Some(format!("event={event} text_len={}", text.chars().count()))
+        }
+        "diag-error" => {
+            let fields: Vec<_> = text.split_whitespace().collect();
+            if fields.len() != 3 { return None; }
+            let stage = fields[0].strip_prefix("stage=")?;
+            let domain = fields[1].strip_prefix("domain=")?;
+            let code = fields[2].strip_prefix("code=")?.parse::<i64>().ok()?;
+            if !["recognizer-unavailable", "recognition-task", "audio-engine-start",
+                "speech-authorization", "microphone-authorization"].contains(&stage)
+                || !["kAFAssistantErrorDomain", "SFSpeechErrorDomain", "NSOSStatusErrorDomain",
+                    "AVFoundationErrorDomain", "NSCocoaErrorDomain", "none", "other"].contains(&domain) {
+                return None;
+            }
+            Some(format!("event=error-detail stage={stage} domain={domain} code={code}"))
+        }
+        _ => None,
+    }
+}
+
 extern "C" fn phase1_native_callback(
     identity: SpeechLayerIdentity,
     event_type: *const c_char,
@@ -1002,6 +1091,10 @@ extern "C" fn phase1_native_callback(
     }
     let event_type = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
     let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    if let Some(diagnostic) = native_callback_diagnostic(&event_type, &text) {
+        super::debug_log("[native-callback]", format!(
+            "session={} revision={} {diagnostic}", identity.session_sequence, identity.revision));
+    }
     match event_type.as_ref() {
         "started" => super::update_runtime_state(|state| {
             state.recognition_mode = Some(text.to_string());
@@ -1014,6 +1107,15 @@ extern "C" fn phase1_native_callback(
     if let Some(input) =
         super::native_backend::map_bridge_callback(identity, identity, &event_type, &text)
     {
-        let _ = send_control_input(input);
+        if send_control_input(input).is_err() {
+            super::debug_log("[native-callback-queue-failed]", format!(
+                "session={} revision={}", identity.session_sequence, identity.revision));
+        } else {
+            if let Ok(snapshot) = get_speech_control_snapshot() {
+                super::debug_log("[native-callback-state]", format!(
+                    "session={} revision={} phase={:?} outcome={:?}",
+                    identity.session_sequence, identity.revision, snapshot.phase, snapshot.writeback_outcome));
+            }
+        }
     }
 }

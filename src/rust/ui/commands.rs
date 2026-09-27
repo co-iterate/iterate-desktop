@@ -3,7 +3,7 @@ use crate::bridge::ws::{
 };
 use crate::config::{
     load_config, save_config, AppConfig, AppState, CustomPrompt, CustomPromptConfig, ReplyConfig,
-    ShortcutBinding, ShortcutConfig, WindowConfig,
+    PopupPlacement, ShortcutBinding, ShortcutConfig, WindowConfig,
 };
 use crate::constants::{ui, validation, window};
 use crate::conversation::{resolve_tree_route_key, ConversationManager, NodeMetadata, NodeType};
@@ -530,6 +530,12 @@ pub async fn set_window_settings(
             .lock()
             .map_err(|e| format!("获取配置失败: {}", e))?;
 
+        if let Some(placement) = window_settings.get("popup_placement") {
+            config.ui_config.window_config.popup_placement =
+                serde_json::from_value(placement.clone())
+                    .map_err(|e| format!("弹窗位置无效: {}", e))?;
+        }
+
         // 更新窗口配置
         if let Some(fixed) = window_settings.get("fixed").and_then(|v| v.as_bool()) {
             config.ui_config.window_config.fixed = fixed;
@@ -736,6 +742,9 @@ pub async fn send_mcp_response(
     // Cross-device requests arbitrate before conversation/checkpoint side effects.
     let closing = response.as_str() == Some("CANCELLED")
         || response.pointer("/metadata/source").and_then(serde_json::Value::as_str) == Some("popup_closed");
+    if crate::delivery::get_mcp_delivery_status()? == "returned" {
+        return Err("这条请求已经送达，不能再次提交".to_string());
+    }
     if !closing { crate::delivery::ensure_connected()?; }
     if crate::cross_device::submit(&response).await? {
         return Ok(());
@@ -775,6 +784,24 @@ pub async fn send_mcp_response(
     // 检查是否为MCP模式
     let args: Vec<String> = std::env::args().collect();
     let is_mcp_mode = args.len() >= 3 && args[1] == "--mcp-request";
+    let mut response_file_claim = if (is_standalone_mode || is_mcp_mode)
+        && cross_finalize_guard.is_none()
+    {
+        std::env::var_os("ITERATE_RESPONSE_FILE")
+            .map(|path| {
+                crate::delivery::ResponseFileClaim::acquire(std::path::Path::new(&path))
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            "这条请求已从其他端提交".to_string()
+                        } else {
+                            format!("无法占用回复通道: {error}")
+                        }
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let route_key = resolve_tree_route_key(
         effective_request_id.as_deref(),
         normalized_project_path.as_deref(),
@@ -888,8 +915,13 @@ pub async fn send_mcp_response(
             if cross_finalize_guard.is_some() {
                 crate::cross_device::publish_source_response(std::path::Path::new(&response_file), &response)?;
             } else {
-                std::fs::write(&response_file, &response_str)
+                crate::delivery::publish_claimed_response_file(
+                    std::path::Path::new(&response_file), &response_str,
+                )
                     .map_err(|e| format!("写入响应文件失败: {}", e))?;
+                if let Some(claim) = response_file_claim.as_mut() {
+                    claim.commit();
+                }
             }
         }
         if !closing { crate::delivery::wait_for_handoff().await?; }
@@ -2158,18 +2190,36 @@ pub async fn open_confirmed_external_file(path: String) -> Result<(), String> {
     let resolved_path_string = target.to_string_lossy().to_string();
 
     let result = if cfg!(target_os = "windows") {
-        Command::new("explorer").arg(&resolved_path_string).spawn()
+        let shell_path = windows_explorer_path(&resolved_path_string);
+        let mut command = Command::new("explorer");
+        if target.is_file() {
+            command.arg(format!("/select,{}", shell_path));
+        } else {
+            command.arg(shell_path);
+        }
+        command.spawn()
     } else if cfg!(target_os = "macos") {
-        Command::new("open")
-            .args(["-R", &resolved_path_string])
-            .spawn()
+        let mut command = Command::new("open");
+        if target.is_file() {
+            command.arg("-R");
+        }
+        command.arg(&target).spawn()
     } else {
         Command::new("xdg-open").arg(&target).spawn()
     };
 
     result
         .map(|_| ())
-        .map_err(|e| format!("无法在 Finder 中定位跨项目文件: {}", e))
+        .map_err(|e| format!("无法在文件管理器中打开跨项目文件或文件夹: {}", e))
+}
+
+// canonicalize() returns extended-length Windows paths; Explorer expects shell paths.
+fn windows_explorer_path(path: &str) -> String {
+    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", unc_path)
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
 }
 
 #[tauri::command]
@@ -3820,10 +3870,35 @@ pub async fn open_in_ide(project_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 在当前活动工作区显示窗口（跟随当前页面）
-/// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
-#[tauri::command]
-pub async fn center_window(app: AppHandle) -> Result<(), String> {
+fn popup_window_coordinates(
+    placement: PopupPlacement,
+    work_x: i32,
+    work_y: i32,
+    work_width: i32,
+    work_height: i32,
+    window_width: i32,
+    window_height: i32,
+    left_margin: i32,
+) -> (i32, i32) {
+    let available_width = (work_width - window_width).max(0);
+    let x = work_x
+        + match placement {
+            PopupPlacement::Left => left_margin.min(available_width),
+            PopupPlacement::Center => available_width / 2,
+        };
+    let y = work_y + (work_height - window_height).max(0) / 2;
+    (x, y)
+}
+
+fn place_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    let placement = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map_err(|e| format!("获取配置失败: {}", e))?
+        .ui_config
+        .window_config
+        .popup_placement;
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "未找到主窗口".to_string())?;
@@ -3844,16 +3919,38 @@ pub async fn center_window(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("获取窗口尺寸失败: {}", e))?;
     let work_area = target_monitor.work_area();
 
-    let centered_x =
-        work_area.position.x + ((work_area.size.width as i32 - window_size.width as i32) / 2);
-    let centered_y =
-        work_area.position.y + ((work_area.size.height as i32 - window_size.height as i32) / 2);
+    let left_margin = (24.0 * target_monitor.scale_factor()).round() as i32;
+    let (x, y) = popup_window_coordinates(
+        placement,
+        work_area.position.x,
+        work_area.position.y,
+        work_area.size.width as i32,
+        work_area.size.height as i32,
+        window_size.width as i32,
+        window_size.height as i32,
+        left_margin,
+    );
 
     window
         .set_position(Position::Physical(PhysicalPosition::new(
-            centered_x, centered_y,
+            x, y,
         )))
         .map_err(|e| format!("设置窗口位置失败: {}", e))?;
+
+    Ok(window)
+}
+
+/// 按已保存的弹窗位置调整窗口，不改变窗口可见性、最小化状态或焦点。
+#[tauri::command]
+pub fn position_window_left(app: AppHandle) -> Result<(), String> {
+    place_main_window(&app).map(|_| ())
+}
+
+/// 按已保存的位置在鼠标所在屏幕的工作区显示窗口。
+/// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
+#[tauri::command]
+pub async fn center_window(app: AppHandle) -> Result<(), String> {
+    let window = place_main_window(&app)?;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     window
         .unminimize()
@@ -3864,6 +3961,35 @@ pub async fn center_window(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("聚焦窗口失败: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod popup_placement_tests {
+    use super::{popup_window_coordinates, PopupPlacement};
+
+    #[test]
+    fn left_and_center_use_selected_monitor_work_area() {
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Left, 1920, 40, 1280, 900, 600, 700, 24),
+            (1944, 140)
+        );
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Center, 1920, 40, 1280, 900, 600, 700, 24),
+            (2260, 140)
+        );
+    }
+
+    #[test]
+    fn placement_keeps_oversized_window_at_work_area_origin() {
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Left, -1920, 0, 700, 500, 900, 700, 24),
+            (-1920, 0)
+        );
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Center, -1920, 0, 700, 500, 900, 700, 24),
+            (-1920, 0)
+        );
+    }
 }
 
 #[tauri::command]
@@ -4524,8 +4650,8 @@ fn resolve_confirmed_external_file_target(path: &str) -> Result<PathBuf, String>
     let metadata =
         std::fs::metadata(&canonical_path).map_err(|e| format!("读取文件失败: {}", e))?;
 
-    if !metadata.is_file() {
-        return Err("跨项目仅支持在 Finder 中定位普通文件".to_string());
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("跨项目仅支持普通文件或文件夹".to_string());
     }
 
     if has_dangerous_local_open_extension(&canonical_path) || is_executable_file(&metadata) {
@@ -4759,18 +4885,41 @@ mod local_file_path_tests {
     }
 
     #[test]
-    fn rejects_confirmed_external_directory() {
+    fn resolves_confirmed_external_directory() {
         let directory = std::env::temp_dir().join(format!(
-            "iterate-confirmed-external-dir-{}",
+            "iterate-confirmed-external-dir-中文 空格-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&directory).expect("create external directory");
 
-        let error = resolve_confirmed_external_file_target(&directory.to_string_lossy())
-            .expect_err("external directory should be rejected");
+        let resolved = resolve_confirmed_external_file_target(&directory.to_string_lossy())
+            .expect("external directory should resolve");
 
-        assert!(error.contains("普通文件"));
+        assert_eq!(resolved, directory.canonicalize().expect("canonical directory"));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn normalizes_windows_explorer_paths() {
+        assert_eq!(super::windows_explorer_path(r"\\?\C:\中文 空格\folder"), r"C:\中文 空格\folder");
+        assert_eq!(super::windows_explorer_path(r"\\?\UNC\server\share\folder"), r"\\server\share\folder");
+        assert_eq!(super::windows_explorer_path(r"C:\folder"), r"C:\folder");
+    }
+
+    #[test]
+    fn rejects_confirmed_external_executable() {
+        let file = std::env::temp_dir().join(format!("iterate-external-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"test").expect("write executable fixture");
+        let error = resolve_confirmed_external_file_target(&file.to_string_lossy())
+            .expect_err("executable should remain rejected");
+        assert!(error.contains("可执行文件"));
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn rejects_confirmed_external_relative_path() {
+        assert!(resolve_confirmed_external_file_target("relative-folder")
+            .unwrap_err().contains("绝对路径"));
     }
 
     #[cfg(unix)]

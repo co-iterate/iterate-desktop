@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
 import { nextTick, ref } from 'vue'
+import { publishCompletedMcpRequest } from '../services/bridgeRequestClosure'
 import { clearActiveMcpFatalContext, setActiveMcpFatalContext } from '../utils/mcpFatalError'
 import { crossDeviceSendError } from './useCrossDevice'
 import { MCP_DELIVERY_FAILURE, mcpDeliveryError } from './useMcpDelivery'
@@ -426,6 +427,7 @@ export function useMcpHandler() {
       })
       await invoke('send_mcp_response', { response, projectPath, requestId, timelineRouteId })
       submitted = true
+      await publishCompletedMcpRequest(requestId, request?.project_path ?? request?.projectPath)
       clearActiveMcpFatalContext()
       if (isMcpProcess.value) {
         await invoke('exit_app')
@@ -489,6 +491,7 @@ export function useMcpHandler() {
         projectPath,
       })
       await invoke('send_mcp_response', { response: 'CANCELLED', projectPath, requestId, timelineRouteId })
+      await publishCompletedMcpRequest(requestId, request?.project_path ?? request?.projectPath)
       clearActiveMcpFatalContext()
       if (isMcpProcess.value) {
         await invoke('exit_app')
@@ -572,6 +575,15 @@ export function useMcpHandler() {
         // 仍然设置请求数据，但不显示弹窗
         mcpRequest.value = routedRequest
         showMcpPopup.value = true
+        if (isMcpProcess.value) {
+          await nextTick()
+          try {
+            await invoke('position_window_left')
+          }
+          catch (error) {
+            console.error('定位静音MCP窗口失败:', error)
+          }
+        }
         // 最小化窗口到 Dock
         try {
           const window = getCurrentWindow()
@@ -596,9 +608,15 @@ export function useMcpHandler() {
       // after the shared notification preference and force-popup rules resolve.
       if (isMcpProcess.value && !isMuted.value) {
         await nextTick()
-        const window = getCurrentWindow()
-        await window.show()
-        await window.setFocus()
+        try {
+          await invoke('center_window')
+        }
+        catch (error) {
+          console.error('定位并显示MCP窗口失败:', error)
+          const window = getCurrentWindow()
+          await window.show()
+          await window.setFocus()
+        }
       }
     }
     else {

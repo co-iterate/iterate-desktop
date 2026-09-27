@@ -452,7 +452,7 @@ function handleCodexLiveClick() {
           size="small"
           quaternary
           circle
-          title="显示手机连接二维码"
+          title="连接 Android 手机"
           @click="handleOpenIteratePairing"
         >
           <template #icon>

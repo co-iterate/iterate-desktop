@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { publishCompletedMcpRequest } from '../services/bridgeRequestClosure'
 
 interface CrossDeviceStatus {
   enabled: boolean
@@ -31,6 +32,7 @@ export async function refreshCrossDevice() {
     if (state.value.source_pending) {
       const pending = state.value.source_pending
       await invoke('send_mcp_response', { response: pending.response, requestId: pending.request_id, projectPath: pending.project_path, timelineRouteId: null })
+      await publishCompletedMcpRequest(pending.request_id, pending.project_path)
       // Deferred sources retain their GUI until the HTTP handoff completes.
       // Only close after success; a failed handoff must keep its error window.
       await invoke('exit_app')

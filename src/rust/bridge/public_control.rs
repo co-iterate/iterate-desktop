@@ -25,8 +25,16 @@ fn public_bridge_base_url_override() -> Option<String> {
 fn configured_public_bridge_base_url() -> Option<String> {
     let config = crate::config::load_standalone_config().ok()?;
     if let Some(route) = config.mobile_config.formal_route.as_ref() {
-        if route.schema_version == 1 && route.transport == "cloudflare_named_tunnel" {
-            if let Some(base_url) = normalize_public_origin(&route.base_url) {
+        if route.schema_version == 1
+            && matches!(
+                route.transport.as_str(),
+                "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel"
+            )
+        {
+            if let Some(base_url) = normalize_public_origin(&route.base_url).filter(|base_url| {
+                route.transport != "aliyun_ssh_reverse_tunnel"
+                    || crate::tunnel::commands::aliyun_ip_origin_is_public(base_url)
+            }) {
                 return Some(base_url);
             }
         }
@@ -127,11 +135,13 @@ pub(super) fn is_public_control_path(path: &str) -> bool {
         || path.starts_with("/bridge/")
         || path.starts_with("/api/ghost-suggestions/")
         || path.starts_with("/api/phone-action-jobs/")
+        || path.starts_with("/api/android/pairing/sessions/")
         || matches!(
             path,
             "/api/active-sessions"
-                | "/api/apns/register"
-                | "/api/apns/notify"
+                | "/api/android/pairing"
+                | "/api/android/pairing/claim"
+                | "/api/android/pairing/status"
                 | "/api/audio-assets"
                 | "/api/bridge/health"
                 | "/api/cleanup-session"
@@ -146,9 +156,6 @@ pub(super) fn is_public_control_path(path: &str) -> bool {
                 | "/api/ghost-suggestion-learning"
                 | "/api/import-prompts-dir"
                 | "/api/mcp-tools"
-                | "/api/mobile/pairing"
-                | "/api/mobile/pairing/claim"
-                | "/api/mobile/pairing/status"
                 | "/api/mobile/paired-device-file-roots"
                 | "/api/open-codex-chat"
                 | "/api/phone-action"

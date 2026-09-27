@@ -23,7 +23,7 @@ const {
 } = useAppManager()
 
 // 创建事件处理器
-const handlers = useEventHandlers(actions)
+const handlers = useEventHandlers(actions, () => mcpRequest.value)
 const speechRuntimeHost = useGlobalSpeechRuntimeHost()
 
 // 试用期状态

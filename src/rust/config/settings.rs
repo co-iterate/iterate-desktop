@@ -79,6 +79,8 @@ pub struct FontConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WindowConfig {
+    #[serde(default)]
+    pub popup_placement: PopupPlacement,
     // 窗口约束设置
     #[serde(default = "default_auto_resize")]
     pub auto_resize: bool,
@@ -106,6 +108,14 @@ pub struct WindowConfig {
     pub free_width: f64,
     #[serde(default = "default_free_height")]
     pub free_height: f64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupPlacement {
+    #[default]
+    Left,
+    Center,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -543,6 +553,7 @@ pub fn default_audio_url() -> String {
 
 pub fn default_window_config() -> WindowConfig {
     WindowConfig {
+        popup_placement: PopupPlacement::Left,
         auto_resize: window::DEFAULT_AUTO_RESIZE,
         max_width: window::MAX_WIDTH,
         max_height: window::MAX_HEIGHT,
@@ -1000,6 +1011,22 @@ pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_placement_defaults_left_for_legacy_config_and_round_trips() {
+        let legacy = serde_json::to_value(default_window_config()).unwrap();
+        let mut legacy = legacy.as_object().unwrap().clone();
+        legacy.remove("popup_placement");
+        let decoded: WindowConfig = serde_json::from_value(legacy.into()).unwrap();
+        assert_eq!(decoded.popup_placement, PopupPlacement::Left);
+
+        let mut centered = decoded;
+        centered.popup_placement = PopupPlacement::Center;
+        let encoded = serde_json::to_value(&centered).unwrap();
+        assert_eq!(encoded["popup_placement"], "center");
+        let reloaded: WindowConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(reloaded.popup_placement, PopupPlacement::Center);
+    }
 
     #[test]
     fn reply_config_defaults_clipboard_backup_to_disabled() {

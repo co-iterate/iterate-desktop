@@ -6,6 +6,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import { resolveMcpLaunchContext } from '../../composables/useMcpHandler'
 import { useShortcuts } from '../../composables/useShortcuts'
 import { copySubmissionToClipboard } from '../../utils/submissionClipboard'
 import { stripAutoPrompt } from '../../utils/textUtils'
@@ -723,13 +724,14 @@ watch(() => props.request, async (newRequest) => {
       console.log('🔔 关键 loop 弹窗：自动取消静音')
     }
 
-    // 窗口居中到当前屏幕（静音模式下跳过，避免覆盖 minimize）
+    // 常驻窗口按请求重定位；独立 MCP 窗口由 useMcpHandler 在首次显示前定位。
     if (!props.isMuted || shouldForceShow) {
       try {
-        await invoke('center_window')
+        if (!(await resolveMcpLaunchContext()).isStandaloneMode)
+          await invoke('center_window')
       }
       catch (e) {
-        console.log('窗口居中失败:', e)
+        console.log('窗口定位失败:', e)
       }
     }
 
@@ -970,7 +972,7 @@ async function handleSubmit() {
       metadata: {
         timestamp: new Date().toISOString(),
         request_id: props.request?.id || null,
-        source: resolveSubmitSource(finalUserInput, selectedOptions.value),
+        source: resolveSubmitSource(finalUserInput ?? '', selectedOptions.value),
       },
     }
 

@@ -802,6 +802,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_terminal,
             open_in_ide,
             center_window,
+            position_window_left,
             dismiss_standalone_mcp_window,
             activate_app_window,
             probe_codex_automation_permission,
