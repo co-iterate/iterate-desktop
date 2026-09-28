@@ -39,6 +39,7 @@ interface SpeechRuntimeStatus {
     owner_exe_mtime?: string | null
     owner_acquired_at?: string | null
     owner_is_current_process?: boolean
+    owner_lease_verified?: boolean
     owner_matches_current_binary?: boolean | null
     current_pid?: number
     current_path?: string | null
@@ -164,6 +165,8 @@ const ownerTagText = computed(() => {
     return '未知'
   if (ownerIsCurrentProcess.value)
     return `当前进程${owner.current_pid ? ` PID ${owner.current_pid}` : ''}`
+  if (owner.owner_pid && owner.owner_lease_verified === false)
+    return `状态未知（记录 PID ${owner.owner_pid}）`
   if (owner.owner_pid)
     return `PID ${owner.owner_pid}`
   return '未持有'
@@ -465,7 +468,7 @@ onMounted(() => {
         最近刷新：{{ lastRefreshedAt }}
       </div>
       <n-alert v-if="showOwnerWarning" class="mt-3" type="warning" :bordered="false">
-        Fn 监听不在当前窗口进程，当前窗口只用于查看状态；实际监听进程是 {{ ownerTagText }}。
+        当前窗口未确认持有 Fn 监听。记录状态：{{ ownerTagText }}。
       </n-alert>
     </div>
 

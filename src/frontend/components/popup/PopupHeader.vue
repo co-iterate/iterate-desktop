@@ -4,7 +4,10 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useMessage } from 'naive-ui'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { crossDeviceSendError, useCrossDevice } from '../../composables/useCrossDevice'
+import { useMcpDelivery } from '../../composables/useMcpDelivery'
 import { hasOpenModifier } from '../../utils/clickModifiers'
+import CrossDeviceToggle from '../common/CrossDeviceToggle.vue'
 import ThemeIcon from '../common/ThemeIcon.vue'
 import UsageQuotaPopover from '../common/UsageQuotaPopover.vue'
 
@@ -35,6 +38,7 @@ interface Props {
   shortcutEnabled?: boolean
   projectPath?: string
   codexThreadId?: string
+  conversationTitle?: string
   linkUrl?: string
   linkTitle?: string
   quotaProviders?: UsageProvider[]
@@ -54,6 +58,7 @@ interface Emits {
   minimizeWindow: []
   toggleCodexLive: []
   toggleCodexLiveMute: []
+  closeCurrentDialog: []
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -70,6 +75,8 @@ const props = withDefaults(defineProps<Props>(), {
 
 const emit = defineEmits<Emits>()
 const message = useMessage()
+const { mcpDeliveryError } = useMcpDelivery()
+const { crossState } = useCrossDevice()
 let suppressNextProjectPathClick = false
 const preventSleepEnabled = ref(false)
 const preventSleepPending = ref(false)
@@ -162,6 +169,8 @@ const projectPathTitle = computed(() => {
 
   return `${props.projectPath}\n(点击复制完整路径)\n(${cmdAction})`
 })
+
+const displayConversationTitle = computed(() => props.conversationTitle?.trim() || null)
 
 async function openCodexTarget() {
   if (props.codexThreadId)
@@ -271,6 +280,10 @@ function handleToggleMute() {
   emit('toggleMute')
 }
 
+function handleCloseCurrentDialog() {
+  emit('closeCurrentDialog')
+}
+
 function handleNewChat() {
   emit('newChat')
 }
@@ -346,6 +359,9 @@ function handleCodexLiveClick() {
 
 <template>
   <div class="popup-header-root px-4 py-3 select-none">
+    <div v-if="mcpDeliveryError" role="alert" style="color: #dc2626; font-weight: 700; margin-bottom: 8px">
+      {{ mcpDeliveryError }}
+    </div>
     <div class="flex items-center justify-between">
       <!-- 左侧：标题和项目路径/链接 -->
       <div class="flex items-center gap-3 min-w-0 flex-1">
@@ -396,6 +412,8 @@ function handleCodexLiveClick() {
 
       <!-- 右侧：操作按钮 -->
       <n-space size="small">
+        <span v-if="crossDeviceSendError" role="alert" style="color: #dc2626; font-size: 12px; max-width: 180px">{{ crossDeviceSendError }}</span>
+        <CrossDeviceToggle />
         <n-button
           size="small"
           quaternary
@@ -422,6 +440,7 @@ function handleCodexLiveClick() {
           quaternary
           circle
           title="在当前项目打开终端"
+          :disabled="crossState.mirror"
           aria-label="在当前项目打开终端"
           @click="handleOpenTerminal"
         >
@@ -433,7 +452,7 @@ function handleCodexLiveClick() {
           size="small"
           quaternary
           circle
-          title="显示手机连接二维码"
+          title="连接 Android 手机"
           @click="handleOpenIteratePairing"
         >
           <template #icon>
@@ -460,7 +479,10 @@ function handleCodexLiveClick() {
           size="small"
           quaternary
           circle
-          :title="props.isMuted ? '通知已静音 (点击开启)' : '通知已开启 (点击静音)'"
+          :title="props.isMuted ? '免打扰已开启（点击恢复弹窗通知）' : '免打扰已关闭（点击暂停弹窗通知）'"
+          :aria-label="props.isMuted ? '免打扰已开启（点击恢复弹窗通知）' : '免打扰已关闭（点击暂停弹窗通知）'"
+          :aria-pressed="props.isMuted"
+          data-guide="notification-mute"
           @click="handleToggleMute"
         >
           <template #icon>
@@ -494,6 +516,7 @@ function handleCodexLiveClick() {
           quaternary
           circle
           title="在 Codex 中打开当前项目"
+          :disabled="crossState.mirror"
           @click="handleNewChat"
         >
           <template #icon>
@@ -543,12 +566,49 @@ function handleCodexLiveClick() {
             <ThemeIcon :theme="props.currentTheme" class="w-4 h-4" style="color: #111827;" />
           </template>
         </n-button>
+        <n-button
+          size="small"
+          quaternary
+          circle
+          class="close-current-dialog-button"
+          title="结束当前对话（iterate 继续运行）"
+          aria-label="结束当前对话（iterate 继续运行）"
+          data-guide="close-current-dialog"
+          @click="handleCloseCurrentDialog"
+        >
+          <template #icon>
+            <div class="i-carbon-close w-4 h-4" />
+          </template>
+        </n-button>
       </n-space>
+    </div>
+    <div
+      v-if="displayConversationTitle || crossState.mirror"
+      class="conversation-title-row mt-2 flex min-w-0 items-center gap-2 border-t pt-2"
+      :class="[props.currentTheme === 'light' ? 'border-gray-200' : 'border-white/10', { 'origin-remote': crossState.mirror }]"
+      :title="displayConversationTitle"
+      data-guide="conversation-title"
+    >
+      <span
+        v-if="crossState.mirror"
+        class="origin-badge flex-shrink-0 text-xs"
+      >异端 · {{ crossState.origin_name || '另一设备' }}</span>
+      <span
+        class="truncate text-sm font-medium"
+        :style="{
+          color: props.currentTheme === 'light' ? '#111827' : '#f9fafb',
+          textDecoration: 'underline',
+          textUnderlineOffset: '3px',
+        }"
+      >{{ displayConversationTitle }}</span>
     </div>
   </div>
 </template>
 
 <style scoped>
+.conversation-title-row.origin-remote { border-left: 3px solid #a855f7; padding-left: 8px; }
+.origin-badge { padding: 2px 6px; border-radius: 4px; }
+.origin-remote .origin-badge { background: #f3e8ff; color: #6b21a8; }
 .popup-header-quota :deep(.usage-trigger) {
   min-width: 0;
   height: auto;
@@ -585,6 +645,16 @@ function handleCodexLiveClick() {
   z-index: 5000;
   overflow: visible;
   isolation: isolate;
+}
+
+.close-current-dialog-button {
+  color: #dc2626;
+}
+
+.close-current-dialog-button:hover,
+.close-current-dialog-button:focus-visible {
+  background: rgba(239, 68, 68, 0.14);
+  color: #ef4444;
 }
 
 .codex-live-button {

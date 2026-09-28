@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { computed, ref, watch } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 
 export interface FontInfo {
   font_family: string
@@ -23,6 +23,9 @@ export interface FontSizeOption {
  * 字体管理组合式函数
  */
 export function useFontManager() {
+  const refreshSyncedFont = () => { void loadFontConfig() }
+  window.addEventListener('iterate:settings-synced', refreshSyncedFont)
+  onScopeDispose(() => window.removeEventListener('iterate:settings-synced', refreshSyncedFont))
   // 响应式状态
   const fontConfig = ref<FontInfo>({
     font_family: 'inter',

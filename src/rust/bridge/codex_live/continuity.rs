@@ -465,34 +465,31 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_project_path(root: &Path, name: &str) -> String {
+        root.join(name).to_string_lossy().into_owned()
+    }
+
     #[test]
     fn project_threads_are_isolated_and_cas_protected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(STORE_FILE_NAME);
-        store_thread_at(&path, "/tmp/project-a", None, "thread-a").unwrap();
-        store_thread_at(&path, "/tmp/project-b", None, "thread-b").unwrap();
+        let project_a = test_project_path(dir.path(), "project-a");
+        let project_b = test_project_path(dir.path(), "project-b");
+        store_thread_at(&path, &project_a, None, "thread-a").unwrap();
+        store_thread_at(&path, &project_b, None, "thread-b").unwrap();
 
         assert_eq!(
-            load_at(&path, "/tmp/project-a")
-                .unwrap()
-                .thread_id
-                .as_deref(),
+            load_at(&path, &project_a).unwrap().thread_id.as_deref(),
             Some("thread-a")
         );
         assert_eq!(
-            load_at(&path, "/tmp/project-b")
-                .unwrap()
-                .thread_id
-                .as_deref(),
+            load_at(&path, &project_b).unwrap().thread_id.as_deref(),
             Some("thread-b")
         );
-        assert!(store_thread_at(&path, "/tmp/project-a", None, "thread-c").is_err());
-        store_thread_at(&path, "/tmp/project-a", Some("thread-a"), "thread-c").unwrap();
+        assert!(store_thread_at(&path, &project_a, None, "thread-c").is_err());
+        store_thread_at(&path, &project_a, Some("thread-a"), "thread-c").unwrap();
         assert_eq!(
-            load_at(&path, "/tmp/project-a")
-                .unwrap()
-                .thread_id
-                .as_deref(),
+            load_at(&path, &project_a).unwrap().thread_id.as_deref(),
             Some("thread-c")
         );
     }
@@ -501,11 +498,13 @@ mod tests {
     fn most_recent_valid_continuity_project_restores_the_global_target() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(STORE_FILE_NAME);
+        let older = test_project_path(dir.path(), "older");
+        let newer = test_project_path(dir.path(), "newer");
         let projects = BTreeMap::from([
             (
-                "/tmp/older".to_string(),
+                older.clone(),
                 ProjectContinuity {
-                    project_path: "/tmp/older".to_string(),
+                    project_path: older,
                     thread_id: "thread-older".to_string(),
                     continuity_revision: 1,
                     items: Vec::new(),
@@ -513,9 +512,9 @@ mod tests {
                 },
             ),
             (
-                "/tmp/newer".to_string(),
+                newer.clone(),
                 ProjectContinuity {
-                    project_path: "/tmp/newer".to_string(),
+                    project_path: newer.clone(),
                     thread_id: "thread-newer".to_string(),
                     continuity_revision: 1,
                     items: Vec::new(),
@@ -532,31 +531,29 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            last_project_path_at(&path).unwrap().as_deref(),
-            Some("/tmp/newer")
-        );
+        assert_eq!(last_project_path_at(&path).unwrap(), Some(newer));
     }
 
     #[test]
     fn transcript_is_bounded_deduplicated_and_role_checked() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(STORE_FILE_NAME);
-        store_thread_at(&path, "/tmp/project", None, "thread").unwrap();
-        assert!(append_transcript_at(&path, "/tmp/project", "thread", "user", "重复").unwrap());
-        assert!(!append_transcript_at(&path, "/tmp/project", "thread", "user", "重复").unwrap());
-        assert!(!append_transcript_at(&path, "/tmp/project", "thread", "system", "忽略").unwrap());
+        let project = test_project_path(dir.path(), "project");
+        store_thread_at(&path, &project, None, "thread").unwrap();
+        assert!(append_transcript_at(&path, &project, "thread", "user", "重复").unwrap());
+        assert!(!append_transcript_at(&path, &project, "thread", "user", "重复").unwrap());
+        assert!(!append_transcript_at(&path, &project, "thread", "system", "忽略").unwrap());
         for index in 0..20 {
             append_transcript_at(
                 &path,
-                "/tmp/project",
+                &project,
                 "thread",
                 if index % 2 == 0 { "assistant" } else { "user" },
                 &format!("segment-{index}"),
             )
             .unwrap();
         }
-        let snapshot = load_at(&path, "/tmp/project").unwrap();
+        let snapshot = load_at(&path, &project).unwrap();
         assert_eq!(snapshot.items.len(), MAX_ITEMS);
         assert_eq!(snapshot.items.first().unwrap().text, "segment-10");
         assert_eq!(snapshot.items.last().unwrap().text, "segment-19");
@@ -566,11 +563,12 @@ mod tests {
     fn initial_items_wrap_history_as_one_non_actionable_item() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(STORE_FILE_NAME);
-        store_thread_at(&path, "/tmp/project", None, "thread").unwrap();
-        append_transcript_at(&path, "/tmp/project", "thread", "user", "刚才的目标").unwrap();
-        append_transcript_at(&path, "/tmp/project", "thread", "assistant", "刚才的回答").unwrap();
+        let project = test_project_path(dir.path(), "project");
+        store_thread_at(&path, &project, None, "thread").unwrap();
+        append_transcript_at(&path, &project, "thread", "user", "刚才的目标").unwrap();
+        append_transcript_at(&path, &project, "thread", "assistant", "刚才的回答").unwrap();
 
-        let items = initial_items(&load_at(&path, "/tmp/project").unwrap());
+        let items = initial_items(&load_at(&path, &project).unwrap());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["role"], "user");
         assert!(items[0]["text"].as_str().unwrap().contains("historical"));
@@ -600,9 +598,10 @@ mod tests {
     fn corrupt_store_is_quarantined_and_live_can_start_without_history() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(STORE_FILE_NAME);
+        let project = test_project_path(dir.path(), "project");
         std::fs::write(&path, b"not-json").unwrap();
 
-        let snapshot = load_with_recovery_at(&path, "/tmp/project").unwrap();
+        let snapshot = load_with_recovery_at(&path, &project).unwrap();
         assert!(snapshot.store_recovered);
         assert!(snapshot.thread_id.is_none());
         assert!(snapshot.items.is_empty());
@@ -623,9 +622,9 @@ mod tests {
             "not-json"
         );
 
-        store_thread_at(&path, "/tmp/project", None, "thread-after-recovery").unwrap();
+        store_thread_at(&path, &project, None, "thread-after-recovery").unwrap();
         assert_eq!(
-            load_at(&path, "/tmp/project").unwrap().thread_id.as_deref(),
+            load_at(&path, &project).unwrap().thread_id.as_deref(),
             Some("thread-after-recovery")
         );
     }

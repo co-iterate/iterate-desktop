@@ -7,6 +7,9 @@ use std::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
+    /// The exact fields read by this writer; never persisted or synchronized.
+    #[serde(skip)]
+    pub save_baseline: Option<serde_json::Value>,
     #[serde(default = "default_ui_config")]
     pub ui_config: UiConfig, // UI相关配置（主题、窗口、置顶等）
     #[serde(default = "default_audio_config")]
@@ -76,6 +79,8 @@ pub struct FontConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WindowConfig {
+    #[serde(default)]
+    pub popup_placement: PopupPlacement,
     // 窗口约束设置
     #[serde(default = "default_auto_resize")]
     pub auto_resize: bool,
@@ -105,6 +110,14 @@ pub struct WindowConfig {
     pub free_height: f64,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupPlacement {
+    #[default]
+    Left,
+    Center,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AudioConfig {
     #[serde(default = "default_audio_notification_enabled")]
@@ -117,6 +130,8 @@ pub struct AudioConfig {
 pub struct ReplyConfig {
     #[serde(default = "default_enable_continue_reply")]
     pub enable_continue_reply: bool,
+    #[serde(default = "default_copy_submission_to_clipboard")]
+    pub copy_submission_to_clipboard: bool,
     #[serde(default = "default_auto_continue_threshold")]
     pub auto_continue_threshold: u32, // 字符数阈值
     #[serde(default = "default_continue_prompt")]
@@ -360,6 +375,7 @@ impl Default for AppState {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            save_baseline: None,
             ui_config: default_ui_config(),
             audio_config: default_audio_config(),
             reply_config: default_reply_config(),
@@ -537,6 +553,7 @@ pub fn default_audio_url() -> String {
 
 pub fn default_window_config() -> WindowConfig {
     WindowConfig {
+        popup_placement: PopupPlacement::Left,
         auto_resize: window::DEFAULT_AUTO_RESIZE,
         max_width: window::MAX_WIDTH,
         max_height: window::MAX_HEIGHT,
@@ -553,6 +570,7 @@ pub fn default_window_config() -> WindowConfig {
 pub fn default_reply_config() -> ReplyConfig {
     ReplyConfig {
         enable_continue_reply: mcp::DEFAULT_CONTINUE_REPLY_ENABLED,
+        copy_submission_to_clipboard: mcp::DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD,
         auto_continue_threshold: mcp::DEFAULT_AUTO_CONTINUE_THRESHOLD,
         continue_prompt: mcp::DEFAULT_CONTINUE_PROMPT.to_string(),
         loop_prompt: mcp::DEFAULT_LOOP_PROMPT.to_string(),
@@ -582,6 +600,10 @@ pub fn default_min_height() -> f64 {
 
 pub fn default_enable_continue_reply() -> bool {
     mcp::DEFAULT_CONTINUE_REPLY_ENABLED
+}
+
+pub fn default_copy_submission_to_clipboard() -> bool {
+    mcp::DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD
 }
 
 pub fn default_auto_continue_threshold() -> u32 {
@@ -901,6 +923,7 @@ pub fn default_shortcut_config() -> ShortcutConfig {
 
 pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
     let mut shortcuts = HashMap::new();
+    let is_macos = cfg!(target_os = "macos");
 
     // 快速发送快捷键
     shortcuts.insert(
@@ -914,8 +937,8 @@ pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
                 key: "Enter".to_string(),
                 ctrl: false,
                 alt: false,
-                shift: false,
-                meta: true,
+                shift: !is_macos,
+                meta: is_macos,
             },
             enabled: true,
             scope: "popup".to_string(),
@@ -932,9 +955,9 @@ pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
             action: "enhance".to_string(),
             key_combination: ShortcutKey {
                 key: "Enter".to_string(),
-                ctrl: false,
-                alt: true,
-                shift: false,
+                ctrl: !is_macos,
+                alt: is_macos,
+                shift: !is_macos,
                 meta: false,
             },
             enabled: true,
@@ -952,9 +975,9 @@ pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
             action: "continue".to_string(),
             key_combination: ShortcutKey {
                 key: "Enter".to_string(),
-                ctrl: false,
+                ctrl: !is_macos,
                 alt: false,
-                shift: true,
+                shift: is_macos,
                 meta: false,
             },
             enabled: true,
@@ -990,6 +1013,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn popup_placement_defaults_left_for_legacy_config_and_round_trips() {
+        let legacy = serde_json::to_value(default_window_config()).unwrap();
+        let mut legacy = legacy.as_object().unwrap().clone();
+        legacy.remove("popup_placement");
+        let decoded: WindowConfig = serde_json::from_value(legacy.into()).unwrap();
+        assert_eq!(decoded.popup_placement, PopupPlacement::Left);
+
+        let mut centered = decoded;
+        centered.popup_placement = PopupPlacement::Center;
+        let encoded = serde_json::to_value(&centered).unwrap();
+        assert_eq!(encoded["popup_placement"], "center");
+        let reloaded: WindowConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(reloaded.popup_placement, PopupPlacement::Center);
+    }
+
+    #[test]
+    fn reply_config_defaults_clipboard_backup_to_disabled() {
+        let config: ReplyConfig = serde_json::from_str("{}").expect("reply config");
+
+        assert!(!config.copy_submission_to_clipboard);
+    }
+
+    #[test]
     fn usage_provider_config_defaults_to_no_accounts() {
         let config: UsageProviderConfig =
             serde_json::from_str(r#"{"enabled":true}"#).expect("usage provider config");
@@ -1006,5 +1052,29 @@ mod tests {
 
         assert!(account.enabled);
         assert_eq!(account.id, "plus");
+    }
+
+    #[test]
+    fn popup_shortcut_defaults_match_current_platform() {
+        let shortcuts = default_shortcuts();
+        let quick_submit = &shortcuts["quick_submit"].key_combination;
+        let continue_key = &shortcuts["continue"].key_combination;
+        let enhance = &shortcuts["enhance"].key_combination;
+
+        if cfg!(target_os = "macos") {
+            assert!(quick_submit.meta);
+            assert!(!quick_submit.ctrl && !quick_submit.alt && !quick_submit.shift);
+            assert!(continue_key.shift);
+            assert!(!continue_key.ctrl && !continue_key.alt && !continue_key.meta);
+            assert!(enhance.alt);
+            assert!(!enhance.ctrl && !enhance.shift && !enhance.meta);
+        } else {
+            assert!(quick_submit.shift);
+            assert!(!quick_submit.ctrl && !quick_submit.alt && !quick_submit.meta);
+            assert!(continue_key.ctrl);
+            assert!(!continue_key.alt && !continue_key.shift && !continue_key.meta);
+            assert!(enhance.ctrl && enhance.shift);
+            assert!(!enhance.alt && !enhance.meta);
+        }
     }
 }

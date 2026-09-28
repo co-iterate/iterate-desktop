@@ -217,7 +217,8 @@ export function auditLicenseDigest(filePath, bytes, expectedDigests) {
   const expected = expectedDigests?.[filePath]
   if (!expected)
     return []
-  const actual = createHash('sha256').update(bytes).digest('hex')
+  const canonicalBytes = Buffer.from(bytes.toString('utf8').replace(/\r\n/g, '\n'))
+  const actual = createHash('sha256').update(canonicalBytes).digest('hex')
   return actual === expected
     ? []
     : [{ code: 'license-digest-mismatch', path: filePath }]

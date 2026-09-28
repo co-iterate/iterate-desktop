@@ -387,6 +387,7 @@ mod tests {
 
     fn device_info(device_id: &str, environment: &str) -> ApnsDeviceInfo {
         ApnsDeviceInfo {
+            authorization_generation: String::new(),
             device_token: format!("{device_id}-{environment}"),
             platform: "ios".to_string(),
             app_version: "1.0".to_string(),
@@ -482,6 +483,7 @@ mod tests {
 
     fn live_info(token: &str, environment: &str) -> ApnsLiveActivityInfo {
         ApnsLiveActivityInfo {
+            authorization_generation: String::new(),
             activity_token: token.to_string(),
             goal_id: "goal-a".to_string(),
             activity_kind: "live_goal".to_string(),

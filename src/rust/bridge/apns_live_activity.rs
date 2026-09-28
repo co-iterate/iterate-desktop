@@ -7,6 +7,8 @@ pub(super) const QUOTA_LIVE_ACTIVITY_KEY: &str = "codex_quota";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ApnsLiveActivityInfo {
+    #[serde(skip)]
+    pub(super) authorization_generation: String,
     pub(super) activity_token: String,
     pub(super) goal_id: String,
     #[serde(default = "default_live_activity_kind")]
@@ -401,6 +403,7 @@ pub(super) fn direct_live_activity_info_from_request(
         .or_else(|| activity_key.clone())
         .unwrap_or_else(|| "direct".to_string());
     ApnsLiveActivityInfo {
+        authorization_generation: String::new(),
         activity_token: activity_token.to_string(),
         goal_id,
         activity_kind,

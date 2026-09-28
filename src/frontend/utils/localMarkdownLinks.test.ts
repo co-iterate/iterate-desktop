@@ -71,3 +71,17 @@ assert.equal(hasOpenModifier({ metaKey: false, ctrlKey: false }), false)
 
 assert.equal(resolveLocalMarkdownHref('src/frontend/App.vue', null), null)
 assert.equal(resolveLocalMarkdownHref('https://example.com', projectPath), null)
+
+const windowsProject = 'E:\\Github\\iterate-desktop'
+const windowsImage = 'E:/Github/iterate-desktop/target/disconnect-feedback/DISCONNECT_AFTER_SEND.png'
+for (const href of [windowsImage, `/${windowsImage}`, `file:///${windowsImage}`, windowsImage.replaceAll('/', '\\')]) {
+  assert.equal(isPotentialLocalMarkdownHref(href), true)
+  assert.deepEqual(resolveLocalMarkdownHref(href, windowsProject), { path: windowsImage })
+  assert.equal(isOutsideCurrentProject({ path: windowsImage }, windowsProject), false)
+}
+assert.deepEqual(resolveLocalMarkdownHref('target\\截图%20一.png', windowsProject), { path: 'E:/Github/iterate-desktop/target/截图 一.png' })
+assert.equal(isOutsideCurrentProject({ path: 'e:/GITHUB/iterate-desktop/src/main.rs:12:3' }, windowsProject), false)
+assert.equal(isOutsideCurrentProject({ path: 'E:/Github/iterate-desktop/../outside/file.md' }, windowsProject), true)
+assert.equal(isOutsideCurrentProject({ path: 'E:/Github/iterate-desktop-other/file.md' }, windowsProject), true)
+assert.equal(isOutsideCurrentProject({ path: 'D:/Github/iterate-desktop/file.md' }, windowsProject), true)
+assert.equal(isPotentialLocalMarkdownHref('E:relative.md'), false)

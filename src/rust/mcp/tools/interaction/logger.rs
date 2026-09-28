@@ -477,17 +477,21 @@ mod tests {
     struct ConfigEnvGuard {
         previous_home: Option<OsString>,
         previous_xdg_config_home: Option<OsString>,
+        previous_iterate_config_dir: Option<OsString>,
     }
 
     impl ConfigEnvGuard {
         fn set(home: &Path) -> Self {
             let previous_home = std::env::var_os("HOME");
             let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            let previous_iterate_config_dir = std::env::var_os("ITERATE_CONFIG_DIR");
             std::env::set_var("HOME", home);
             std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            std::env::set_var("ITERATE_CONFIG_DIR", home.join(".config/cunzhi"));
             Self {
                 previous_home,
                 previous_xdg_config_home,
+                previous_iterate_config_dir,
             }
         }
     }
@@ -504,6 +508,12 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", previous);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
+            }
+
+            if let Some(previous) = self.previous_iterate_config_dir.take() {
+                std::env::set_var("ITERATE_CONFIG_DIR", previous);
+            } else {
+                std::env::remove_var("ITERATE_CONFIG_DIR");
             }
         }
     }

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use cunzhi::native_speech::owner::{
     read_existing_owner_metadata, OwnerEpochSource, OwnerLeaseAttempt, OwnerLeaseBackend,
     OwnerMetadata, OwnerSupervisor, OwnerSupervisorCommand, OwnerSupervisorEvent,

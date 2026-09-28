@@ -33,7 +33,7 @@ describe('MCP response immediate dismissal', () => {
     assert.doesNotMatch(shortcutsSource, /const keys = useMagicKeys\(\)/)
     assert.match(shortcutsSource, /window\.addEventListener\('keydown', handleKeydown, true\)/)
     assert.match(shortcutsSource, /event\.preventDefault\(\)\s+event\.stopPropagation\(\)/)
-    assert.match(shortcutsSource, /if \(!event\.repeat\)\s+callback\(\)/)
+    assert.match(shortcutsSource, /if \(event\.repeat\) \{\s+return\s+\}\s+callback\(\)/)
   })
 
   it('restores the exact pre-popup macOS application after hiding the standalone window', () => {

@@ -309,7 +309,7 @@ test('export destination must stay outside the real source worktree', async () =
   const sourceAlias = path.join(fixtureRoot, 'source-alias')
   await mkdir(sourceRoot)
   await mkdir(outsideRoot)
-  await symlink(sourceRoot, sourceAlias, 'dir')
+  await symlink(sourceRoot, sourceAlias, process.platform === 'win32' ? 'junction' : 'dir')
 
   try {
     assert.throws(

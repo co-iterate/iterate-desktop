@@ -23,4 +23,16 @@ describe('PopupHeader Codex project path open', () => {
     assert.match(source, /openCodexTargetFromEvent\(event\)/)
     assert.match(source, /props\.codexThreadId \? '正在打开 Codex 会话' : '正在打开 Codex 项目'/)
   })
+
+  it('renders a compact conversation title row when the protocol provides one', () => {
+    assert.match(source, /conversationTitle\?: string/)
+    assert.match(source, /props\.conversationTitle\?\.trim\(\) \|\| null/)
+    assert.match(source, /data-guide="conversation-title"/)
+    assert.match(source, /v-if="displayConversationTitle"/)
+    assert.match(source, />标题<\/span>/)
+    assert.match(source, /color: props\.currentTheme === 'light' \? '#374151' : '#e5e7eb'/)
+    assert.match(source, /color: props\.currentTheme === 'light' \? '#111827' : '#f9fafb'/)
+    assert.match(source, /textDecoration: 'underline'/)
+    assert.match(source, /textUnderlineOffset: '3px'/)
+  })
 })

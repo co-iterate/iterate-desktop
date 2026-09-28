@@ -9,6 +9,7 @@ APP_NAME="${CUNZHI_MACOS_APP_NAME:-iterate}"
 SOURCE_APP="${CUNZHI_MACOS_SOURCE_APP:-${REPO_ROOT}/target/release/bundle/macos/${APP_NAME}.app}"
 DEST_APP="${CUNZHI_MACOS_DEST_APP:-/Applications/${APP_NAME}.app}"
 SIGN_IDENTITY="${CUNZHI_MACOS_DEV_SIGN_IDENTITY:-}"
+INSTALLED_REQUIREMENT=""
 ENTITLEMENTS_PATH="${CUNZHI_MACOS_ENTITLEMENTS_PATH:-${REPO_ROOT}/Entitlements.plist}"
 SIGN_TIMESTAMP="${CUNZHI_MACOS_CODESIGN_TIMESTAMP:-}"
 SOURCE_RECEIPT_TOOL="${REPO_ROOT}/scripts/macos-source-receipt.mjs"
@@ -31,7 +32,7 @@ Usage:
 Options:
   --skip-build              Install the existing app bundle without running pnpm tauri:build
   --no-open                 Do not open the installed app after installation
-  --no-sign                 Do not sign the installed app
+  --no-sign                 Skip signing (may invalidate existing macOS permissions)
   --stop-background         Also stop preserved serve/popup/bridge/relay processes
   --restart-bridge          Restart the preserved bridge LaunchAgent after install
   --restart-relay           Restart the preserved relay LaunchAgent after install
@@ -41,13 +42,20 @@ Options:
   -h, --help                Show this help
 
 Environment:
-  CUNZHI_MACOS_DEV_SIGN_IDENTITY   codesign identity for local installs (default: auto-detect)
-  CUNZHI_MACOS_ALLOW_ADHOC_SIGN    set to 1 to allow fallback ad-hoc signing
+  CUNZHI_MACOS_DEV_SIGN_IDENTITY   explicit identity override ("-" requests temporary ad-hoc signing)
+  CUNZHI_MACOS_ALLOW_ADHOC_SIGN    set to 1 to explicitly allow fallback ad-hoc signing
   CUNZHI_MACOS_ENTITLEMENTS_PATH   app entitlements plist (default: Entitlements.plist)
   CUNZHI_MACOS_CODESIGN_TIMESTAMP  timestamp mode: default, none, or timestamp URL
   CUNZHI_MACOS_SOURCE_APP          source app bundle override
   CUNZHI_MACOS_DEST_APP            destination app bundle override
   CUNZHI_MACOS_ALLOW_DIRTY_SOURCE  set to 1 only for an intentional dirty development receipt
+
+Signing defaults:
+  Reuse the installed certificate identity; otherwise prefer Developer ID Application,
+  then Apple Development. A missing matching certificate stops replacement.
+  Ad-hoc signing changes identity on rebuild and can require permission grants again.
+  Moving from an old ad-hoc install to a certificate may require a one-time grant.
+  Keep the same certificate and bundle identifier for subsequent updates.
 EOF
 }
 
@@ -89,21 +97,49 @@ process_command() {
   ps -p "${pid}" -o command= 2>/dev/null || true
 }
 
-detect_sign_identity() {
+prepare_sign_identity() {
+  if [[ "${DO_SIGN}" -ne 1 ]]; then
+    info "WARNING: --no-sign may invalidate existing macOS permissions"
+    return 0
+  fi
+  [[ -f "${ENTITLEMENTS_PATH}" ]] || die "missing macOS entitlements file: ${ENTITLEMENTS_PATH}"
   if [[ -n "${SIGN_IDENTITY}" ]]; then
-    printf '%s\n' "${SIGN_IDENTITY}"
+    info "Using explicit signing override; changing identity may require permissions again"
     return 0
   fi
 
-  security find-identity -v -p codesigning \
-    | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' \
-    | head -n 1
-}
+  local identities
+  local installed_authority=""
+  local installed_details
+  identities="$(security find-identity -v -p codesigning)" || die "cannot read signing identities; installed app unchanged"
+  if [[ -e "${DEST_APP}" ]]; then
+    installed_details="$(codesign -d -vv "${DEST_APP}" 2>&1)" || die "cannot inspect installed signature; use an explicit signing identity for migration"
+    installed_authority="$(sed -n 's/^Authority=//p' <<<"${installed_details}" | head -n 1)"
+  fi
 
-detect_development_sign_identity() {
-  security find-identity -v -p codesigning \
-    | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' \
-    | head -n 1
+  if [[ -n "${installed_authority}" ]]; then
+    SIGN_IDENTITY="$(awk -F '"' -v authority="${installed_authority}" '$2 == authority { split($1, fields, " "); print fields[2]; exit }' <<<"${identities}")"
+    if [[ -n "${SIGN_IDENTITY}" ]]; then
+      INSTALLED_REQUIREMENT="$(codesign -d -r- "${DEST_APP}" 2>&1 | sed -n 's/^designated => //p')"
+      [[ -n "${INSTALLED_REQUIREMENT}" ]] || die "cannot read installed designated requirement; replacement stopped"
+      info "Reusing installed signing identity: ${installed_authority}"
+      return 0
+    fi
+    if [[ "${CUNZHI_MACOS_ALLOW_ADHOC_SIGN:-0}" != "1" ]]; then
+      die "matching signing certificate unavailable: ${installed_authority}; restore its certificate and private key before updating"
+    fi
+  else
+    SIGN_IDENTITY="$(sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' <<<"${identities}" | head -n 1)"
+    if [[ -z "${SIGN_IDENTITY}" ]]; then
+      SIGN_IDENTITY="$(sed -n 's/.*"\(Apple Development:.*\)"/\1/p' <<<"${identities}" | head -n 1)"
+    fi
+    [[ -z "${SIGN_IDENTITY}" ]] || return 0
+  fi
+  if [[ "${CUNZHI_MACOS_ALLOW_ADHOC_SIGN:-0}" == "1" ]]; then
+    SIGN_IDENTITY="-"
+  else
+    die "no stable signing identity found; install a Developer ID/Apple Development certificate and private key before updating"
+  fi
 }
 
 codesign_timestamp_args() {
@@ -262,7 +298,7 @@ bundle_has_running_code() {
   local pids
 
   bundle_path="$(cd "$(dirname "${bundle}")" && pwd -P)/$(basename "${bundle}")"
-  pids="$({ pgrep -x "${APP_NAME}" 2>/dev/null || true; pgrep -x "mcp-server" 2>/dev/null || true; } | sort -u)"
+  pids="$({ pgrep -x "${APP_NAME}" 2>/dev/null || true; pgrep -x "iterate-real" 2>/dev/null || true; pgrep -x "mcp-server" 2>/dev/null || true; } | sort -u)"
   if [[ -z "${pids}" ]]; then
     return 1
   fi
@@ -295,6 +331,55 @@ cleanup_retired_apps() {
   rmdir "${retired_root}" 2>/dev/null || true
 }
 
+preserve_installed_profile() {
+  local staged="$1"
+  # Read the old wrapper as data. Never execute it or copy its application flags.
+  /usr/bin/python3 - "${DEST_APP}" "${staged}" "${APP_NAME}" <<'PY'
+import json, pathlib, plistlib, shlex, sys
+old, staged = map(pathlib.Path, sys.argv[1:3])
+binary = sys.argv[3]
+old_info = plistlib.loads((old / 'Contents/Info.plist').read_bytes())
+installed_identifier = old_info.get('CFBundleIdentifier')
+if not isinstance(installed_identifier, str) or not installed_identifier.strip():
+    raise SystemExit('Missing installed bundle identifier; replacement stopped')
+profile = old / 'Contents/Resources/iterate-profile.json'
+allowed = {'ITERATE_CONFIG_DIR', 'ITERATE_CROSS_DEVICE_DIR', 'ITERATE_CROSS_DEVICE_NAME', 'ITERATE_CONVERSATION_STATE_FILE'}
+values = {}
+legacy = False
+if profile.is_file():
+    values = json.loads(profile.read_text())
+else:
+    legacy = old_info.get('CFBundleExecutable') == 'launcher' and installed_identifier == 'dev.iterate.cross-device'
+    if legacy:
+        for line in (old / 'Contents/MacOS/launcher').read_text().splitlines():
+            parts = shlex.split(line)
+            if len(parts) == 2 and parts[0] == 'export' and '=' in parts[1]:
+                key, value = parts[1].split('=', 1)
+                if key in allowed:
+                    values[key] = value
+        if not {'ITERATE_CONFIG_DIR', 'ITERATE_CROSS_DEVICE_DIR'} <= values.keys():
+            raise SystemExit('Cannot preserve the installed pairing profile; replacement stopped')
+if not isinstance(values, dict) or not values.keys() <= allowed or not all(isinstance(v, str) and v for v in values.values()):
+    raise SystemExit('Invalid installed profile; replacement stopped')
+if values:
+    target = staged / 'Contents/Resources/iterate-profile.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(values, ensure_ascii=False))
+if values or (old / 'Contents/MacOS/launcher').is_file():
+    # Regenerate the safe compatibility entry; never copy arbitrary wrapper code.
+    launcher = staged / 'Contents/MacOS/launcher'
+    launcher.write_text('#!/bin/sh\nexec "$(dirname "$0")/' + binary + '" "$@"\n')
+    launcher.chmod(0o755)
+info_path = staged / 'Contents/Info.plist'
+info = plistlib.loads(info_path.read_bytes())
+info['CFBundleIdentifier'] = installed_identifier
+info['CFBundleExecutable'] = binary
+info['LSUIElement'] = False
+info.pop('LSBackgroundOnly', None)
+info_path.write_bytes(plistlib.dumps(info))
+PY
+}
+
 copy_app() {
   local dest_parent
   local retired_app=""
@@ -316,6 +401,23 @@ copy_app() {
   if ! ditto "${SOURCE_APP}" "${staging_app}"; then
     rm -rf "${staging_app}"
     die "failed to stage app bundle"
+  fi
+
+  if [[ -e "${DEST_APP}" ]]; then
+    preserve_installed_profile "${staging_app}"
+  fi
+
+  # Finish signing and verify continuity before moving the installed bundle.
+  if ! (
+    clear_copied_app_attributes "${staging_app}" || exit 1
+    sign_app "${staging_app}" || exit 1
+    codesign --verify --deep --strict "${staging_app}" || exit 1
+    if [[ -n "${INSTALLED_REQUIREMENT}" ]]; then
+      codesign --verify --strict -R "=${INSTALLED_REQUIREMENT}" "${staging_app}"
+    fi
+  ); then
+    rm -rf "${staging_app}"
+    die "staged signature failed verification; installed app unchanged"
   fi
 
   if [[ -e "${DEST_APP}" ]]; then
@@ -347,7 +449,7 @@ copy_app() {
 
 clear_copied_app_attributes() {
   info "Clearing copied app extended attributes before signing"
-  xattr -cr "${DEST_APP}"
+  xattr -cr "$1"
 }
 
 write_or_verify_source_receipt() {
@@ -368,64 +470,63 @@ sign_app() {
   fi
 
   local identity
+  local app="$1"
   local binary_path
   local timestamp_args=()
 
-  identity="$(detect_sign_identity || true)"
-  if [[ -z "${identity}" ]]; then
-    identity="$(detect_development_sign_identity || true)"
-  fi
-
-  if [[ -z "${identity}" ]]; then
-    if [[ "${CUNZHI_MACOS_ALLOW_ADHOC_SIGN:-0}" == "1" ]]; then
-      identity="-"
-      timestamp_args=(--timestamp=none)
-      info "No codesign identity found; using explicit ad-hoc signing because CUNZHI_MACOS_ALLOW_ADHOC_SIGN=1"
-    else
-      die "no codesign identity found; set CUNZHI_MACOS_DEV_SIGN_IDENTITY, install a Developer ID/Apple Development certificate, or pass --no-sign"
-    fi
+  identity="${SIGN_IDENTITY}"
+  [[ -n "${identity}" ]] || die "signing identity was not prepared"
+  if [[ "${identity}" == "-" ]]; then
+    timestamp_args=(--timestamp=none)
+    info "WARNING: explicit ad-hoc signing can require macOS permissions again after each rebuild"
   else
-    if [[ "${identity}" == "-" ]]; then
-      [[ "${CUNZHI_MACOS_ALLOW_ADHOC_SIGN:-0}" == "1" ]] || die "ad-hoc signing is disabled by default; set CUNZHI_MACOS_ALLOW_ADHOC_SIGN=1 to use identity '-'"
-      timestamp_args=(--timestamp=none)
-      info "Using explicit ad-hoc signing because CUNZHI_MACOS_ALLOW_ADHOC_SIGN=1"
-    else
-      while IFS= read -r timestamp_arg; do
-        timestamp_args+=("${timestamp_arg}")
-      done < <(codesign_timestamp_args)
-    fi
+    while IFS= read -r timestamp_arg; do
+      timestamp_args+=("${timestamp_arg}")
+    done < <(codesign_timestamp_args)
   fi
 
   [[ -f "${ENTITLEMENTS_PATH}" ]] || die "missing macOS entitlements file: ${ENTITLEMENTS_PATH}"
 
-  info "Signing installed app binaries with identity: ${identity}"
-  for binary_path in "${DEST_APP}/Contents/MacOS"/*; do
+  # The compatibility script is nested code in Contents/MacOS. Its signature
+  # lives in extended attributes and must exist before signing the enclosing app.
+  if [[ -f "${app}/Contents/MacOS/launcher" ]]; then
+    info "Signing preserved launcher with identity: ${identity}"
+    codesign --force "${timestamp_args[@]}" --sign "${identity}" \
+      "${app}/Contents/MacOS/launcher" || return 1
+  fi
+
+  info "Signing staged helper binaries with identity: ${identity}"
+  for binary_path in "${app}/Contents/MacOS"/*; do
     [[ -f "${binary_path}" ]] || continue
+    # Signing the primary executable also processes its enclosing bundle.
+    # Leave it until all nested code is signed, then sign the app below.
+    [[ "$(basename "${binary_path}")" != "${APP_NAME}" ]] || continue
+    [[ "$(basename "${binary_path}")" != "launcher" ]] || continue
+    [[ "$(file -b "${binary_path}")" == *Mach-O* ]] || continue
     if [[ "$(basename "${binary_path}")" == "mcp-server" ]]; then
       codesign --force --options runtime "${timestamp_args[@]}" \
         --identifier "com.kexin94yyds.iterate.mcp-server" \
-        --sign "${identity}" "${binary_path}"
+        --sign "${identity}" "${binary_path}" || return 1
     else
-      codesign --force --options runtime "${timestamp_args[@]}" --sign "${identity}" "${binary_path}"
+      codesign --force --options runtime "${timestamp_args[@]}" --sign "${identity}" "${binary_path}" || return 1
     fi
   done
 
-  info "Signing installed app bundle with entitlements: ${ENTITLEMENTS_PATH}"
+  info "Signing staged app bundle with entitlements: ${ENTITLEMENTS_PATH}"
   codesign \
     --force \
     --options runtime \
     "${timestamp_args[@]}" \
     --entitlements "${ENTITLEMENTS_PATH}" \
     --sign "${identity}" \
-    "${DEST_APP}"
+    "${app}"
 }
 
 verify_app() {
   local dest_bin="${DEST_APP}/Contents/MacOS/${APP_NAME}"
 
-  info "Clearing quarantine attributes"
-  xattr -cr "${DEST_APP}"
-
+  # Attributes were cleared before signing the staged app. Clearing them here
+  # would remove the preserved launcher's code-signing extended attributes.
   info "Verifying code signature"
   codesign --verify --deep --strict "${DEST_APP}"
 
@@ -638,6 +739,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   die "macOS is required"
 fi
 
+prepare_sign_identity
+
 if [[ "${DO_BUILD}" -eq 1 ]]; then
   info "Building desktop app"
   (cd "${REPO_ROOT}" && pnpm tauri:build)
@@ -649,8 +752,6 @@ write_or_verify_source_receipt
 stop_installed_app
 stop_conflicting_foreground_app_bundles
 copy_app
-clear_copied_app_attributes
-sign_app
 verify_app
 restart_requested_background_processes
 

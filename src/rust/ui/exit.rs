@@ -159,6 +159,7 @@ pub async fn handle_system_exit_request(
         if state.exit_in_progress.swap(true, Ordering::SeqCst) {
             return Ok(true);
         }
+        // 标题栏 X 只关闭当前实例；不能广播退出或清理其他会话进程。
         cancel_pending_mcp_requests(state.inner())?;
         perform_exit(app.clone()).await?;
         return Ok(true);
@@ -202,6 +203,8 @@ pub async fn handle_system_exit_request(
 
 /// 执行实际的退出操作
 async fn perform_exit(app: AppHandle) -> Result<(), String> {
+    // 立即隐藏窗口，让用户得到明确反馈；不要再次调用 close()，否则会递归触发
+    // CloseRequested 事件。
     #[cfg(target_os = "windows")]
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
@@ -211,7 +214,7 @@ async fn perform_exit(app: AppHandle) -> Result<(), String> {
         let _ = window.close();
     }
 
-    // 给已取消请求和日志一个很短的收尾窗口，随后终止整个应用运行时。
+    // 给当前实例的已取消请求和日志一个很短的收尾窗口。
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     app.exit(0);
     Ok(())
@@ -220,14 +223,14 @@ async fn perform_exit(app: AppHandle) -> Result<(), String> {
 /// Tauri命令：强制退出应用（用于程序内部调用）
 #[tauri::command]
 pub async fn force_exit_app(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     #[cfg(target_os = "windows")]
     {
-        let state = app.state::<AppState>();
         if state.exit_in_progress.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        cancel_pending_mcp_requests(state.inner())?;
     }
+    cancel_pending_mcp_requests(state.inner())?;
     perform_exit(app).await
 }
 

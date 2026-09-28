@@ -1,8 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { getCurrentWindow } from '@tauri-apps/api/window'
-import { ref } from 'vue'
+import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
+import { nextTick, ref } from 'vue'
+import { publishCompletedMcpRequest } from '../services/bridgeRequestClosure'
 import { clearActiveMcpFatalContext, setActiveMcpFatalContext } from '../utils/mcpFatalError'
+import { crossDeviceSendError } from './useCrossDevice'
+import { MCP_DELIVERY_FAILURE, mcpDeliveryError } from './useMcpDelivery'
 import { useNotification } from './useNotification'
 
 const MUTE_STORAGE_KEY = 'iterate.muted'
@@ -296,6 +299,10 @@ export function resolveMcpLaunchContext(): Promise<McpLaunchContext> {
 
 // 静音状态（模块级单例，确保所有调用者共享同一个状态）
 const isMuted = ref(localStorage.getItem(MUTE_STORAGE_KEY) === 'true')
+window.addEventListener('storage', (event) => {
+  if (event.key === MUTE_STORAGE_KEY)
+    isMuted.value = event.newValue === 'true'
+})
 
 /**
  * 切换静音状态
@@ -312,6 +319,21 @@ export function useMcpHandler() {
   const mcpRequest = ref(null)
   const showMcpPopup = ref(false)
   const isMcpProcess = ref(false)
+  const resolvingRequestIds = new Set<string>()
+
+  function beginRequestResolution(request: any, response?: any): string | null {
+    const key = resolveRequestId(request) ?? resolveRequestId(response) ?? '__unrouted_mcp_request__'
+    if (resolvingRequestIds.has(key)) {
+      console.info('[MCP] 忽略重复响应', { requestId: key })
+      return null
+    }
+    resolvingRequestIds.add(key)
+    return key
+  }
+
+  function finishRequestResolution(key: string) {
+    resolvingRequestIds.delete(key)
+  }
 
   interface ImmediateMcpDismissal {
     request: any
@@ -363,6 +385,8 @@ export function useMcpHandler() {
   }
 
   function resolveProjectPath(request: any): string | null {
+    if (String(request?.id || '').startsWith('cross-'))
+      return null
     const candidate = request?.project_path ?? request?.projectPath
     if (isDisplayableProjectPath(candidate)) {
       const normalized = candidate.trim()
@@ -381,11 +405,18 @@ export function useMcpHandler() {
    * 统一的MCP响应处理
    */
   async function handleMcpResponse(response: any) {
+    crossDeviceSendError.value = ''
+    mcpDeliveryError.value = ''
     const request = mcpRequest.value as any
+    const resolutionKey = beginRequestResolution(request, response)
+    if (!resolutionKey)
+      return
     const projectPath = resolveProjectPath(request)
     const requestId = resolveRequestId(request)
-    const dismissal = await dismissMcpUiImmediately(request)
+    let dismissal: ImmediateMcpDismissal | null = null
+    let submitted = false
     try {
+      dismissal = await dismissMcpUiImmediately(request)
       // 通过Tauri命令发送响应并退出应用
       const timelineRouteId = await resolveConversationRouteIdWithFallback(request, projectPath)
       console.info('[MCP] 发送响应', {
@@ -395,6 +426,8 @@ export function useMcpHandler() {
         hasResponse: response != null,
       })
       await invoke('send_mcp_response', { response, projectPath, requestId, timelineRouteId })
+      submitted = true
+      await publishCompletedMcpRequest(requestId, request?.project_path ?? request?.projectPath)
       clearActiveMcpFatalContext()
       if (isMcpProcess.value) {
         await invoke('exit_app')
@@ -402,8 +435,39 @@ export function useMcpHandler() {
     }
     catch (error) {
       console.error('MCP响应处理失败:', error)
-      await restoreMcpUiAfterFailure(dismissal)
+      if (!submitted)
+        mcpDeliveryError.value = MCP_DELIVERY_FAILURE
+      if (String(requestId || '').startsWith('cross-'))
+        crossDeviceSendError.value = String(error)
+      if (dismissal)
+        await restoreMcpUiAfterFailure(dismissal)
     }
+    finally {
+      finishRequestResolution(resolutionKey)
+    }
+  }
+
+  /**
+   * 结束当前 zhi/call_zhi，但保留 iterate 主程序和其他请求。
+   */
+  async function handleMcpCloseCurrentDialog() {
+    const request = mcpRequest.value as any
+    const requestId = resolveRequestId(request)
+    if (!request || !requestId)
+      return
+
+    await handleMcpResponse({
+      user_input: '',
+      selected_options: [],
+      images: [],
+      file_paths: [],
+      image_paths: [],
+      metadata: {
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        source: 'popup_closed',
+      },
+    })
   }
 
   /**
@@ -411,10 +475,14 @@ export function useMcpHandler() {
    */
   async function handleMcpCancel() {
     const request = mcpRequest.value as any
+    const resolutionKey = beginRequestResolution(request)
+    if (!resolutionKey)
+      return
     const projectPath = resolveProjectPath(request)
     const requestId = resolveRequestId(request)
-    const dismissal = await dismissMcpUiImmediately(request)
+    let dismissal: ImmediateMcpDismissal | null = null
     try {
+      dismissal = await dismissMcpUiImmediately(request)
       // 发送取消信息并退出应用
       const timelineRouteId = await resolveConversationRouteIdWithFallback(request, projectPath)
       console.info('[MCP] 发送取消响应', {
@@ -423,6 +491,7 @@ export function useMcpHandler() {
         projectPath,
       })
       await invoke('send_mcp_response', { response: 'CANCELLED', projectPath, requestId, timelineRouteId })
+      await publishCompletedMcpRequest(requestId, request?.project_path ?? request?.projectPath)
       clearActiveMcpFatalContext()
       if (isMcpProcess.value) {
         await invoke('exit_app')
@@ -431,7 +500,11 @@ export function useMcpHandler() {
     catch (error) {
       // 静默处理MCP取消错误
       console.error('MCP取消处理失败:', error)
-      await restoreMcpUiAfterFailure(dismissal)
+      if (dismissal)
+        await restoreMcpUiAfterFailure(dismissal)
+    }
+    finally {
+      finishRequestResolution(resolutionKey)
     }
   }
 
@@ -439,6 +512,7 @@ export function useMcpHandler() {
    * 显示MCP弹窗
    */
   async function showMcpDialog(request: any) {
+    mcpDeliveryError.value = ''
     const projectPath = resolveProjectPath(request)
     const routedRequest = await freezeConversationRouteId(request, projectPath)
     const requestId = resolveRequestId(routedRequest)
@@ -501,10 +575,25 @@ export function useMcpHandler() {
         // 仍然设置请求数据，但不显示弹窗
         mcpRequest.value = routedRequest
         showMcpPopup.value = true
+        if (isMcpProcess.value) {
+          await nextTick()
+          try {
+            await invoke('position_window_left')
+          }
+          catch (error) {
+            console.error('定位静音MCP窗口失败:', error)
+          }
+        }
         // 最小化窗口到 Dock
         try {
           const window = getCurrentWindow()
           await window.minimize()
+          // Windows needs show() for a taskbar entry; macOS show() restores
+          // the miniaturized window, so leave its Dock presentation alone.
+          if (isMcpProcess.value && !navigator.platform.toUpperCase().includes('MAC'))
+            await window.show()
+          if (navigator.platform.toUpperCase().includes('WIN'))
+            await window.requestUserAttention(UserAttentionType.Informational)
         }
         catch (error) {
           console.error('最小化窗口失败:', error)
@@ -514,6 +603,20 @@ export function useMcpHandler() {
         // 正常模式：设置请求数据和显示状态
         mcpRequest.value = routedRequest
         showMcpPopup.value = true
+      }
+      // Standalone windows start hidden: decide their first visible state only
+      // after the shared notification preference and force-popup rules resolve.
+      if (isMcpProcess.value && !isMuted.value) {
+        await nextTick()
+        try {
+          await invoke('center_window')
+        }
+        catch (error) {
+          console.error('定位并显示MCP窗口失败:', error)
+          const window = getCurrentWindow()
+          await window.show()
+          await window.setFocus()
+        }
       }
     }
     else {
@@ -739,6 +842,7 @@ export function useMcpHandler() {
     toggleMute,
     handleMcpResponse,
     handleMcpCancel,
+    handleMcpCloseCurrentDialog,
     handleMcpContinue,
     handleMcpLoopReply,
     handleMcpEnhance,

@@ -261,13 +261,6 @@ pub(super) async fn try_handle_mcp_action_directly(
         }
     };
 
-    crate::ui::live_goal::apply_live_goal_intent_from_response(
-        Some(app_handle),
-        &response,
-        Some(project_path),
-        request_id,
-    );
-
     if let Some(state) = app_handle.try_state::<crate::config::AppState>() {
         let response_str = match serde_json::to_string(&response) {
             Ok(s) => s,
@@ -338,6 +331,10 @@ pub(super) async fn try_handle_mcp_action_directly(
                 request_id, project_path
             );
 
+            crate::ui::live_goal::apply_live_goal_intent_from_response(
+                Some(app_handle), &response, Some(project_path), request_id,
+            );
+
             if let Err(err) = record_mcp_action_response_node(
                 app_handle,
                 action,
@@ -400,6 +397,9 @@ pub(super) async fn try_handle_mcp_action_directly(
                 &bridge_debug_log,
             );
             if serve_attempt.delivered {
+                crate::ui::live_goal::apply_live_goal_intent_from_response(
+                    Some(app_handle), &response, Some(project_path), request_id,
+                );
                 if let Err(err) = record_mcp_action_response_node(
                     app_handle,
                     action,
@@ -606,13 +606,6 @@ pub(super) async fn try_handle_mcp_action_headless(
         }
     };
 
-    crate::ui::live_goal::apply_live_goal_intent_from_response::<tauri::Wry>(
-        None,
-        &response,
-        Some(project_path),
-        request_id,
-    );
-
     let serve_attempt = try_write_serve_response_file(
         request_id,
         project_path,
@@ -627,6 +620,10 @@ pub(super) async fn try_handle_mcp_action_headless(
         ));
         return RoomDeliveryResult::rejected(serve_attempt);
     }
+
+    crate::ui::live_goal::apply_live_goal_intent_from_response::<tauri::Wry>(
+        None, &response, Some(project_path), request_id,
+    );
 
     if matches!(action, "submit" | "continue" | "enhance") {
         let persistent_manager = ConversationManager::new_with_forced_persistence();

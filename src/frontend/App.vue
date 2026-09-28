@@ -23,7 +23,7 @@ const {
 } = useAppManager()
 
 // 创建事件处理器
-const handlers = useEventHandlers(actions)
+const handlers = useEventHandlers(actions, () => mcpRequest.value)
 const speechRuntimeHost = useGlobalSpeechRuntimeHost()
 
 // 试用期状态
@@ -201,7 +201,18 @@ onMounted(async () => {
       return
     }
 
-    await speechRuntimeHost.initialize()
+    if (windowsPlatform) {
+      try {
+        await speechRuntimeHost.initialize()
+      }
+      catch (error) {
+        console.warn('语音运行时初始化失败，主界面将继续启动:', error)
+        await reportTrialDebug(`onMounted:speechRuntimeDegraded ${String(error)}`)
+      }
+    }
+    else {
+      await speechRuntimeHost.initialize()
+    }
 
     if (mcpLaunchContext.value.kind === 'invalid')
       await reportTrialDebug(`onMounted:mcpLaunchInvalid ${mcpLaunchContext.value.error ?? 'unknown'}`)
@@ -318,6 +329,7 @@ onUnmounted(() => {
               :mcp-request="mcpRequest" :show-mcp-popup="showMcpPopup" :app-config="appConfig"
               :is-initializing="isInitializing" :is-muted="isMuted"
               @mcp-response="handlers.onMcpResponse" @mcp-cancel="handlers.onMcpCancel"
+              @mcp-close-current-dialog="handlers.onMcpCloseCurrentDialog"
               @theme-change="handlers.onThemeChange" @toggle-always-on-top="handlers.onToggleAlwaysOnTop"
               @toggle-mute="handlers.onToggleMute"
               @toggle-audio-notification="handlers.onToggleAudioNotification"
