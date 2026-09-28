@@ -112,6 +112,7 @@ const { loadShortcutConfig, getShortcutByAction } = useShortcuts()
 
 // 响应式状态
 const loading = ref(false)
+const focusPopupOnShow = ref(false)
 const submitting = ref(false)
 const selectedOptions = ref<string[]>([])
 const userInput = ref('')
@@ -558,7 +559,7 @@ async function scheduleInputFocus(
   reason: string,
   options: { preserveExistingFocus?: boolean, activateWindow?: boolean } = {},
 ) {
-  if (!isVisible.value || loading.value || !inputRef.value)
+  if (!focusPopupOnShow.value || !isVisible.value || loading.value || !inputRef.value)
     return
 
   if (options.preserveExistingFocus && shouldPreserveCurrentFocus()) {
@@ -580,7 +581,7 @@ async function scheduleInputFocus(
   await nextTick()
 
   const attemptFocus = () => {
-    if (!isVisible.value || loading.value || !inputRef.value)
+    if (!focusPopupOnShow.value || !isVisible.value || loading.value || !inputRef.value)
       return false
 
     inputRef.value.focusInput?.()
@@ -711,8 +712,17 @@ let telegramUnlisten: (() => void) | null = null
 // 监听请求变化
 watch(() => props.request, async (newRequest) => {
   if (newRequest) {
+    focusPopupOnShow.value = false
     resetForm()
     loading.value = true
+    try {
+      const config = await invoke<{ focus_popup_on_show?: boolean }>('get_window_config')
+      focusPopupOnShow.value = config.focus_popup_on_show !== false
+    }
+    catch (error) {
+      console.warn('加载弹窗聚焦设置失败，使用默认行为:', error)
+      focusPopupOnShow.value = true
+    }
     // 每次显示弹窗时重新加载配置
     loadReplyConfig()
 
@@ -1316,6 +1326,7 @@ defineExpose({
             :enable-context-append="true"
             :loading="loading"
             :submitting="submitting"
+            :auto-focus="focusPopupOnShow"
             @update="handleInputUpdate"
             @image-add="handleImageAdd"
             @conditional-state-change="emit('conditionalStateChange', $event)"

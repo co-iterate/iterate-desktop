@@ -40,6 +40,7 @@ interface Props {
   enableContextAppend?: boolean
   loading?: boolean
   submitting?: boolean
+  autoFocus?: boolean
 }
 
 interface Emits {
@@ -71,6 +72,7 @@ const props = withDefaults(defineProps<Props>(), {
   enableContextAppend: true,
   loading: false,
   submitting: false,
+  autoFocus: true,
 })
 
 const emit = defineEmits<Emits>()
@@ -1330,12 +1332,15 @@ async function applySpeechInsertText(payload: SpeechInsertPayload) {
   await acknowledgeSpeechInsert(payload)
 }
 
-async function focusInput(options: { registerSpeechTarget?: boolean } = {}) {
+async function focusInput(options: { registerSpeechTarget?: boolean, onlyIfAutoFocus?: boolean } = {}) {
   const registerSpeechTarget = options.registerSpeechTarget ?? true
   if (!registerSpeechTarget)
     suppressProgrammaticSpeechTargetFocus()
 
   await nextTick()
+
+  if (options.onlyIfAutoFocus && !props.autoFocus)
+    return
 
   if (!textareaRef.value)
     return
@@ -1540,24 +1545,26 @@ function clearLocalFocusTimer() {
 }
 
 function scheduleTextareaFocus(reason: string) {
-  if (props.loading || props.submitting)
+  if (!props.autoFocus || props.loading || props.submitting)
     return
 
   clearLocalFocusTimer()
 
-  void focusInput({ registerSpeechTarget: false })
+  void focusInput({ registerSpeechTarget: false, onlyIfAutoFocus: true })
   scheduleGhostMetricsSync()
 
   if (typeof window.requestAnimationFrame === 'function') {
     localFocusFrame = window.requestAnimationFrame(() => {
       localFocusFrame = null
-      void focusInput({ registerSpeechTarget: false })
+      if (props.autoFocus)
+        void focusInput({ registerSpeechTarget: false, onlyIfAutoFocus: true })
       scheduleGhostMetricsSync()
     })
   }
 
   localFocusTimer = setTimeout(() => {
-    void focusInput({ registerSpeechTarget: false })
+    if (props.autoFocus)
+      void focusInput({ registerSpeechTarget: false, onlyIfAutoFocus: true })
     scheduleGhostMetricsSync()
     localFocusTimer = null
   }, 180)

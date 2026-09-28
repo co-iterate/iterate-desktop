@@ -22,9 +22,17 @@ export function useMcpDelivery() {
       if (status === 'disconnected') {
         warned = true
         mcpDeliveryError.value = MCP_DELIVERY_FAILURE
-        const window = getCurrentWindow()
-        await window.show()
-        await window.setFocus()
+        const focusOnShow = await invoke<{ focus_popup_on_show?: boolean }>('get_window_config')
+          .then(config => config.focus_popup_on_show !== false)
+          .catch(() => true)
+        if (!focusOnShow) {
+          await invoke('center_window')
+        }
+        else {
+          const window = getCurrentWindow()
+          await window.show()
+          await window.setFocus()
+        }
       }
     }
     catch (error) { console.error('读取调用交付状态失败:', error) }

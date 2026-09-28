@@ -81,6 +81,8 @@ pub struct FontConfig {
 pub struct WindowConfig {
     #[serde(default)]
     pub popup_placement: PopupPlacement,
+    #[serde(default = "default_focus_popup_on_show")]
+    pub focus_popup_on_show: bool,
     // 窗口约束设置
     #[serde(default = "default_auto_resize")]
     pub auto_resize: bool,
@@ -554,6 +556,7 @@ pub fn default_audio_url() -> String {
 pub fn default_window_config() -> WindowConfig {
     WindowConfig {
         popup_placement: PopupPlacement::Left,
+        focus_popup_on_show: default_focus_popup_on_show(),
         auto_resize: window::DEFAULT_AUTO_RESIZE,
         max_width: window::MAX_WIDTH,
         max_height: window::MAX_HEIGHT,
@@ -600,6 +603,10 @@ pub fn default_min_height() -> f64 {
 
 pub fn default_enable_continue_reply() -> bool {
     mcp::DEFAULT_CONTINUE_REPLY_ENABLED
+}
+
+pub fn default_focus_popup_on_show() -> bool {
+    true
 }
 
 pub fn default_copy_submission_to_clipboard() -> bool {
@@ -1026,6 +1033,21 @@ mod tests {
         assert_eq!(encoded["popup_placement"], "center");
         let reloaded: WindowConfig = serde_json::from_value(encoded).unwrap();
         assert_eq!(reloaded.popup_placement, PopupPlacement::Center);
+    }
+
+    #[test]
+    fn popup_focus_defaults_on_for_legacy_config_and_round_trips() {
+        let legacy = serde_json::to_value(default_window_config()).unwrap();
+        let mut legacy = legacy.as_object().unwrap().clone();
+        legacy.remove("focus_popup_on_show");
+        let decoded: WindowConfig = serde_json::from_value(legacy.into()).unwrap();
+        assert!(decoded.focus_popup_on_show);
+
+        let mut disabled = decoded;
+        disabled.focus_popup_on_show = false;
+        let encoded = serde_json::to_value(&disabled).unwrap();
+        let reloaded: WindowConfig = serde_json::from_value(encoded).unwrap();
+        assert!(!reloaded.focus_popup_on_show);
     }
 
     #[test]

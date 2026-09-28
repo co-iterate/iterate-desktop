@@ -10,6 +10,17 @@ import { useNotification } from './useNotification'
 
 const MUTE_STORAGE_KEY = 'iterate.muted'
 const LAST_VALID_PROJECT_PATH_KEY = 'iterate.last_valid_project_path'
+async function shouldFocusPopupOnShow(): Promise<boolean> {
+  try {
+    const config = await invoke<{ focus_popup_on_show?: boolean }>('get_window_config')
+    return config.focus_popup_on_show !== false
+  }
+  catch (error) {
+    console.warn('加载弹窗聚焦设置失败，使用默认行为:', error)
+    return true
+  }
+}
+
 const DEFAULT_CONTINUE_PROMPT = '请按照最佳实践继续'
 const DEFAULT_LOOP_PROMPT = '进入自主循环模式。\n\n## 执行规则\n1. 基于当前上下文，按最佳实践继续执行当前任务\n2. 每轮完成后立即调用 iterate/zhi 汇报进度，不要等待用户\n3. 如果任务未完成且无需用户决策，继续自动执行下一步\n\n## 停止条件（满足任一即停止）\n- 任务已全部完成\n- 遇到必须由用户决定的问题\n- 遇到无法自动解决的错误（连续失败2次）\n- 不确定下一步该做什么\n\n## 汇报格式\n每轮简要说明：做了什么 → 结果如何 → 下一步计划'
 
@@ -374,9 +385,14 @@ export function useMcpHandler() {
 
     if (dismissal.hidStandaloneWindow) {
       try {
-        const window = getCurrentWindow()
-        await window.show()
-        await window.setFocus()
+        if (await shouldFocusPopupOnShow()) {
+          const window = getCurrentWindow()
+          await window.show()
+          await window.setFocus()
+        }
+        else {
+          await invoke('center_window')
+        }
       }
       catch (error) {
         console.error('恢复MCP窗口失败:', error)
@@ -613,9 +629,11 @@ export function useMcpHandler() {
         }
         catch (error) {
           console.error('定位并显示MCP窗口失败:', error)
-          const window = getCurrentWindow()
-          await window.show()
-          await window.setFocus()
+          if (await shouldFocusPopupOnShow()) {
+            const window = getCurrentWindow()
+            await window.show()
+            await window.setFocus()
+          }
         }
       }
     }

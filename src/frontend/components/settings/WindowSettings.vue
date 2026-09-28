@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { NRadioButton, NRadioGroup } from 'naive-ui'
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useSettings } from '../../composables/useSettings'
 
 const props = defineProps({
   alwaysOnTop: {
@@ -24,6 +25,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['toggleAlwaysOnTop', 'updateWindowSize'])
+const settings = useSettings()
 
 // 窗口设置状态 - 完全依赖后端
 const localFixed = ref(props.fixedWindowSize)
@@ -32,14 +34,37 @@ const localHeight = ref(props.windowHeight)
 const popupPlacement = ref<'left' | 'center'>('left')
 const savingPopupPlacement = ref(false)
 const popupPlacementError = ref('')
+const focusPopupOnShow = ref(true)
+const savingPopupFocus = ref(false)
+const popupFocusError = ref('')
 
 async function loadPopupPlacement() {
   try {
-    const config = await invoke<{ popup_placement?: string }>('get_window_config')
+    const config = await invoke<{ popup_placement?: string, focus_popup_on_show?: boolean }>('get_window_config')
     popupPlacement.value = config.popup_placement === 'center' ? 'center' : 'left'
+    focusPopupOnShow.value = config.focus_popup_on_show !== false
   }
   catch (error) {
     popupPlacementError.value = `加载弹窗位置失败：${error}`
+  }
+}
+
+async function updatePopupFocus(value: boolean) {
+  if (savingPopupFocus.value || focusPopupOnShow.value === value)
+    return
+  savingPopupFocus.value = true
+  popupFocusError.value = ''
+  try {
+    await invoke('set_window_settings', { windowSettings: { focus_popup_on_show: value } })
+    focusPopupOnShow.value = value
+    if (!value)
+      settings.alwaysOnTop.value = false
+  }
+  catch (error) {
+    popupFocusError.value = `保存弹窗聚焦设置失败：${error}`
+  }
+  finally {
+    savingPopupFocus.value = false
   }
 }
 
@@ -321,6 +346,32 @@ onUnmounted(() => {
           {{ popupPlacementError }}
         </div>
       </div>
+    </div>
+
+    <div class="flex items-center justify-between">
+      <div class="flex items-center">
+        <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 flex-shrink-0" />
+        <div>
+          <div class="text-sm font-medium leading-relaxed">
+            弹窗出现时自动聚焦
+          </div>
+          <div class="text-xs opacity-60">
+            关闭后弹窗不会抢走键盘输入，并同时关闭“总在最前”；点击弹窗后可输入
+          </div>
+          <div v-if="!focusPopupOnShow && alwaysOnTop" class="text-xs text-amber-500 mt-1">
+            “总在最前”已单独开启，弹窗仍可能遮挡其他窗口
+          </div>
+          <div v-if="popupFocusError" class="text-xs text-red-500 mt-2" role="alert">
+            {{ popupFocusError }}
+          </div>
+        </div>
+      </div>
+      <n-switch
+        :value="focusPopupOnShow"
+        :disabled="savingPopupFocus"
+        size="small"
+        @update:value="updatePopupFocus"
+      />
     </div>
 
     <!-- 置顶显示设置 -->

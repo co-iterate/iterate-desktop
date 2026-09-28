@@ -524,6 +524,8 @@ pub async fn set_window_settings(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    let disable_always_on_top = window_settings.get("focus_popup_on_show")
+        == Some(&serde_json::Value::Bool(false));
     {
         let mut config = state
             .config
@@ -534,6 +536,14 @@ pub async fn set_window_settings(
             config.ui_config.window_config.popup_placement =
                 serde_json::from_value(placement.clone())
                     .map_err(|e| format!("弹窗位置无效: {}", e))?;
+        }
+        if let Some(focus) = window_settings.get("focus_popup_on_show") {
+            config.ui_config.window_config.focus_popup_on_show = focus
+                .as_bool()
+                .ok_or_else(|| "弹窗自动聚焦设置无效".to_string())?;
+            if disable_always_on_top {
+                config.ui_config.always_on_top = false;
+            }
         }
 
         // 更新窗口配置
@@ -591,6 +601,17 @@ pub async fn set_window_settings(
     save_config(&state, &app)
         .await
         .map_err(|e| format!("保存配置失败: {}", e))?;
+
+    if disable_always_on_top {
+        if let Some(window) = app.get_webview_window("main") {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            window
+                .set_always_on_top(false)
+                .map_err(|e| format!("取消窗口置顶失败: {}", e))?;
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let _ = window;
+        }
+    }
 
     Ok(())
 }
@@ -3951,14 +3972,35 @@ pub fn position_window_left(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn center_window(app: AppHandle) -> Result<(), String> {
     let window = place_main_window(&app)?;
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    window
-        .unminimize()
-        .map_err(|e| format!("恢复窗口失败: {}", e))?;
-    window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
-    window
-        .set_focus()
-        .map_err(|e| format!("聚焦窗口失败: {}", e))?;
+    let focus_on_show = app.state::<AppState>()
+        .config
+        .lock()
+        .map_err(|e| format!("获取配置失败: {}", e))?
+        .ui_config
+        .window_config
+        .focus_popup_on_show;
+
+    if focus_on_show {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        window
+            .unminimize()
+            .map_err(|e| format!("恢复窗口失败: {}", e))?;
+        window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
+        window
+            .set_focus()
+            .map_err(|e| format!("聚焦窗口失败: {}", e))?;
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+
+            let hwnd = window.hwnd().map_err(|e| format!("获取窗口句柄失败: {}", e))?;
+            // Tauri's show/unminimize may activate the window on Windows.
+            unsafe { ShowWindow(hwnd.0, SW_SHOWNOACTIVATE) };
+        }
+        #[cfg(not(target_os = "windows"))]
+        window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
+    }
 
     Ok(())
 }

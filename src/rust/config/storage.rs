@@ -169,13 +169,23 @@ pub fn save_standalone_config(config: &AppConfig) -> Result<()> {
 /// A concurrent change to the same field is rejected instead of silently overwritten.
 pub fn save_config_changes(config: &AppConfig) -> Result<AppConfig> {
     update_config_locked(|latest| {
+        merge_writer_config(config, latest)
+    })
+}
+
+fn merge_writer_config(config: &AppConfig, latest: &mut AppConfig) -> Result<()> {
+    if let Some(base) = &config.save_baseline {
         let mut current = serde_json::to_value(&*latest)?;
         let desired = serde_json::to_value(config)?;
-        let default = serde_json::to_value(AppConfig::default())?;
-        merge_config_fields(config.save_baseline.as_ref().unwrap_or(&default), &desired, &mut current, "")?;
+        merge_config_fields(base, &desired, &mut current, "")?;
         *latest = serde_json::from_value(current)?;
-        Ok(())
-    })
+    } else {
+        // No snapshot exists on first launch. The lock holder may write only if
+        // the file still does not exist; another writer's new file is a conflict.
+        anyhow::ensure!(latest.save_baseline.is_none(), "配置已在另一窗口创建，请重新加载");
+        *latest = config.clone();
+    }
+    Ok(())
 }
 
 pub fn update_config_locked(change: impl FnOnce(&mut AppConfig) -> Result<()>) -> Result<AppConfig> {
@@ -218,6 +228,55 @@ fn merge_config_fields(base: &serde_json::Value, desired: &serde_json::Value, cu
         *current = desired.clone();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod save_merge_tests {
+    use super::merge_writer_config;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn first_save_keeps_the_writers_defaults_and_settings() {
+        let mut writer = AppConfig::default();
+        writer.ui_config.window_config.focus_popup_on_show = false;
+        writer.ui_config.always_on_top = false;
+        let mut latest = AppConfig::default();
+        latest.custom_prompt_config.prompts[0].updated_at = "different default instance".into();
+
+        merge_writer_config(&writer, &mut latest).unwrap();
+
+        assert_eq!(serde_json::to_value(latest).unwrap(), serde_json::to_value(writer).unwrap());
+    }
+
+    #[test]
+    fn first_writer_rejects_a_file_created_by_another_writer() {
+        let writer = AppConfig::default();
+        let mut latest = AppConfig::default();
+        latest.save_baseline = Some(serde_json::to_value(&latest).unwrap());
+
+        let error = merge_writer_config(&writer, &mut latest).unwrap_err();
+
+        assert!(error.to_string().contains("另一窗口创建"));
+    }
+
+    #[test]
+    fn loaded_writers_still_merge_independent_fields_and_reject_conflicts() {
+        let base = AppConfig::default();
+        let mut writer = base.clone();
+        writer.save_baseline = Some(serde_json::to_value(&base).unwrap());
+        writer.ui_config.window_config.focus_popup_on_show = false;
+        let mut latest = base.clone();
+        latest.audio_config.notification_enabled = false;
+
+        merge_writer_config(&writer, &mut latest).unwrap();
+        assert!(!latest.ui_config.window_config.focus_popup_on_show);
+        assert!(!latest.audio_config.notification_enabled);
+
+        writer.ui_config.window_config.max_width = 1400.0;
+        latest.ui_config.window_config.max_width = 1300.0;
+        let error = merge_writer_config(&writer, &mut latest).unwrap_err();
+        assert!(error.to_string().contains("/ui_config/window_config/max_width"));
+    }
 }
 
 /// 独立加载Telegram配置（用于MCP模式下的配置检查）

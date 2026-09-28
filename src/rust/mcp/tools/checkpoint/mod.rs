@@ -250,7 +250,7 @@ mod tests {
     use super::{
         filter_monitor_relevant_status, maybe_auto_checkpoint, STANDALONE_CONFIG_ENV_LOCK,
     };
-    use crate::config::{save_standalone_config, AppConfig};
+    use crate::config::{load_standalone_config, save_standalone_config, AppConfig};
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
@@ -375,6 +375,9 @@ mod tests {
         let head_subject = String::from_utf8_lossy(&head.stdout);
         assert_eq!(head_subject.trim(), "seed");
 
+        // The second write is based on the just-persisted snapshot so a
+        // concurrent configuration change remains detectable.
+        let mut config = load_standalone_config().expect("saved config should reload");
         config.checkpoint_config.auto_checkpoint_enabled = true;
         save_standalone_config(&config).expect("enabled config should be saved");
 

@@ -10889,20 +10889,23 @@ async fn handle_api_config_post(
                     .into_response();
             };
 
-            if let Err(error) = crate::config::storage::save_standalone_config(&new_config) {
-                log::warn!("[Bridge] 保存配置失败: {}", error);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("保存失败: {}", error)})),
-                )
-                    .into_response();
-            }
+            let saved_config = match crate::config::storage::save_config_changes(&new_config) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    log::warn!("[Bridge] 保存配置失败: {}", error);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("保存失败: {}", error)})),
+                    )
+                        .into_response();
+                }
+            };
 
             // Roll back only the fields this patch changed, and reject rollback
             // if another writer has since changed those same fields.
             previous_config.save_baseline = serde_json::to_value(&new_config).ok();
             match app_state.config.lock() {
-                Ok(mut config) => *config = new_config,
+                Ok(mut config) => *config = saved_config,
                 Err(_) => {
                     let _ = crate::config::storage::save_standalone_config(&previous_config);
                     return json_error_response(
