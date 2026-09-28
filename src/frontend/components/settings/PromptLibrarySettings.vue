@@ -103,6 +103,10 @@ function clearAll() {
 </script>
 
 <template>
+  <div v-if="promptLibrary.saveError.value" role="alert" class="mb-3 text-red-500">
+    {{ promptLibrary.saveError.value }}。未保存的编辑仍保留在当前窗口。
+    <n-button size="small" @click="promptLibrary.load()">放弃未保存编辑并重新加载</n-button>
+  </div>
   <div class="p-4">
     <!-- 统计信息 -->
     <div class="flex items-center justify-between mb-4">

@@ -6,7 +6,8 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
 import { useMessage } from 'naive-ui'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { isBridgeActionForWindow } from '../composables/useEventHandlers'
 import { setupExitWarningListener } from '../composables/useExitWarning'
 import { useKeyboard } from '../composables/useKeyboard'
 import { useVersionCheck } from '../composables/useVersionCheck'
@@ -24,6 +25,7 @@ import HtmlArtifactRenderer from './popup/HtmlArtifactRenderer.vue'
 import McpPopup from './popup/McpPopup.vue'
 import PopupHeader from './popup/PopupHeader.vue'
 import MobileConnectionWizard from './settings/MobileConnectionWizard.vue'
+import SettingsTab from './tabs/SettingsTab.vue'
 
 interface AppConfig {
   theme: string
@@ -55,6 +57,7 @@ interface Props {
 interface Emits {
   mcpResponse: [response: any]
   mcpCancel: []
+  mcpCloseCurrentDialog: []
   themeChange: [theme: string]
   toggleAlwaysOnTop: []
   toggleMute: []
@@ -124,6 +127,7 @@ interface UsageProvider {
 
 interface McpPopupRef {
   applyTimelinePrefill: (payload: TimelinePrefillPayload) => void
+  getDraft: () => TimelinePrefillPayload
 }
 
 const props = defineProps<Props>()
@@ -144,6 +148,7 @@ const conversationTreeId = ref<string | null>(null)
 const currentConversationNodeId = ref<string | null>(null)
 const activeConversationRouteKey = ref<string | null>(null)
 const mcpPopupRef = ref<McpPopupRef | null>(null)
+let popupSettingsDraft: TimelinePrefillPayload | null = null
 const activeArtifact = ref<PopupArtifact | null>(null)
 const activeArtifactContent = computed(() => activeArtifact.value?.content || '')
 let skipNextBridgePush = false
@@ -973,8 +978,10 @@ async function pullCachedBridgeAction(reason: string) {
       return
     const data = await res.json()
     const action = data?.action
-    if (action && !handleWindowConditionalAction(action))
-      emit('bridgeAction', action)
+    if (action && isBridgeActionForWindow(action, props.mcpRequest)) {
+      if (!handleWindowConditionalAction(action))
+        emit('bridgeAction', action)
+    }
   }
   catch (e) {
     const now = Date.now()
@@ -1011,12 +1018,24 @@ async function triggerShortcutToggle() {
 }
 
 // 切换弹窗设置显示
-function togglePopupSettings() {
-  showPopupSettings.value = !showPopupSettings.value
+async function togglePopupSettings() {
+  if (!showPopupSettings.value) {
+    popupSettingsDraft = mcpPopupRef.value?.getDraft() ?? null
+    showPopupSettings.value = true
+    return
+  }
+
+  showPopupSettings.value = false
+  await nextTick()
+  if (popupSettingsDraft) {
+    mcpPopupRef.value?.applyTimelinePrefill(popupSettingsDraft)
+    popupSettingsDraft = null
+  }
 }
 
 // 监听 MCP 请求变化，当有新请求时重置设置页面状态并更新窗口注册
 watch(() => props.mcpRequest, async (newRequest) => {
+  popupSettingsDraft = null
   const timelinePayload = {
     hasRequest: !!newRequest,
     requestId: normalizeRequestId(newRequest),
@@ -1382,6 +1401,8 @@ onMounted(async () => {
     }
     else if (message_type === 'mcp_action') {
       // 转发 Web 端的动作到本地处理逻辑
+      if (!isBridgeActionForWindow(payload, props.mcpRequest))
+        return
       if (handleWindowConditionalAction(payload))
         return
       emit('bridgeAction', payload)
@@ -1686,6 +1707,7 @@ onUnmounted(async () => {
           :shortcut-enabled="localShortcutEnabled"
           :project-path="effectiveProjectPath"
           :codex-thread-id="props.mcpRequest?.codex_thread_id"
+          :conversation-title="props.mcpRequest?.conversation_title"
           :link-url="props.mcpRequest?.link_url"
           :link-title="props.mcpRequest?.link_title"
           :quota-providers="quotaProviders"
@@ -1702,6 +1724,7 @@ onUnmounted(async () => {
           @toggle-codex-live-mute="handleToggleCodexLiveMute"
           @toggle-shortcut="handleToggleShortcut"
           @minimize-window="minimizeWindow"
+          @close-current-dialog="$emit('mcpCloseCurrentDialog')"
         />
       </div>
 
@@ -1732,12 +1755,16 @@ onUnmounted(async () => {
       <!-- 设置界面 -->
       <div
         v-if="showPopupSettings"
-        class="flex-1 overflow-y-auto scrollbar-thin"
+        class="flex-1 overflow-y-auto scrollbar-thin p-4"
       >
-        <LayoutWrapper
-          :app-config="props.appConfig"
-          :codex-live-phase="globalCodexLivePhase"
-          :codex-live-status="globalCodexLiveStatus"
+        <SettingsTab
+          :current-theme="props.appConfig.theme"
+          :always-on-top="props.appConfig.window.alwaysOnTop"
+          :audio-notification-enabled="props.appConfig.audio.enabled"
+          :audio-url="props.appConfig.audio.url"
+          :window-width="props.appConfig.window.width"
+          :window-height="props.appConfig.window.height"
+          :fixed-window-size="props.appConfig.window.fixed"
           @theme-change="$emit('themeChange', $event)"
           @toggle-always-on-top="$emit('toggleAlwaysOnTop')"
           @toggle-audio-notification="$emit('toggleAudioNotification')"
@@ -1746,8 +1773,6 @@ onUnmounted(async () => {
           @stop-audio="$emit('stopAudio')"
           @test-audio-error="$emit('testAudioError', $event)"
           @update-window-size="$emit('updateWindowSize', $event)"
-          @toggle-codex-live="handleToggleCodexLive"
-          @toggle-codex-live-mute="handleToggleCodexLiveMute"
         />
       </div>
 
@@ -1948,10 +1973,12 @@ onUnmounted(async () => {
     <LayoutWrapper
       v-else
       :app-config="props.appConfig"
+      :is-muted="props.isMuted"
       :codex-live-phase="globalCodexLivePhase"
       :codex-live-status="globalCodexLiveStatus"
       @theme-change="$emit('themeChange', $event)"
       @toggle-always-on-top="$emit('toggleAlwaysOnTop')"
+      @toggle-mute="$emit('toggleMute')"
       @toggle-audio-notification="$emit('toggleAudioNotification')"
       @update-audio-url="$emit('updateAudioUrl', $event)"
       @test-audio="$emit('testAudio')"

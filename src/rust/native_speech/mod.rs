@@ -48,7 +48,6 @@ const INSERT_TEXT_EVENT: &str = "speech://insert-text";
 const OVERLAY_WIDTH: f64 = 96.0;
 const OVERLAY_HEIGHT: f64 = 48.0;
 const OVERLAY_BOTTOM_MARGIN: f64 = 34.0;
-const OWN_BUNDLE_ID: &str = "com.kexin94yyds.iterate";
 const LOG_PATH: &str = "/tmp/iterate-native-speech.log";
 #[cfg(target_os = "macos")]
 const SPEECH_TARGET_REGISTRY_FILE: &str = "iterate_speech_targets.json";
@@ -307,6 +306,7 @@ pub struct SpeechRuntimeOwner {
     pub owner_exe_mtime: Option<String>,
     pub owner_acquired_at: Option<String>,
     pub owner_is_current_process: bool,
+    pub owner_lease_verified: bool,
     pub owner_matches_current_binary: Option<bool>,
     pub current_pid: u32,
     pub current_path: Option<String>,
@@ -423,9 +423,10 @@ struct FnOwnerState {
     lock: Option<FnOwnerLock>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Default)]
 struct FnOwnerMetadata {
+    epoch: Option<String>,
     pid: Option<u32>,
     bundle_id: Option<String>,
     exe_path: Option<String>,
@@ -1226,7 +1227,7 @@ fn fn_owner_lock_matches_path(file: &File, lock_path: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_own_bundle_id(bundle_id: &str) -> bool {
-    bundle_id == OWN_BUNDLE_ID
+    target::matches_own_bundle(bundle_id, target::current_bundle_identifier().as_deref())
 }
 
 #[cfg(target_os = "macos")]
@@ -1546,6 +1547,11 @@ fn log_paste_dispatch_route(
 pub fn capture_frontmost_target_app() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        let Some(own_bundle_id) = target::current_bundle_identifier() else {
+            clear_last_target_app_bundle_id();
+            debug_log("[target-capture-rejected]", "reason=current-bundle-identity-unavailable");
+            return Err("无法确认当前应用身份，已停止语音目标捕获。".to_string());
+        };
         let (bundle_id, frontmost_pid) = frontmost_app_identity()?;
         let mut guard = last_speech_target()
             .lock()
@@ -1564,7 +1570,7 @@ pub fn capture_frontmost_target_app() -> Result<(), String> {
                     .unwrap_or_else(|| "<none>".to_string())
             ),
         );
-        if is_own_bundle_id(&bundle_id) {
+        if target::matches_own_bundle(&bundle_id, Some(&own_bundle_id)) {
             if let Some(pid) = frontmost_pid {
                 if let Some(target) = current_active_popup_speech_target()
                     .filter(|target| popup_target_pid_i32(target) == Some(pid))
@@ -2152,8 +2158,9 @@ fn current_fn_owner_metadata() -> FnOwnerMetadata {
         .unwrap_or((None, None));
 
     FnOwnerMetadata {
+        epoch: None,
         pid: Some(std::process::id()),
-        bundle_id: Some(OWN_BUNDLE_ID.to_string()),
+        bundle_id: target::current_bundle_identifier(),
         exe_path,
         exe_mtime,
         team_id,
@@ -2199,8 +2206,31 @@ fn read_fn_owner_metadata_from_file(file: &mut File) -> Option<FnOwnerMetadata> 
     Some(parse_fn_owner_metadata(&content))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn parse_fn_owner_metadata(content: &str) -> FnOwnerMetadata {
+    if content.trim_start().starts_with('{') {
+        let Ok(owner) = serde_json::from_str::<owner::OwnerMetadata>(content) else {
+            return FnOwnerMetadata::default();
+        };
+        if owner.pid == 0 || owner.executable.is_empty() || owner.acquired_unix_ms == 0
+            || !owner.role.is_owner_eligible() {
+            return FnOwnerMetadata::default();
+        }
+        let Some(epoch) = owner.epoch.as_deref().and_then(session::OwnerEpoch::parse_canonical) else {
+            return FnOwnerMetadata::default();
+        };
+        return FnOwnerMetadata {
+            epoch: Some(epoch.to_canonical_string()),
+            pid: Some(owner.pid),
+            exe_path: Some(owner.executable),
+            team_id: (owner.signing_identity != "unknown").then_some(owner.signing_identity),
+            cdhash: (owner.signing_hash != "unknown").then_some(owner.signing_hash),
+            acquired_at: i64::try_from(owner.acquired_unix_ms).ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|time| time.to_rfc3339()),
+            ..Default::default()
+        };
+    }
     let mut metadata = FnOwnerMetadata::default();
 
     for token in content.lines().map(str::trim) {
@@ -2221,6 +2251,46 @@ fn parse_fn_owner_metadata(content: &str) -> FnOwnerMetadata {
     }
 
     metadata
+}
+
+#[cfg(test)]
+mod owner_metadata_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn reads_current_owner_json_fields() {
+        let mut owner = owner::OwnerMetadata::new(owner::SpeechProcessRole::CanonicalGui,
+            42, "/Applications/Custom.app/Contents/MacOS/iterate", "local-signing", "abc123");
+        owner.epoch = Some(session::OwnerEpoch([7; 16]).to_canonical_string());
+        owner.acquired_unix_ms = 1_700_000_000_123;
+        let parsed = parse_fn_owner_metadata(&serde_json::to_string(&owner).unwrap());
+        assert_eq!(parsed.pid, Some(42));
+        assert_eq!(parsed.exe_path.as_deref(), Some(owner.executable.as_str()));
+        assert_eq!(parsed.cdhash.as_deref(), Some("abc123"));
+        assert_eq!(parsed.epoch, owner.epoch);
+        assert_eq!(parsed.acquired_at.as_deref(), Some("2023-11-14T22:13:20.123+00:00"));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_json_without_legacy_fallback() {
+        for content in ["{invalid\npid=42", "{}", r#"{"pid":42,"executable":"/app"}"#] {
+            assert_eq!(parse_fn_owner_metadata(content).pid, None);
+        }
+        let mut owner = owner::OwnerMetadata::new(owner::SpeechProcessRole::CanonicalGui,
+            42, "/app", "signer", "hash");
+        owner.epoch = Some("invalid".into());
+        owner.acquired_unix_ms = 1000;
+        assert_eq!(parse_fn_owner_metadata(&serde_json::to_string(&owner).unwrap()).pid, None);
+    }
+
+    #[test]
+    fn preserves_legacy_owner_metadata() {
+        let parsed = parse_fn_owner_metadata("pid=42\nexe_path=/old/app\ncdhash=old\n");
+        assert_eq!(parsed.pid, Some(42));
+        assert_eq!(parsed.exe_path.as_deref(), Some("/old/app"));
+        assert_eq!(parsed.cdhash.as_deref(), Some("old"));
+        assert_eq!(parsed.epoch, None);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2829,20 +2899,35 @@ mod tests {
 fn build_owner_status() -> SpeechRuntimeOwner {
     #[cfg(target_os = "macos")]
     {
-        let fn_listener_owner = fn_owner_state()
+        let legacy_listener_owner = fn_owner_state()
             .lock()
             .map(|state| state.lock.is_some())
             .unwrap_or(false);
         let current = current_fn_owner_metadata();
-        let owner = read_fn_owner_metadata().unwrap_or_else(|| {
-            if fn_listener_owner {
+        let mut owner = read_fn_owner_metadata().unwrap_or_else(|| {
+            if legacy_listener_owner {
                 current.clone()
             } else {
                 FnOwnerMetadata::default()
             }
         });
-        let owner_is_current_process = owner.pid == Some(std::process::id());
+        // A lock file survives its owner. Do not present a definitely dead PID as an owner.
+        if owner.pid.is_some_and(|pid| i32::try_from(pid).ok().is_none_or(|pid| {
+            (unsafe { libc::kill(pid, 0) }) != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })) {
+            owner = FnOwnerMetadata::default();
+        }
+        let owner_pid_is_current = owner.pid == Some(std::process::id());
         let owner_matches_current_binary = owner_matches_current_binary(&owner, &current);
+        let phase1_listener_owner = phase1::diagnostic_owner_epoch()
+            .is_some_and(|epoch| owner.epoch.as_deref() == Some(epoch.to_canonical_string().as_str()));
+        let fn_listener_owner = owner_pid_is_current
+            && owner_matches_current_binary == Some(true)
+            && (legacy_listener_owner || phase1_listener_owner);
+        if owner_pid_is_current && !fn_listener_owner {
+            owner = FnOwnerMetadata::default();
+        }
 
         SpeechRuntimeOwner {
             fn_listener_owner,
@@ -2853,7 +2938,8 @@ fn build_owner_status() -> SpeechRuntimeOwner {
             owner_cdhash: owner.cdhash,
             owner_exe_mtime: owner.exe_mtime,
             owner_acquired_at: owner.acquired_at,
-            owner_is_current_process,
+            owner_is_current_process: fn_listener_owner,
+            owner_lease_verified: fn_listener_owner,
             owner_matches_current_binary,
             current_pid: std::process::id(),
             current_path: current.exe_path,
@@ -2876,6 +2962,7 @@ fn build_owner_status() -> SpeechRuntimeOwner {
             owner_exe_mtime: None,
             owner_acquired_at: None,
             owner_is_current_process: true,
+            owner_lease_verified: true,
             owner_matches_current_binary: Some(true),
             current_pid: std::process::id(),
             current_path: current_exe_path_string(),

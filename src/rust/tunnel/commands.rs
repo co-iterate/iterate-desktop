@@ -1097,12 +1097,49 @@ pub async fn check_origin_health() -> Result<bool, String> {
     manager::check_origin_health().await
 }
 
+fn publicly_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !matches!(a, 0 | 10 | 127 | 224..=255)
+        && !(a == 100 && (64..=127).contains(&b))
+        && !(a == 169 && b == 254)
+        && !(a == 172 && (16..=31).contains(&b))
+        && !(a == 192 && ((b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99) || b == 168))
+        && !(a == 198 && ((b == 18 || b == 19) || (b == 51 && c == 100)))
+        && !(a == 203 && b == 0 && c == 113)
+}
+
+pub(crate) fn aliyun_ip_origin_is_public(value: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(value.trim().trim_end_matches('/')) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed
+            .host_str()
+            .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+            .is_some_and(publicly_routable_ipv4)
+}
+
+fn normalize_formal_mobile_route_base_url(transport: &str, value: &str) -> Result<String, String> {
+    if transport == "aliyun_ssh_reverse_tunnel" && !aliyun_ip_origin_is_public(value) {
+        return Err("formal_route_ip_origin_invalid".to_string());
+    }
+    manager::normalize_public_hostname(value)
+}
+
 pub fn configured_formal_mobile_route() -> Option<FormalMobileRouteConfig> {
     let config = load_standalone_config().ok()?;
     if let Some(route) = config.mobile_config.formal_route {
         if route.schema_version == 1
-            && route.transport == "cloudflare_named_tunnel"
-            && manager::normalize_public_hostname(&route.base_url).is_ok()
+            && matches!(
+                route.transport.as_str(),
+                "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel"
+            )
+            && normalize_formal_mobile_route_base_url(&route.transport, &route.base_url).is_ok()
         {
             return Some(route);
         }
@@ -1198,7 +1235,10 @@ pub async fn register_formal_mobile_route(
     base_url: &str,
     source: &str,
 ) -> Result<FormalMobileRouteStatus, String> {
-    if transport != "cloudflare_named_tunnel" {
+    if !matches!(
+        transport,
+        "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel"
+    ) {
         return Err("formal_route_transport_not_supported".to_string());
     }
     let source = match source.trim() {
@@ -1207,7 +1247,7 @@ pub async fn register_formal_mobile_route(
         "legacy_migration" => "legacy_migration",
         _ => return Err("formal_route_source_invalid".to_string()),
     };
-    let base_url = manager::normalize_public_hostname(base_url)?;
+    let base_url = normalize_formal_mobile_route_base_url(transport, base_url)?;
     if !manager::check_origin_health().await? {
         return Err("bridge_unhealthy".to_string());
     }
@@ -2066,5 +2106,43 @@ mod tests {
         .expect_err("unknown route provenance must be rejected");
 
         assert_eq!(error, "formal_route_source_invalid");
+    }
+
+    #[test]
+    fn aliyun_formal_route_accepts_https_ip_origin_on_configured_port() {
+        for port in [8443, 9443] {
+            let origin = format!("https://8.8.8.8:{port}");
+            assert_eq!(
+                normalize_formal_mobile_route_base_url("aliyun_ssh_reverse_tunnel", &origin),
+                Ok(origin)
+            );
+        }
+        for origin in [
+            "https://example.com:8443",
+            "https://user:secret@8.8.8.8:8443",
+            "https://8.8.8.8:8443/path",
+            "http://8.8.8.8:8443",
+            "https://127.0.0.1:8443",
+            "https://0.1.2.3:8443",
+            "https://10.1.2.3:8443",
+            "https://100.64.1.2:8443",
+            "https://169.254.1.2:8443",
+            "https://172.16.1.2:8443",
+            "https://192.168.1.2:8443",
+            "https://192.0.0.1:8443",
+            "https://192.0.2.1:8443",
+            "https://192.88.99.1:8443",
+            "https://198.18.1.2:8443",
+            "https://198.51.100.2:8443",
+            "https://203.0.113.10:8443",
+            "https://224.0.0.1:8443",
+            "https://240.0.0.1:8443",
+            "https://255.255.255.255:8443",
+        ] {
+            assert!(
+                normalize_formal_mobile_route_base_url("aliyun_ssh_reverse_tunnel", origin)
+                    .is_err()
+            );
+        }
     }
 }

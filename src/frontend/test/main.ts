@@ -470,12 +470,12 @@ if (!window.__TAURI__) {
     if (command === 'get_shortcut_config') {
       return {
         shortcuts: {
-          submit: {
-            id: 'submit',
+          quick_submit: {
+            id: 'quick_submit',
             name: '快速发送',
             description: '提交当前输入',
             action: 'submit',
-            key_combination: { key: 'Enter', ctrl: false, alt: false, shift: false, meta: true },
+            key_combination: { key: 'Enter', ctrl: false, alt: false, shift: true, meta: false },
             enabled: true,
             scope: 'popup',
           },
@@ -484,7 +484,7 @@ if (!window.__TAURI__) {
             name: '目标',
             description: '提交当前输入为目标',
             action: 'enhance',
-            key_combination: { key: 'Enter', ctrl: false, alt: true, shift: false, meta: false },
+            key_combination: { key: 'Enter', ctrl: true, alt: false, shift: true, meta: false },
             enabled: true,
             scope: 'popup',
           },
@@ -493,7 +493,7 @@ if (!window.__TAURI__) {
             name: '继续',
             description: '继续当前任务',
             action: 'continue',
-            key_combination: { key: 'Enter', ctrl: false, alt: false, shift: true, meta: false },
+            key_combination: { key: 'Enter', ctrl: true, alt: false, shift: false, meta: false },
             enabled: true,
             scope: 'popup',
           },
@@ -833,20 +833,20 @@ if (!window.__TAURI__) {
         ? input.toString()
         : input.url
 
-    if (url.includes('/api/mobile/pairing/status')) {
+    if (url.includes('/api/android/pairing/status')) {
       return new Response(JSON.stringify({
         ok: true,
         formal_route: {
           configured: true,
-          transport: 'cloudflare_named_tunnel',
-          base_url: 'https://iterate.example.com',
+          transport: 'aliyun_ssh_reverse_tunnel',
+          base_url: 'https://8.129.82.226:8443',
           health: 'healthy',
           endpoint_identity_ok: true,
         },
         candidates: [{
           transport_mode: 'public_tunnel',
-          base_url: 'https://iterate.example.com',
-          ws_url: 'wss://iterate.example.com/ws',
+          base_url: 'https://8.129.82.226:8443',
+          ws_url: 'wss://8.129.82.226:8443/ws',
           health: 'healthy',
           disabled: false,
         }],
@@ -856,7 +856,7 @@ if (!window.__TAURI__) {
       })
     }
 
-    if (url.endsWith('/api/mobile/pairing')) {
+    if (url.endsWith('/api/android/pairing')) {
       const issuedAt = new Date()
       const expiresAt = new Date(issuedAt.getTime() + 10 * 60 * 1000)
       return new Response(JSON.stringify({
@@ -864,15 +864,15 @@ if (!window.__TAURI__) {
         pairing: {
           version: 2,
           pairing_session_id: 'preview-session',
-          device_id: 'preview-mac',
-          device_name: 'Preview Mac',
+          device_id: 'preview-desktop',
+          device_name: 'Preview Desktop',
           transport_mode: 'public_tunnel',
-          base_url: 'https://iterate.example.com',
-          ws_url: 'wss://iterate.example.com/ws',
+          base_url: 'https://8.129.82.226:8443',
+          ws_url: 'wss://8.129.82.226:8443/ws',
           candidates: [{
             transport_mode: 'public_tunnel',
-            base_url: 'https://iterate.example.com',
-            ws_url: 'wss://iterate.example.com/ws',
+            base_url: 'https://8.129.82.226:8443',
+            ws_url: 'wss://8.129.82.226:8443/ws',
             health: 'healthy',
             disabled: false,
           }],
@@ -886,7 +886,7 @@ if (!window.__TAURI__) {
       })
     }
 
-    if (url.includes('/api/mobile/pairing/sessions/')) {
+    if (url.includes('/api/android/pairing/sessions/')) {
       return new Response(JSON.stringify({
         ok: true,
         session: {

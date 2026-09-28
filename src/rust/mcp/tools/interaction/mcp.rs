@@ -21,6 +21,11 @@ pub struct InteractionTool;
 
 impl InteractionTool {
     pub async fn zhi(request: ZhiRequest) -> Result<CallToolResult, McpError> {
+        #[cfg(target_os = "windows")]
+        crate::app::windows_lifecycle::activate_mcp_launch().map_err(|error| {
+            McpError::internal_error(format!("重新启动 iterate 失败: {error}"), None)
+        })?;
+
         let ai_message = normalize_zhi_message(&request.message);
         let project_path = request.project_path.clone();
         let request_id = generate_request_id();
@@ -94,6 +99,7 @@ impl InteractionTool {
         match create_tauri_popup(&popup_request) {
             Ok(response) => {
                 mark_live_goal_user_response_received(project_path.as_deref(), &request_id);
+                let (response, end_source) = normalize_terminal_response(&response);
 
                 // 记录对话日志
                 log_conversation(
@@ -106,6 +112,12 @@ impl InteractionTool {
 
                 // 解析响应内容，支持文本和图片
                 let mut content = parse_mcp_response(&response)?;
+                if let Some(end_source) = end_source {
+                    content.push(Content::text(format!(
+                        "继续对话: false\n响应来源: {}",
+                        end_source
+                    )));
+                }
 
                 // compact 模式：附带对话日志文件路径，方便 AI 在旧消息被砍后用 read_file 找回上下文
                 if request.compact.unwrap_or(false) {
@@ -146,6 +158,64 @@ fn normalize_zhi_message(message: &str) -> String {
     } else {
         message.to_string()
     }
+}
+
+fn normalize_terminal_response(response: &str) -> (String, Option<String>) {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(response) else {
+        return (response.to_string(), None);
+    };
+    let user_input = value
+        .get("user_input")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let selected_options = value
+        .get("selected_options")
+        .and_then(serde_json::Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let submitted_source = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let end_source = if crate::conversation::is_explicit_conversation_end_response(
+        &user_input,
+        &selected_options,
+    ) {
+        Some(crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE)
+    } else if crate::conversation::is_popup_closed_response_source(&submitted_source) {
+        Some(crate::conversation::POPUP_CLOSED_SOURCE)
+    } else {
+        None
+    };
+    let Some(end_source) = end_source else {
+        return (response.to_string(), None);
+    };
+
+    if let Some(object) = value.as_object_mut() {
+        object.insert("selected_options".to_string(), serde_json::json!([]));
+        object.insert("images".to_string(), serde_json::json!([]));
+        object.insert("file_paths".to_string(), serde_json::json!([]));
+        object.insert("image_paths".to_string(), serde_json::json!([]));
+        let metadata = object
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.insert(
+                "source".to_string(),
+                serde_json::json!(end_source),
+            );
+        }
+    }
+    (value.to_string(), Some(end_source.to_string()))
 }
 
 fn mark_live_goal_waiting_for_user(project_path: Option<&str>, request_id: &str) {
@@ -318,6 +388,69 @@ mod tests {
     #[test]
     fn normalize_zhi_message_preserves_content() {
         assert_eq!(normalize_zhi_message("正常消息"), "正常消息");
+    }
+
+    #[test]
+    fn explicit_end_response_discards_business_payload_without_touching_ordinary_input() {
+        let response = serde_json::json!({
+            "user_input": "结束对话。",
+            "selected_options": ["继续"],
+            "images": [{"data": "abc"}],
+            "file_paths": ["a.txt"],
+            "image_paths": ["a.png"],
+            "metadata": {"source": "popup"}
+        })
+        .to_string();
+        let (normalized, end_source) = normalize_terminal_response(&response);
+        assert_eq!(
+            end_source.as_deref(),
+            Some(crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE)
+        );
+        let normalized: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(normalized["selected_options"], serde_json::json!([]));
+        assert_eq!(normalized["images"], serde_json::json!([]));
+        assert_eq!(normalized["file_paths"], serde_json::json!([]));
+        assert_eq!(normalized["image_paths"], serde_json::json!([]));
+        assert_eq!(
+            normalized["metadata"]["source"],
+            crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE
+        );
+
+        let ordinary = serde_json::json!({"user_input": "如何结束对话"}).to_string();
+        let (unchanged, end_source) = normalize_terminal_response(&ordinary);
+        assert!(end_source.is_none());
+        assert_eq!(unchanged, ordinary);
+    }
+
+    #[test]
+    fn terminal_response_accepts_end_options_and_popup_close_source() {
+        let option_response = serde_json::json!({
+            "user_input": "",
+            "selected_options": ["结束对话"],
+            "images": [],
+            "metadata": {"source": "popup"}
+        })
+        .to_string();
+        let (normalized, end_source) = normalize_terminal_response(&option_response);
+        assert_eq!(
+            end_source.as_deref(),
+            Some(crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE)
+        );
+        let normalized: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(normalized["selected_options"], serde_json::json!([]));
+
+        let close_response = serde_json::json!({
+            "user_input": "",
+            "selected_options": [],
+            "images": [],
+            "metadata": {"source": "popup_closed"}
+        })
+        .to_string();
+        let (_, end_source) = normalize_terminal_response(&close_response);
+        assert_eq!(
+            end_source.as_deref(),
+            Some(crate::conversation::POPUP_CLOSED_SOURCE)
+        );
     }
 
     #[test]

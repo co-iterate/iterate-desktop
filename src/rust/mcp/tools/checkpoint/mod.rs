@@ -259,6 +259,7 @@ mod tests {
     struct EnvRestore {
         home: Option<OsString>,
         xdg_config_home: Option<OsString>,
+        iterate_config_dir: Option<OsString>,
     }
 
     impl EnvRestore {
@@ -266,6 +267,7 @@ mod tests {
             Self {
                 home: std::env::var_os("HOME"),
                 xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+                iterate_config_dir: std::env::var_os("ITERATE_CONFIG_DIR"),
             }
         }
     }
@@ -282,6 +284,12 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", xdg_config_home);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
+            }
+
+            if let Some(iterate_config_dir) = self.iterate_config_dir.as_ref() {
+                std::env::set_var("ITERATE_CONFIG_DIR", iterate_config_dir);
+            } else {
+                std::env::remove_var("ITERATE_CONFIG_DIR");
             }
         }
     }
@@ -338,6 +346,7 @@ mod tests {
         fs::create_dir_all(&repo).expect("temp repo should exist");
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("ITERATE_CONFIG_DIR", home.join(".config/cunzhi"));
 
         let mut config = AppConfig::default();
         config.checkpoint_config.auto_checkpoint_enabled = false;

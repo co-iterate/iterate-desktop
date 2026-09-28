@@ -6,7 +6,9 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import { resolveMcpLaunchContext } from '../../composables/useMcpHandler'
 import { useShortcuts } from '../../composables/useShortcuts'
+import { copySubmissionToClipboard } from '../../utils/submissionClipboard'
 import { stripAutoPrompt } from '../../utils/textUtils'
 import TimelineDotBar from '../conversation/TimelineDotBar.vue'
 import PopupActions from './PopupActions.vue'
@@ -113,6 +115,7 @@ const loading = ref(false)
 const submitting = ref(false)
 const selectedOptions = ref<string[]>([])
 const userInput = ref('')
+const rawUserInput = ref('')
 const draggedImages = ref<string[]>([])
 const attachedFiles = ref<PopupFileAttachment[]>([])
 const contentRef = ref<PopupContentRef | null>(null)
@@ -132,6 +135,7 @@ function handleAtTrigger() {
 
 // 继续回复配置
 const continueReplyEnabled = ref(true)
+const copySubmissionToClipboardEnabled = ref(false)
 const continuePrompt = ref('请按照最佳实践继续')
 const DEFAULT_LOOP_PROMPT = `进入 GoalRun 目标模式。
 
@@ -604,6 +608,7 @@ async function scheduleInputFocus(
 function syncInputData(data: PopupInputData) {
   if (data.userInput !== undefined) {
     userInput.value = data.userInput
+    rawUserInput.value = data.rawUserInput ?? data.userInput
   }
   if (data.selectedOptions !== undefined) {
     selectedOptions.value = [...data.selectedOptions]
@@ -664,6 +669,15 @@ function applyTimelinePrefill(payload: TimelinePrefillPayload) {
   flushTimelinePrefill()
 }
 
+function getDraft(): TimelinePrefillPayload {
+  return {
+    userInput: rawUserInput.value,
+    selectedOptions: [...selectedOptions.value],
+    draggedImages: [...draggedImages.value],
+    attachedFiles: attachedFiles.value.map(file => ({ ...file })),
+  }
+}
+
 // 加载继续回复配置
 async function loadReplyConfig() {
   try {
@@ -671,6 +685,7 @@ async function loadReplyConfig() {
     if (config) {
       const replyConfig = config as any
       continueReplyEnabled.value = replyConfig.enable_continue_reply ?? true
+      copySubmissionToClipboardEnabled.value = replyConfig.copy_submission_to_clipboard ?? false
       continuePrompt.value = replyConfig.continue_prompt ?? '请按照最佳实践继续'
       loopPrompt.value = replyConfig.loop_prompt ?? DEFAULT_LOOP_PROMPT
       goalPromptTemplate.value = replyConfig.goal_prompt_template ?? DEFAULT_GOAL_PROMPT_TEMPLATE
@@ -709,13 +724,14 @@ watch(() => props.request, async (newRequest) => {
       console.log('🔔 关键 loop 弹窗：自动取消静音')
     }
 
-    // 窗口居中到当前屏幕（静音模式下跳过，避免覆盖 minimize）
+    // 常驻窗口按请求重定位；独立 MCP 窗口由 useMcpHandler 在首次显示前定位。
     if (!props.isMuted || shouldForceShow) {
       try {
-        await invoke('center_window')
+        if (!(await resolveMcpLaunchContext()).isStandaloneMode)
+          await invoke('center_window')
       }
       catch (e) {
-        console.log('窗口居中失败:', e)
+        console.log('窗口定位失败:', e)
       }
     }
 
@@ -905,9 +921,25 @@ onUnmounted(() => {
 function resetForm() {
   selectedOptions.value = []
   userInput.value = ''
+  rawUserInput.value = ''
   draggedImages.value = []
   attachedFiles.value = []
   submitting.value = false
+}
+
+async function backupCurrentSubmissionToClipboard() {
+  try {
+    await copySubmissionToClipboard({
+      enabled: copySubmissionToClipboardEnabled.value,
+      userInput: rawUserInput.value,
+      selectedOptions: selectedOptions.value,
+      writeText: text => invoke('plugin:clipboard-manager|write_text', { text }),
+    })
+  }
+  catch (error) {
+    console.error('发送内容备份到剪贴板失败:', error)
+    message.warning('未能备份到剪贴板，仍将继续发送')
+  }
 }
 
 // 桌面弹窗统一回复给当前 IDE/MCP 调用方。
@@ -928,6 +960,7 @@ async function handleSubmit() {
   submitting.value = true
 
   try {
+    await backupCurrentSubmissionToClipboard()
     const finalUserInput = buildFinalUserInput(userInput.value, attachedFiles.value)
     inputRef.value?.recordSubmittedInputForAutoPromotion()
     const response = {
@@ -939,7 +972,7 @@ async function handleSubmit() {
       metadata: {
         timestamp: new Date().toISOString(),
         request_id: props.request?.id || null,
-        source: resolveSubmitSource(finalUserInput, selectedOptions.value),
+        source: resolveSubmitSource(finalUserInput ?? '', selectedOptions.value),
       },
     }
 
@@ -969,6 +1002,7 @@ async function handleSubmit() {
 // 处理输入更新
 function handleInputUpdate(data: PopupInputData) {
   userInput.value = data.userInput ?? ''
+  rawUserInput.value = data.rawUserInput ?? data.userInput ?? ''
   selectedOptions.value = data.selectedOptions ?? []
   draggedImages.value = data.draggedImages ?? []
   attachedFiles.value = data.attachedFiles ?? []
@@ -987,6 +1021,7 @@ async function handleContinue() {
   submitting.value = true
 
   try {
+    await backupCurrentSubmissionToClipboard()
     // 使用新的结构化数据格式
     const response = {
       user_input: continuePrompt.value,
@@ -1195,6 +1230,7 @@ async function handleGoalSubmit() {
       return
     }
 
+    await backupCurrentSubmissionToClipboard()
     const liveGoalSnapshot = await applyLiveGoalIntent(`/goal ${goalTitle}`)
     const huiSnapshot = shouldPrefetchGoalRunHuiSnapshot(goalText)
       ? await getGoalRunHuiSnapshot(liveGoalSnapshot)
@@ -1242,6 +1278,7 @@ async function handleGoalSubmit() {
 
 defineExpose({
   applyTimelinePrefill,
+  getDraft,
 })
 </script>
 

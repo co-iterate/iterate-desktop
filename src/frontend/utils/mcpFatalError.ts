@@ -1,5 +1,6 @@
 import type { App as VueApp } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { publishCompletedMcpRequest } from '../services/bridgeRequestClosure'
 
 interface ActiveMcpFatalContext {
   isMcpProcess: boolean
@@ -127,6 +128,7 @@ async function reportMcpFatalError(error: unknown, fatalSource: string, info?: s
       projectPath: context.projectPath,
       requestId: context.requestId,
     })
+    await publishCompletedMcpRequest(context.requestId, context.projectPath)
 
     if (context.isMcpProcess) {
       window.setTimeout(() => {

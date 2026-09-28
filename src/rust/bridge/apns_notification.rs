@@ -8,6 +8,8 @@ pub(super) const APNS_NOTIFICATION_EXPIRATION_SECS: i64 = 5 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ApnsDeviceInfo {
+    #[serde(skip)]
+    pub(super) authorization_generation: String,
     pub(super) device_token: String,
     pub(super) platform: String,
     pub(super) app_version: String,
