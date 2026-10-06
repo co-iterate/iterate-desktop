@@ -622,6 +622,10 @@ pub fn ack_mcp_request_ready(
     request_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if crate::codex_questions::ready(request_id.as_deref())
+        || request_id.as_deref().is_some_and(crate::codex_questions::registered) {
+        return Ok(());
+    }
     let route_key = resolve_tree_route_key(request_id.as_deref(), project_path.as_deref())
         .ok_or_else(|| "缺少 request_id/project_path，无法确认 MCP 请求已接收".to_string())?;
 
@@ -760,6 +764,16 @@ pub async fn send_mcp_response(
     state: State<'_, AppState>,
     conversation_manager: State<'_, Arc<ConversationManager>>,
 ) -> Result<(), String> {
+    // Native IDs are registered by the local monitor; isolate them before global MCP state.
+    let native_id = request_id.as_deref().or_else(|| response.pointer("/metadata/request_id").and_then(serde_json::Value::as_str));
+    if let Some(id) = native_id {
+        if crate::codex_questions::registered(id) {
+            return crate::codex_questions::respond(id, &response).await;
+        }
+        if id.starts_with("native-codex:") {
+            return Err("该 CLI 问题路由已失效，不能回答".into());
+        }
+    }
     // Cross-device requests arbitrate before conversation/checkpoint side effects.
     let closing = response.as_str() == Some("CANCELLED")
         || response.pointer("/metadata/source").and_then(serde_json::Value::as_str) == Some("popup_closed");
@@ -771,9 +785,20 @@ pub async fn send_mcp_response(
         return Ok(());
     }
     let cross_finalize_guard = crate::cross_device::source_finalize_guard()?;
+    let source_identity = crate::cross_device::source_reply_identity(&response);
+    if cross_finalize_guard.is_some() && source_identity.is_none() {
+        return Err("无法核对跨设备获胜回复的原始请求".into());
+    }
+    if let Some((event_id, _)) = &source_identity {
+        if let Some(metadata) = response.get_mut("metadata").and_then(serde_json::Value::as_object_mut) {
+            metadata.insert("run_id".into(), serde_json::Value::String(event_id.clone()));
+        }
+    }
     let normalized_project_path = normalize_non_empty(project_path.clone());
     let normalized_request_id = normalize_non_empty(request_id.clone());
-    let normalized_timeline_route_id = normalize_non_empty(timeline_route_id.clone());
+    let normalized_timeline_route_id = source_identity
+        .map(|(_, route)| route)
+        .or_else(|| normalize_non_empty(timeline_route_id.clone()));
     let metadata_request_id = extract_response_request_id(&response);
     let effective_request_id = normalized_request_id
         .clone()
@@ -1656,17 +1681,14 @@ pub(crate) async fn record_user_response_node(
         source: Some(source.to_string()),
     };
 
-    let node_id = match manager
-        .add_node(
-            &tree_id,
-            parent_id.clone(),
-            NodeType::User,
-            content,
-            false,
-            metadata,
-        )
-        .await
-    {
+    let node_result = if metadata.run_id.as_deref().is_some_and(|id| id.starts_with("cross-device-reply:")) {
+        manager.add_node_for_event(&tree_id, NodeType::User, content, metadata)
+            .await.map(|outcome| outcome.node_id)
+    } else {
+        manager.add_node(&tree_id, parent_id.clone(), NodeType::User, content, false, metadata)
+            .await
+    };
+    let node_id = match node_result {
         Ok(node_id) => node_id,
         Err(err) => {
             append_timeline_debug_log(

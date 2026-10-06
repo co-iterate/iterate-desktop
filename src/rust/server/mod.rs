@@ -307,6 +307,9 @@ pub struct DialogRequest {
     /// 调用本次 MCP 的 Codex 会话 ID，用于回到原会话
     #[serde(default)]
     pub codex_thread_id: Option<String>,
+    /// Internal producer provenance; absent for old requests and project-based fallbacks.
+    #[serde(default)]
+    pub codex_thread_provenance: Option<String>,
     /// 调用本次 MCP 的 Codex 会话 deep link
     #[serde(default)]
     pub codex_deeplink: Option<String>,

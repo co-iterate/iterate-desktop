@@ -24,6 +24,25 @@ const ROUTE_MAP_PREVIEW_LIMIT: usize = 6;
 const MAX_NODES_PER_TREE: usize = 30;
 const MIN_TIMELINE_MIGRATION_FREE_BYTES: u64 = 256 * 1024 * 1024;
 
+fn legacy_native_question_event_matches(stable: &str, previous: &str) -> bool {
+    for role in ["user", "assistant"] {
+        let prefix = format!("native-event:{role}:");
+        let (Some(stable_fields), Some(previous_fields)) = (
+            stable.strip_prefix(&prefix),
+            previous.strip_prefix(&format!("{prefix}native-codex:")),
+        ) else { continue };
+        let (Ok(stable_fields), Ok(previous_fields)) = (
+            serde_json::from_str::<Vec<serde_json::Value>>(stable_fields),
+            serde_json::from_str::<Vec<serde_json::Value>>(previous_fields),
+        ) else { continue };
+        if stable_fields.len() == 5 && previous_fields.len() == 6
+            && stable_fields.as_slice() == &previous_fields[1..] {
+            return true;
+        }
+    }
+    false
+}
+
 struct ConversationStateFileLock {
     file: File,
 }
@@ -110,6 +129,19 @@ impl ConversationState {
 pub struct ConversationManager {
     state: Arc<RwLock<ConversationState>>,
     persistence_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeHistorySession {
+    pub route_id: String,
+    pub tree_id: String,
+    pub current_node_id: String,
+    pub project_path: String,
+    pub launch_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub updated_at: String,
 }
 
 pub struct AddNodeOutcome {
@@ -590,11 +622,7 @@ impl ConversationManager {
                             .collect();
                         all_nodes.sort_by(|a, b| a.1.cmp(&b.1));
                         let to_remove = all_nodes.len() - MAX_NODES_PER_TREE;
-                        let remove_ids: HashSet<String> = all_nodes
-                            .iter()
-                            .take(to_remove)
-                            .map(|(id, _)| id.clone())
-                            .collect();
+                        let remove_ids = Self::prune_ids(tree);
                         for id in &remove_ids {
                             tree.nodes.remove(id);
                         }
@@ -626,6 +654,7 @@ impl ConversationManager {
                         if let Some(tree_dedupes) = state.dedupe_keys.get_mut(tree_id.as_str()) {
                             tree_dedupes.retain(|_, nid| !remove_ids.contains(nid));
                         }
+                        Self::reconnect_native_path(tree);
                         eprintln!(
                             "[Conversation][Manager] load_state pruned tree {}: removed {} nodes, kept {}",
                             tree_id, to_remove, tree.nodes.len()
@@ -704,6 +733,48 @@ impl ConversationManager {
             .map(|node| node.timestamp.as_str())
     }
 
+    fn native_first_user_id(tree: &ConversationTree) -> Option<String> {
+        if tree.nodes.is_empty() || !tree.nodes.values().all(|node| {
+            node.metadata.source.as_deref() == Some("codex_native")
+        }) {
+            return None;
+        }
+        tree.nodes.values().find(|node| {
+            node.node_type == NodeType::User
+                && node.metadata.run_id.as_deref().is_some_and(|id| id.starts_with("native-first-user:"))
+        }).map(|node| node.id.clone())
+    }
+
+    fn prune_ids(tree: &ConversationTree) -> HashSet<String> {
+        let pinned = Self::native_first_user_id(tree);
+        let mut nodes = tree.nodes.iter()
+            .map(|(id, node)| (id.clone(), node.timestamp.clone()))
+            .collect::<Vec<_>>();
+        nodes.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        nodes.into_iter()
+            .filter(|(id, _)| pinned.as_deref() != Some(id.as_str()))
+            .take(tree.nodes.len().saturating_sub(MAX_NODES_PER_TREE))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn reconnect_native_path(tree: &mut ConversationTree) {
+        let Some(first) = Self::native_first_user_id(tree) else { return; };
+        let mut rest = tree.nodes.iter()
+            .filter(|(id, _)| id.as_str() != first.as_str())
+            .map(|(id, node)| (id.clone(), node.timestamp.clone()))
+            .collect::<Vec<_>>();
+        rest.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let ids = std::iter::once(first).chain(rest.into_iter().map(|(id, _)| id)).collect::<Vec<_>>();
+        tree.branches.clear();
+        for (index, id) in ids.iter().enumerate() {
+            let parent = index.checked_sub(1).map(|previous| ids[previous].clone());
+            if let Some(node) = tree.nodes.get_mut(id) { node.parent_id = parent.clone(); }
+            if let Some(parent) = parent { tree.branches.entry(parent).or_default().push(id.clone()); }
+        }
+        if let Some(last) = ids.last() { tree.current_node_id = last.clone(); }
+    }
+
     fn prune_merged_tree(tree: &mut ConversationTree) {
         if tree.nodes.len() <= MAX_NODES_PER_TREE {
             return;
@@ -715,11 +786,7 @@ impl ConversationManager {
             .map(|(id, node)| (id.clone(), node.timestamp.clone()))
             .collect::<Vec<_>>();
         all_nodes.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
-        let remove_ids = all_nodes
-            .iter()
-            .take(all_nodes.len() - MAX_NODES_PER_TREE)
-            .map(|(id, _)| id.clone())
-            .collect::<HashSet<_>>();
+        let remove_ids = Self::prune_ids(tree);
 
         tree.nodes.retain(|id, _| !remove_ids.contains(id));
         tree.branches
@@ -745,6 +812,7 @@ impl ConversationManager {
                 .map(|(id, _)| id.clone())
                 .unwrap_or_default();
         }
+        Self::reconnect_native_path(tree);
     }
 
     fn merge_conversation_tree(target: &mut ConversationTree, incoming: ConversationTree) {
@@ -1157,13 +1225,52 @@ impl ConversationManager {
 
         if let Some(project_key) = normalized_project_path.as_ref() {
             if let Some(tree_id) = state.project_tree_map.get(project_key).cloned() {
-                if state.trees.contains_key(&tree_id) {
-                    return Some(tree_id.clone());
+                if state.trees.get(&tree_id).is_some_and(|tree| !tree.nodes.values().any(|node|
+                    node.metadata.source.as_deref() == Some("codex_native"))) {
+                    return Some(tree_id);
                 }
             }
         }
 
         None
+    }
+
+    pub async fn list_native_history_sessions(&self) -> Vec<NativeHistorySession> {
+        let state = self.state.read().await;
+        let mut sessions = state.request_tree_map.iter().filter_map(|(route, tree_id)| {
+            let identity = route.strip_prefix("native-cli:")?;
+            let (launch_id, thread_id) = identity.split_once(':')?;
+            let tree = state.trees.get(tree_id)?;
+            if tree.nodes.is_empty() { return None; }
+            let mut project_path: Option<&str> = None;
+            for node in tree.nodes.values() {
+                if node.metadata.source.as_deref() != Some("codex_native")
+                    || node.metadata.request_id.as_deref() != Some(route.as_str()) { return None; }
+                let path = node.metadata.project_path.as_deref()?;
+                if project_path.is_some_and(|existing| existing != path) { return None; }
+                project_path = Some(path);
+            }
+            let title = tree.nodes.values()
+                .filter(|node| node.node_type == NodeType::Assistant)
+                .min_by(|left, right| left.timestamp.cmp(&right.timestamp))
+                .map(|node| node.content.chars().take(72).collect::<String>())
+                .unwrap_or_else(|| "CLI 对话".to_string());
+            Some(NativeHistorySession {
+                route_id: route.clone(), tree_id: tree_id.clone(),
+                current_node_id: tree.current_node_id.clone(),
+                project_path: project_path?.to_string(),
+                launch_id: launch_id.to_string(), thread_id: thread_id.to_string(),
+                title, updated_at: tree.updated_at.clone(),
+            })
+        }).collect::<Vec<_>>();
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions
+    }
+
+    pub async fn tree_contains_native_source(&self, tree_id: &str) -> bool {
+        self.state.read().await.trees.get(tree_id).is_some_and(|tree|
+            tree.nodes.values().any(|node| node.metadata.source.as_deref() == Some("codex_native")
+                || node.metadata.request_id.as_deref().is_some_and(|route| route.trim().starts_with("native-cli:"))))
     }
 
     pub async fn get_tree_id_by_request_id(&self, request_id: &str) -> Option<String> {
@@ -1217,6 +1324,26 @@ impl ConversationManager {
         .map(|outcome| outcome.node_id)
     }
 
+    pub async fn add_node_for_event(
+        &self,
+        tree_id: &str,
+        node_type: NodeType,
+        content: String,
+        metadata: NodeMetadata,
+    ) -> Result<AddNodeOutcome, String> {
+        let event_id = metadata.run_id.as_deref().ok_or("Missing timeline event identity")?;
+        if let Some(existing) = self.state.read().await.trees.get(tree_id).and_then(|tree| {
+            tree.nodes.values().find(|node| node.metadata.run_id.as_deref().is_some_and(|previous|
+                previous == event_id || (metadata.source.as_deref() == Some("codex_native")
+                    && legacy_native_question_event_matches(event_id, previous))))
+                .map(|node| node.id.clone())
+        }) {
+            return Ok(AddNodeOutcome { node_id: existing, reused: true });
+        }
+        self.add_node_with_options(tree_id, None, node_type, content, false, metadata,
+            AddNodeOptions::default()).await.map(|outcome| outcome)
+    }
+
     pub async fn ensure_assistant_request_node(
         &self,
         tree_id: &str,
@@ -1250,7 +1377,12 @@ impl ConversationManager {
         options: AddNodeOptions,
     ) -> Result<AddNodeOutcome, String> {
         let request_id_for_mapping = metadata.request_id.clone();
-        let project_path_for_mapping = metadata.project_path.clone();
+        // Native trees carry cwd for display but never own the project's fallback route.
+        let project_path_for_mapping = if metadata.source.as_deref() == Some("codex_native") {
+            None
+        } else {
+            metadata.project_path.clone()
+        };
         eprintln!(
             "[Conversation][Manager] add_node start: tree_id={}, node_type={}, parent_id={:?}, request_id={:?}, content_len={}",
             tree_id,
@@ -1468,11 +1600,7 @@ impl ConversationManager {
                 .collect();
             all_nodes.sort_by(|a, b| a.1.cmp(&b.1));
             let to_remove = all_nodes.len() - MAX_NODES_PER_TREE;
-            let remove_ids: HashSet<String> = all_nodes
-                .iter()
-                .take(to_remove)
-                .map(|(id, _)| id.clone())
-                .collect();
+            let remove_ids = Self::prune_ids(tree);
             for id in &remove_ids {
                 tree.nodes.remove(id);
             }
@@ -1504,6 +1632,7 @@ impl ConversationManager {
             if let Some(tree_dedupes) = dedupe_keys.get_mut(tree_id) {
                 tree_dedupes.retain(|_, nid| !remove_ids.contains(nid));
             }
+            Self::reconnect_native_path(tree);
             to_remove
         } else {
             0
@@ -1702,6 +1831,74 @@ fn build_dedupe_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_history_events_are_idempotent_and_same_cwd_sessions_stay_separate() {
+        let manager = ConversationManager::new();
+        for route in ["native-cli:launch-a:thread", "native-cli:launch-b:thread"] {
+            let tree = manager.get_or_create_tree_for_route(Some(route), None).await;
+            let metadata = NodeMetadata {
+                source: Some("codex_native".into()), request_id: Some(route.into()),
+                project_path: Some("C:/same".into()), run_id: Some(format!("first:{route}")),
+                ..NodeMetadata::default()
+            };
+            let first = manager.add_node_for_event(&tree, NodeType::User, "first text".into(), metadata.clone()).await.unwrap();
+            let again = manager.add_node_for_event(&tree, NodeType::User, "first text".into(), metadata).await.unwrap();
+            assert_eq!(first.node_id, again.node_id);
+            assert!(again.reused);
+        }
+        let sessions = manager.list_native_history_sessions().await;
+        assert_eq!(2, sessions.len());
+        assert_ne!(sessions[0].tree_id, sessions[1].tree_id);
+        assert!(manager.tree_contains_native_source(&sessions[0].tree_id).await);
+        assert!(manager.get_tree_for_route(None, Some("C:/same")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_question_replay_reuses_legacy_owner_event() {
+        let manager = ConversationManager::new();
+        let route = "native-cli:launch:thread";
+        let tree = manager.get_or_create_tree_for_route(Some(route), None).await;
+        let metadata = |event: &str| NodeMetadata {
+            source: Some("codex_native".into()), request_id: Some(route.into()),
+            run_id: Some(event.into()), ..NodeMetadata::default()
+        };
+        let previous = manager.add_node_for_event(&tree, NodeType::Assistant, "question".into(),
+            metadata("native-event:assistant:native-codex:[\"old-owner\",\"launch\",\"thread\",\"turn\",\"call\",2]"))
+            .await.unwrap();
+        let replay = manager.add_node_for_event(&tree, NodeType::Assistant, "question".into(),
+            metadata("native-event:assistant:[\"launch\",\"thread\",\"turn\",\"call\",2]"))
+            .await.unwrap();
+        assert!(replay.reused);
+        assert_eq!(previous.node_id, replay.node_id);
+    }
+
+    #[tokio::test]
+    async fn native_history_keeps_first_user_and_a_connected_recent_path_at_30_nodes() {
+        let manager = ConversationManager::new();
+        let route = "native-cli:launch:thread";
+        let tree = manager.get_or_create_tree_for_route(Some(route), None).await;
+        let metadata = |event: String| NodeMetadata {
+            source: Some("codex_native".into()), request_id: Some(route.into()),
+            project_path: Some("C:/same".into()), run_id: Some(event),
+            ..NodeMetadata::default()
+        };
+        let first = manager.add_node_for_event(&tree, NodeType::User, "first".into(),
+            metadata("native-first-user:launch:thread:item".into())).await.unwrap();
+        for index in 0..40 {
+            manager.add_node_for_event(&tree, NodeType::Assistant, format!("item {index}"),
+                metadata(format!("native-item:{index}"))).await.unwrap();
+        }
+        let current = manager.get_current_node_id(&tree).await.unwrap();
+        let path = manager.get_node_path(&tree, &current).await.unwrap();
+        assert_eq!(path.len(), MAX_NODES_PER_TREE);
+        assert_eq!(path.first().unwrap().id, first.node_id);
+        assert_eq!(path.last().unwrap().content, "item 39");
+        let replay = manager.add_node_for_event(&tree, NodeType::User, "first".into(),
+            metadata("native-first-user:launch:thread:item".into())).await.unwrap();
+        assert!(replay.reused);
+        assert_eq!(replay.node_id, first.node_id);
+    }
 
     #[tokio::test]
     async fn get_or_create_tree_for_request_is_stable() {

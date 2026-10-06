@@ -79,6 +79,7 @@ impl InteractionTool {
             project_path: request.project_path,
             codex_home: request.codex_home.or_else(codex_home_from_env),
             codex_thread_id,
+            codex_thread_provenance: request.codex_thread_provenance,
             codex_deeplink,
             checkpoint_id: workspace_checkpoint
                 .as_ref()

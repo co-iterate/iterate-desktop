@@ -199,6 +199,7 @@ fn notify_bridge_apns_on_popup_ready(request_id: String, request: &DialogRequest
         "predefined_options": request.options.clone(),
         "is_markdown": request.is_markdown,
         "codex_thread_id": request.codex_thread_id,
+        "codex_thread_provenance": request.codex_thread_provenance,
         "codex_deeplink": request.codex_deeplink,
         "conversation_title": request.conversation_title,
         "loop_active": request.loop_active,
@@ -850,6 +851,13 @@ pub fn handle_cli_args() -> Result<()> {
         return handle_mobile_route_register(&flags, &options);
     }
 
+    if flags.contains(&"--hub-source".to_string()) {
+        return crate::cross_device::hub_transport::run();
+    }
+    if flags.contains(&"--hub-source-configure".to_string()) {
+        return crate::cross_device::hub_transport::configure_from_stdin().map_err(anyhow::Error::msg);
+    }
+
     if flags.contains(&"--relay-server".to_string()) {
         return handle_relay_server_mode(&options);
     }
@@ -1487,6 +1495,7 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
         "project_path": if request.workspace.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(request.workspace.clone()) },
         "codex_home": request.codex_home,
         "codex_thread_id": request.codex_thread_id,
+        "codex_thread_provenance": request.codex_thread_provenance,
         "codex_deeplink": request.codex_deeplink,
         "conversation_title": request.conversation_title,
         "checkpoint_id": request.checkpoint_id,
@@ -1963,6 +1972,8 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                             if let Some(registration) = &cross_registration {
                                 if let Err(error) = crate::cross_device::mark_source_prepared(registration, &response) {
                                     instance_debug_log("[serve-request-cross-device-prepare-failed]", format!("request_id={}, error={}", request_id, error));
+                                } else if let Err(error) = crate::cross_device::record_accepted_response(registration, &response).await {
+                                    instance_debug_log("[serve-request-cross-device-history-failed]", format!("request_id={}, error={}", request_id, error));
                                 }
                             }
                             return dialog_response;
@@ -2506,6 +2517,8 @@ fn print_help() {
         "  iterate --ui [options]        弹窗模式（兼容旧版 --ui）\n",
         "  iterate --serve [--port N]    HTTP 服务器模式（类似 Infinite WF）\n",
         "  iterate --bridge-only [--port N]  无 GUI mobile bridge origin\n",
+        "  iterate --hub-source          运行已配置的云中心源客户端（Windows native 随 Bridge owner 启动）\n",
+        "  iterate --hub-source-configure  从 stdin JSON 保存 endpoint/device_id/token_env，token 仅从指定环境变量读取\n",
         "  iterate --bridge [options]    桥接模式（替代 cunzhi.py）\n",
         "  iterate --relay-server [--host H] [--port N] [--relay-token-env ENV] [--relay-audit-log PATH|off]\n",
         "  iterate --relay-mac-client --relay-url URL [--device-id ID] [--relay-token-env ENV]\n",

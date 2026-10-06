@@ -35,6 +35,8 @@ pub(super) struct ApnsNotifyRequest {
     #[serde(default)]
     pub(super) codex_thread_id: Option<String>,
     #[serde(default)]
+    pub(super) codex_thread_provenance: Option<String>,
+    #[serde(default)]
     pub(super) codex_deeplink: Option<String>,
     #[serde(default)]
     pub(super) loop_active: bool,

@@ -2,6 +2,7 @@ pub mod app;
 pub mod bridge;
 pub mod browser;
 pub mod config;
+pub mod codex_questions;
 pub mod constants;
 pub mod conversation;
 pub mod cross_device;

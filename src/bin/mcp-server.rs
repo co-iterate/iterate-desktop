@@ -76,6 +76,8 @@ struct DialogRequest {
     #[serde(default)]
     codex_thread_id: Option<String>,
     #[serde(default)]
+    codex_thread_provenance: Option<String>,
+    #[serde(default)]
     codex_deeplink: Option<String>,
     #[serde(default)]
     conversation_title: Option<String>,
@@ -1646,6 +1648,11 @@ fn record_conversation(
     append_conversation_log(&entry);
 }
 
+fn trusted_history_provenance(resolved_thread: Option<&str>, actual_caller: Option<&str>) -> Option<String> {
+    actual_caller.filter(|caller| Some(*caller) == resolved_thread)
+        .map(|_| "caller_meta".to_string())
+}
+
 async fn call_zhi(
     args: CallZhiArgs,
     caller_codex_thread_id: Option<String>,
@@ -1728,6 +1735,8 @@ async fn call_zhi(
                 .map(|fallback| fallback.thread_id.clone())
         })
         .or_else(|| live_goal_codex_thread_id.clone());
+    let codex_thread_provenance = trusted_history_provenance(
+        codex_thread_id.as_deref(), caller_codex_thread_id.as_deref());
     let request_id = generate_request_id();
     append_timeline_debug_log(
         "rust/bin_mcp_server::call_zhi_route_context",
@@ -1792,6 +1801,7 @@ async fn call_zhi(
         is_markdown: args.is_markdown,
         codex_home: codex_home_from_env(),
         codex_thread_id,
+        codex_thread_provenance,
         codex_deeplink,
         conversation_title,
         checkpoint_id: workspace_checkpoint
@@ -2977,6 +2987,13 @@ mod tests {
     use tempfile::tempdir;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn native_history_provenance_requires_matching_actual_caller() {
+        assert_eq!(trusted_history_provenance(Some("thread-a"), Some("thread-a")).as_deref(), Some("caller_meta"));
+        assert_eq!(trusted_history_provenance(Some("thread-b"), Some("thread-a")), None);
+        assert_eq!(trusted_history_provenance(Some("thread-b"), None), None);
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         ENV_LOCK.get_or_init(|| Mutex::new(()))

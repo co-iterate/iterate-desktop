@@ -8,6 +8,31 @@ const SERVE_REQUEST_MAX_BYTES: u64 = 1024 * 1024;
 const SERVE_ROUTE_MAX_BYTES: u64 = 16 * 1024;
 const CLOCK_SKEW_ALLOWANCE_SECS: i64 = 5 * 60;
 
+// Only separator spelling in ordinary Windows drive-absolute paths may differ.
+// Keep case, components, prefixes and relative paths exact; Unix '/' and '\\'
+// are different characters. This comparison does not resolve filesystem aliases.
+pub(super) fn local_project_paths_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let drive_absolute = |path: &str| {
+            let bytes = path.as_bytes();
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'/' | b'\\')
+        };
+        let separator = |byte| if byte == b'/' { b'\\' } else { byte };
+        return drive_absolute(left)
+            && drive_absolute(right)
+            && left.bytes().map(separator).eq(right.bytes().map(separator));
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
 #[derive(Debug)]
 pub(super) struct ServeRequestFallback {
     pub(super) payload: serde_json::Value,
@@ -82,7 +107,7 @@ fn load_live_serve_request_fallback_from_dir(
 
     let live_binding = instances.iter().find(|instance| {
         instance.request_id.as_deref().map(str::trim) == Some(request_id)
-            && instance.project_path.trim() == project_path
+            && local_project_paths_match(instance.project_path.trim(), project_path)
     });
     let Some(live_binding) = live_binding else {
         return Err(ServeRequestFallbackMiss::NoLiveWindowBinding);
@@ -108,7 +133,7 @@ fn load_live_serve_request_fallback_from_dir(
 
     let expected_response_path = temp_dir.join(format!("iterate_response_{request_id}.json"));
     if route.request_id.trim() != request_id
-        || route.project_path.trim() != project_path
+        || !local_project_paths_match(route.project_path.trim(), project_path)
         || route.response_file != expected_response_path
     {
         return Err(ServeRequestFallbackMiss::RouteMismatch);
@@ -133,8 +158,7 @@ fn load_live_serve_request_fallback_from_dir(
         && request
             .get("project_path")
             .and_then(|value| value.as_str())
-            .map(str::trim)
-            == Some(project_path)
+            .is_some_and(|path| local_project_paths_match(path.trim(), project_path))
         && request
             .get("message")
             .and_then(|value| value.as_str())
@@ -340,6 +364,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fallback.payload["request"]["id"], request_id);
+    }
+
+    #[test]
+    fn project_identity_does_not_merge_case_components_prefixes_or_relative_paths() {
+        assert!(local_project_paths_match("E:/Github/iterate-desktop", "E:/Github/iterate-desktop"));
+        for other in [
+            "E:/Github/other", "E:/Github/iterate-desktop-old", "e:/Github/iterate-desktop",
+            "E:/github/iterate-desktop", "E:/Github/./iterate-desktop",
+            "E:/Github/child/../iterate-desktop", "E:/Github/iterate-desktop/",
+            r"\\?\E:\Github\iterate-desktop", "Github/iterate-desktop",
+        ] {
+            assert!(!local_project_paths_match("E:/Github/iterate-desktop", other), "{other}");
+        }
+        assert!(!local_project_paths_match("Github/iterate-desktop", r"Github\iterate-desktop"));
+        assert!(!local_project_paths_match("E:Github/iterate-desktop", r"E:Github\iterate-desktop"));
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!local_project_paths_match("E:/Github/iterate-desktop", r"E:\Github\iterate-desktop"));
+            assert!(!local_project_paths_match("/tmp/project", r"\tmp\project"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn loads_windows_route_with_mixed_separators_at_each_identity_check() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1790913331998-e8e52f66-620c-4589-a59f-4bc6fd6820f3";
+        let forward = "E:/Github/iterate-desktop";
+        let backward = r"E:\Github\iterate-desktop";
+        for (target, live, route, request) in [
+            (backward, forward, forward, forward),
+            (forward, backward, forward, forward),
+            (forward, forward, backward, forward),
+            (forward, forward, forward, backward),
+        ] {
+            write_fixture(temp_dir.path(), request_id, route, NOW);
+            let request_path = temp_dir.path().join(format!("iterate_request_{request_id}.json"));
+            let mut payload: serde_json::Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+            payload["project_path"] = serde_json::json!(request);
+            fs::write(request_path, serde_json::to_vec(&payload).unwrap()).unwrap();
+            let loaded = load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, target, &[window_instance(request_id, live)], NOW,
+            ).unwrap();
+            assert_eq!(loaded.payload["request"], payload);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mixed_separators_still_require_exact_request_and_project_at_each_source() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1790913331998-e8e52f66-620c-4589-a59f-4bc6fd6820f3";
+        let forward = "E:/Github/iterate-desktop";
+        let backward = r"E:\Github\iterate-desktop";
+        write_fixture(temp_dir.path(), request_id, forward, NOW);
+        for live in [window_instance("serve-1790913331999", backward), window_instance(request_id, r"E:\Github\other")] {
+            assert_eq!(load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, backward, &[live], NOW,
+            ).unwrap_err(), ServeRequestFallbackMiss::NoLiveWindowBinding);
+        }
+        let route_path = temp_dir.path().join(format!("iterate_response_route_{request_id}.json"));
+        for (field, value) in [("request_id", "serve-1790913331999"), ("project_path", "E:/Github/other")] {
+            write_fixture(temp_dir.path(), request_id, forward, NOW);
+            let mut route: serde_json::Value = serde_json::from_slice(&fs::read(&route_path).unwrap()).unwrap();
+            route[field] = serde_json::json!(value);
+            fs::write(&route_path, serde_json::to_vec(&route).unwrap()).unwrap();
+            assert_eq!(load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, backward, &[window_instance(request_id, backward)], NOW,
+            ).unwrap_err(), ServeRequestFallbackMiss::RouteMismatch);
+        }
+        let request_path = temp_dir.path().join(format!("iterate_request_{request_id}.json"));
+        for (field, value) in [("id", "serve-1790913331999"), ("project_path", "E:/Github/other")] {
+            write_fixture(temp_dir.path(), request_id, forward, NOW);
+            let mut request: serde_json::Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+            request[field] = serde_json::json!(value);
+            fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+            assert_eq!(load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, backward, &[window_instance(request_id, backward)], NOW,
+            ).unwrap_err(), ServeRequestFallbackMiss::RequestMismatch);
+        }
     }
 
     #[test]

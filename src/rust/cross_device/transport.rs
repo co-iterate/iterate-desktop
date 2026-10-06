@@ -350,6 +350,7 @@ pub(super) fn credential() -> Result<String> {
     Ok(identity(false)?.token)
 }
 pub(super) fn validate_enable() -> Result<()> {
+    if super::hub_transport::config()?.is_some() {return Ok(());}
     let config = validate(connection_config()?)?;
     peer_ips(&config)?;
     paired()?;
@@ -505,6 +506,9 @@ pub(super) async fn ensure_daemon() -> Result<()> {
 }
 
 pub fn start_if_configured() {
+    if matches!(super::hub_transport::config(),Ok(Some(_))) {
+        if std::env::consts::OS=="macos" {std::thread::spawn(||{if let Ok(runtime)=tokio::runtime::Runtime::new(){let _=runtime.block_on(super::hub_transport::ensure_source());}});}
+    }
     if directory().is_ok_and(|dir| dir.join("direct-connection.json").is_file()) {
         std::thread::spawn(|| {
             if let Ok(runtime) = tokio::runtime::Runtime::new() {
@@ -763,6 +767,20 @@ pub async fn test_cross_device_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_revision_tracks_pair_config_while_cloud_is_configured() {
+        let dir=tempfile::tempdir().unwrap();
+        let previous=std::env::var_os("ITERATE_CROSS_DEVICE_DIR");
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR",dir.path());
+        let mut direct=ConnectionConfig{device_name:"desktop".into(),peer_host:"127.0.0.1".into(),..Default::default()};
+        atomic_json(&dir.path().join("direct-connection.json"),&direct).unwrap();
+        let before=route_key().unwrap();
+        atomic_json(&dir.path().join("hub-connection.json"),&super::super::hub_transport::HubConfig{endpoint:"http://127.0.0.1:18555".into(),device_id:"cloud-source".into(),token_env:"TEST_HUB_TOKEN".into(),ca_certificate:None}).unwrap();
+        assert_eq!(route_key().unwrap(),before);
+        direct.peer_port+=1;atomic_json(&dir.path().join("direct-connection.json"),&direct).unwrap();
+        assert_ne!(route_key().unwrap(),before);
+        match previous {Some(value)=>std::env::set_var("ITERATE_CROSS_DEVICE_DIR",value),None=>std::env::remove_var("ITERATE_CROSS_DEVICE_DIR")}
+    }
     #[test]
     fn only_specific_unicast_addresses_are_accepted() {
         assert!(usable_ip("10.8.0.3").is_ok());

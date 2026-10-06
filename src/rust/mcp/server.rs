@@ -651,6 +651,15 @@ impl ServerHandler for ZhiServer {
                             )
                         });
                 }
+                // Tool arguments cannot assert a Native history binding. Even when a
+                // caller exists, an explicit thread must agree with that caller.
+                zhi_request.codex_thread_provenance = if caller_codex_thread_id.as_deref()
+                    == zhi_request.codex_thread_id.as_deref()
+                    && caller_codex_thread_id.is_some() {
+                    Some("caller_meta".to_string())
+                } else {
+                    None
+                };
                 if zhi_request.codex_deeplink.is_none() {
                     zhi_request.codex_deeplink = zhi_request
                         .codex_thread_id

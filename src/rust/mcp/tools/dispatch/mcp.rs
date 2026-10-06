@@ -147,6 +147,7 @@ pnpm codex-room wait --room <room> --project <project_path> --after <target_subm
             project_path: request.project_path.clone(),
             codex_home: None,
             codex_thread_id: None,
+            codex_thread_provenance: None,
             codex_deeplink: None,
             checkpoint_id: None,
             checkpoint_commit: None,
