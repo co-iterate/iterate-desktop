@@ -1529,6 +1529,7 @@ pub async fn setup_application(app_handle: &AppHandle) -> Result<(), String> {
     // 这些服务由主 app 进程管理。子进程抢占 8080 端口会导致 iOS WS 断连。
     let args: Vec<String> = std::env::args().collect();
     let is_standalone = is_standalone_process();
+    // Native CLI questions are owned by the successfully bound Bridge daemon.
     instance_debug_log(
         "[setup-begin]",
         format!("is_standalone={}, args={:?}", is_standalone, args),

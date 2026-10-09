@@ -172,7 +172,7 @@ onMounted(loadSettings)
         同步对端已打开窗口
       </n-button>
       <p class="mt-2 text-xs opacity-75">
-        断线或未连接期间打开的窗口，可在重新连接并开启两端跨设备开关后，点击上方按钮补同步一次。
+        断线或未连接期间打开的待回复窗口，会在重新连接并开启两端跨设备开关后自动同步。已在本端关闭的窗口，可点击上方按钮恢复。
       </p>
       <p v-if="syncError" role="alert" class="mt-2 text-red-500 whitespace-pre-wrap break-all">
         {{ syncError }}

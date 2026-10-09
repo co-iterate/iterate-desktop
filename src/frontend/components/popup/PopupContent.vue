@@ -82,6 +82,9 @@ const requestContentRef = ref<HTMLElement | null>(null)
 const browserResponseRef = ref<HTMLElement | null>(null)
 const previewImageSrc = ref<string | null>(null)
 const dialog = useDialog()
+const platform = navigator.platform.toUpperCase()
+const isWindows = platform.includes('WIN')
+const fileManager = isWindows ? '资源管理器' : platform.includes('MAC') ? 'Finder' : '文件管理器'
 
 interface ManagedSelectionRange {
   range: Range
@@ -492,8 +495,10 @@ async function openLocalMarkdownHref(href: string, event: MouseEvent) {
   }
 
   if (isOutsideCurrentProject(target, projectPath)) {
-    const platform = navigator.platform.toUpperCase()
-    const fileManager = platform.includes('WIN') ? '资源管理器' : platform.includes('MAC') ? 'Finder' : '文件管理器'
+    if (isWindows) {
+      await openConfirmedExternalLocalFile(target.path)
+      return
+    }
     dialog.warning({
       title: '打开跨项目文件或文件夹？',
       content: `将在${fileManager}中打开文件夹或定位文件，不会执行文件或交给编辑器：\n${target.path}`,
@@ -1033,7 +1038,7 @@ defineExpose({
         <div class="flex gap-2 relative">
           <!-- @路径按钮 - 使用原生 Finder 选择文件或文件夹 -->
           <div
-            title="打开 Finder 选择文件或文件夹路径"
+            :title="`打开${fileManager}选择文件或文件夹路径`"
             class="popup-message-action-button inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md cursor-pointer transition-colors duration-100"
             @click="openNativeFileSelector"
           >

@@ -120,25 +120,7 @@ fn normalize_conversation_title(title: Option<&str>) -> Option<String> {
 }
 
 fn codex_thread_title_from_session_index(codex_home: &Path, thread_id: &str) -> Option<String> {
-    let file = std::fs::File::open(codex_home.join("session_index.jsonl")).ok()?;
-    let mut matched_title = None;
-
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if entry.get("id").and_then(|value| value.as_str()) != Some(thread_id) {
-            continue;
-        }
-
-        if let Some(title) =
-            normalize_conversation_title(entry.get("thread_name").and_then(|value| value.as_str()))
-        {
-            matched_title = Some(title);
-        }
-    }
-
-    matched_title
+    cunzhi::mcp::conversation_title::session_title(codex_home, thread_id)
 }
 
 fn codex_thread_title(thread_id: &str) -> Option<String> {
@@ -1757,8 +1739,8 @@ async fn call_zhi(
         .as_deref()
         .and_then(normalize_codex_thread_deeplink)
         .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_deeplink));
-    let conversation_title = normalize_conversation_title(args.conversation_title.as_deref())
-        .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_title));
+    let conversation_title = codex_thread_id.as_deref().and_then(codex_thread_title)
+        .or_else(|| normalize_conversation_title(args.conversation_title.as_deref()));
     checkpoint::touch_auto_checkpoint_monitor(&args.project_path, Some(&request_id));
     let workspace_checkpoint =
         checkpoint::maybe_auto_checkpoint(&args.project_path, Some(&request_id));
@@ -2666,7 +2648,7 @@ impl ServerHandler for IterateZhiServer {
                 },
                 "conversation_title": {
                     "type": "string",
-                    "description": "当前对话标题（可选；Codex 会话未传时会自动提取）"
+                    "description": "无法读取真实会话名称时使用的备用标题（可选；Codex 真实会话名称优先，不应填写每轮进度）"
                 }
             },
             "required": ["message", "project_path"]

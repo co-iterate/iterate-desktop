@@ -402,8 +402,27 @@ pub(crate) fn hub_native_closed(id:&str)->Result<bool,String> {
         // further CLI event arrives to trigger publish().
         persist_native_visibility(&h,&visible(&h))?;
     }
-    Ok(native_ledger()?.query_row("SELECT closed FROM visibility WHERE request_id=?1",[id],|r|r.get::<_,bool>(0))
-        .optional().map_err(|e|e.to_string())?.unwrap_or(false))
+    let db = native_ledger()?;
+    let closed = db.query_row("SELECT closed FROM visibility WHERE request_id=?1",[id],|r|r.get::<_,bool>(0))
+        .optional().map_err(|e|e.to_string())?;
+    // A successfully claimed replacement owner invalidates the previous
+    // routing identity. This retires that question, never its reply receipt.
+    // An empty snapshot or missing ledger alone is still not a close.
+    if closed == Some(false) && belongs_to_previous_native_owner(id, &h.owner) {
+        db.execute("UPDATE visibility SET closed=1 WHERE request_id=?1", [id]).map_err(|e|e.to_string())?;
+        return Ok(true);
+    }
+    Ok(closed.unwrap_or(false))
+}
+fn belongs_to_previous_native_owner(id: &str, owner: &str) -> bool {
+    let Ok(current) = uuid::Uuid::parse_str(owner) else { return false; };
+    let Some(identity) = id.strip_prefix("native-codex:") else { return false; };
+    let Ok(parts) = serde_json::from_str::<Vec<Value>>(identity) else { return false; };
+    if parts.len() != 6 || parts[5].as_u64().is_none()
+        || parts[..5].iter().any(|v| !v.as_str().is_some_and(|s| !s.is_empty())) {
+        return false;
+    }
+    uuid::Uuid::parse_str(parts[0].as_str().unwrap()).is_ok_and(|previous| previous != current)
 }
 pub(crate) fn hub_native_quiescent() -> bool { lock_hub().pending_sends == 0 }
 fn native_digest(payload: &Value) -> String {
@@ -1958,6 +1977,36 @@ mod tests {
         assert_eq!(durable_native_query(&key.0,&payload).unwrap().unwrap()["payload"]["status"],"unknown");
         assert!(lock_hub().sessions.is_empty());
         std::env::remove_var("ITERATE_CROSS_DEVICE_DIR");std::env::remove_var("ITERATE_CONVERSATION_STATE_FILE");
+    }
+    #[test]
+    fn replacement_native_owner_retires_only_known_previous_identities_preserving_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous_env = std::env::var_os("ITERATE_CROSS_DEVICE_DIR");
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR", dir.path());
+        let previous = uuid::Uuid::new_v4().to_string();
+        let current = uuid::Uuid::new_v4().to_string();
+        let identity = |owner: &str| format!("native-codex:{}", json!([owner,"launch","thread","turn","call",0]));
+        let old = identity(&previous);
+        let live = identity(&current);
+        let absent = identity(&uuid::Uuid::new_v4().to_string());
+        let malformed = "native-codex:invalid";
+        let db = native_ledger().unwrap();
+        for id in [&old, &live, malformed] {
+            db.execute("INSERT INTO visibility(request_id,closed) VALUES(?1,0)", [id]).unwrap();
+        }
+        db.execute("INSERT INTO actions(device,action,digest,receipt,history_ref) VALUES('phone','action','original-digest','original-unknown-receipt','original-history')", []).unwrap();
+        *lock_hub() = Hub::default();
+        assert!(!hub_native_closed(&old).unwrap(), "no claimed owner is not a terminal transition");
+        *lock_hub() = Hub { owner: current, ..Hub::default() };
+        assert!(hub_native_closed(&old).unwrap());
+        assert!(!hub_native_closed(&live).unwrap(), "same owner empty snapshot must remain nonterminal");
+        assert!(!hub_native_closed(&absent).unwrap(), "unknown identity must not acquire a synthetic close");
+        assert!(!hub_native_closed(malformed).unwrap());
+        let retained: (String,String,String) = db.query_row("SELECT digest,receipt,history_ref FROM actions WHERE device='phone' AND action='action'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(retained, ("original-digest".into(),"original-unknown-receipt".into(),"original-history".into()));
+        *lock_hub() = Hub::default();
+        assert!(hub_native_closed(&old).unwrap(), "retirement must survive owner exit");
+        match previous_env { Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR", value), None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR") }
     }
     #[test]
     fn cloud_native_owner_close_is_durable_and_missing_owner_is_not_terminal() {

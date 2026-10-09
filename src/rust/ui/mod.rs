@@ -16,6 +16,9 @@ pub mod updater;
 pub mod window;
 pub mod window_events;
 pub mod window_registry;
+pub mod popup_tabs;
+#[cfg(target_os = "windows")]
+pub mod popup_presentation;
 #[cfg(target_os = "windows")]
 pub mod webview_recovery;
 

@@ -37,10 +37,31 @@ const popupPlacementError = ref('')
 const focusPopupOnShow = ref(true)
 const savingPopupFocus = ref(false)
 const popupFocusError = ref('')
+const popupDisplayMode = ref<'windows' | 'tabs'>('windows')
+const savingPopupDisplayMode = ref(false)
+const popupDisplayModeError = ref('')
+
+async function updatePopupDisplayMode(value: string | number | null) {
+  if ((value !== 'windows' && value !== 'tabs') || savingPopupDisplayMode.value)
+    return
+  savingPopupDisplayMode.value = true
+  popupDisplayModeError.value = ''
+  try {
+    await invoke('set_window_settings', { windowSettings: { popup_display_mode: value } })
+    popupDisplayMode.value = value
+  }
+  catch (error) { popupDisplayModeError.value = `保存显示方式失败：${error}` }
+  finally { savingPopupDisplayMode.value = false }
+}
 
 async function loadPopupPlacement() {
   try {
-    const config = await invoke<{ popup_placement?: string, focus_popup_on_show?: boolean }>('get_window_config')
+    const config = await invoke<{ popup_placement?: string, focus_popup_on_show?: boolean, popup_display_mode?: string }>('get_window_config')
+    popupDisplayMode.value = config.popup_display_mode === 'tabs' ? 'tabs' : 'windows'
+    // Other popup processes can change the shared display mode while this
+    // process keeps its original in-memory window configuration.
+    const display = await invoke<{ mode: 'windows' | 'tabs' }>('get_popup_tabs')
+    popupDisplayMode.value = display.mode
     popupPlacement.value = config.popup_placement === 'center' ? 'center' : 'left'
     focusPopupOnShow.value = config.focus_popup_on_show !== false
   }
@@ -320,6 +341,25 @@ onUnmounted(() => {
 <template>
   <!-- 设置内容 -->
   <n-space vertical size="large">
+    <div class="flex items-start">
+      <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 mt-2 flex-shrink-0" />
+      <div>
+        <div class="text-sm font-medium leading-relaxed mb-1">
+          显示方式
+        </div>
+        <NRadioGroup :value="popupDisplayMode" :disabled="savingPopupDisplayMode" size="small" @update:value="updatePopupDisplayMode">
+          <NRadioButton value="windows">
+            分窗
+          </NRadioButton>
+          <NRadioButton value="tabs">
+            标签页
+          </NRadioButton>
+        </NRadioGroup>
+        <div v-if="popupDisplayModeError" class="text-xs text-red-500 mt-2" role="alert">
+          {{ popupDisplayModeError }}
+        </div>
+      </div>
+    </div>
     <div class="flex items-start">
       <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 mt-2 flex-shrink-0" />
       <div>

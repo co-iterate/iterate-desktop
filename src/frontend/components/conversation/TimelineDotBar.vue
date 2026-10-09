@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { selectionTextInsideElement } from '../../utils/popupSelectionQuote'
 
 interface ConversationNode {
@@ -31,7 +31,7 @@ const props = withDefaults(defineProps<{
 })
 
 const emit = defineEmits<{
-  nodeClick: [nodeId: string]
+  nodeClick: [node: ConversationNode | null]
   nodeQuote: [content: string]
 }>()
 
@@ -47,7 +47,7 @@ const nodeCount = computed(() => nodes.value.length)
 
 function buildPreview(node: ConversationNode) {
   const selectedOption = node.metadata?.selected_option?.trim()
-  const normalized = (selectedOption || node.content).replace(/\s+/g, ' ').trim()
+  const normalized = (node.content.trim() || selectedOption || '').replace(/\s+/g, ' ').trim()
   if (!normalized)
     return '(空内容)'
   if (normalized.length <= 40)
@@ -102,15 +102,6 @@ function updateTooltipPosition(dot: HTMLElement) {
   }
 }
 
-function updateTooltipCenterPosition() {
-  tooltipStyle.value = {
-    top: '50vh',
-    left: '50%',
-    right: 'auto',
-    transform: 'translate(-50%, -50%)',
-  }
-}
-
 function handleDotHover(index: number, event: MouseEvent) {
   hoveredIndex.value = index
   if (pinnedNodeId.value)
@@ -129,18 +120,18 @@ const pinnedIndex = computed(() => {
   return idx >= 0 ? idx : null
 })
 
-const activeTooltipIndex = computed(() => pinnedIndex.value ?? hoveredIndex.value)
-const isPinnedTooltip = computed(() => pinnedIndex.value !== null)
+const activeTooltipIndex = computed(() => hoveredIndex.value)
+const isPinnedTooltip = computed(() => false)
 
 function buildTooltipContent(node: ConversationNode) {
   const selectedOption = node.metadata?.selected_option?.trim()
-  const content = selectedOption || node.content
+  const content = node.content.trim() ? node.content : selectedOption || ''
   return isPinnedTooltip.value ? content : buildPreview(node)
 }
 
 function buildQuoteContent(node: ConversationNode) {
   const selectedText = selectionTextInsideElement(tooltipContentRef.value)
-  return (selectedText || node.metadata?.selected_option?.trim() || node.content).trim()
+  return (selectedText || node.content.trim() || node.metadata?.selected_option?.trim() || '').trim()
 }
 
 function clearTextSelection() {
@@ -151,6 +142,7 @@ function clearTextSelection() {
 
 function closePinnedTooltip() {
   pinnedNodeId.value = null
+  emit('nodeClick', null)
   clearTextSelection()
 }
 
@@ -168,41 +160,20 @@ function handleDotClick(index: number, nodeId: string) {
   }
   else {
     pinnedNodeId.value = nodeId
-    updateTooltipCenterPosition()
+    hoveredIndex.value = null
+    emit('nodeClick', nodes.value[index] ?? null)
   }
-}
-
-function handleDocumentPointerDown(event: PointerEvent) {
-  if (!pinnedNodeId.value)
-    return
-
-  const target = event.target
-  if (!(target instanceof Node))
-    return
-
-  if (tooltipRef.value?.contains(target))
-    return
-  if (rootRef.value?.contains(target))
-    return
-
-  closePinnedTooltip()
 }
 
 watch(
   () => [props.treeId, props.currentNodeId, props.mockNodes],
   () => {
+    if (pinnedNodeId.value && !props.treeId && !props.mockNodes)
+      closePinnedTooltip()
     loadPath()
   },
   { immediate: true },
 )
-
-onMounted(() => {
-  document.addEventListener('pointerdown', handleDocumentPointerDown, true)
-})
-
-onUnmounted(() => {
-  document.removeEventListener('pointerdown', handleDocumentPointerDown, true)
-})
 </script>
 
 <template>

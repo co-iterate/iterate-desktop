@@ -80,6 +80,8 @@ pub struct FontConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WindowConfig {
     #[serde(default)]
+    pub popup_display_mode: PopupDisplayMode,
+    #[serde(default)]
     pub popup_placement: PopupPlacement,
     #[serde(default = "default_focus_popup_on_show")]
     pub focus_popup_on_show: bool,
@@ -118,6 +120,14 @@ pub enum PopupPlacement {
     #[default]
     Left,
     Center,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupDisplayMode {
+    #[default]
+    Windows,
+    Tabs,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -555,6 +565,7 @@ pub fn default_audio_url() -> String {
 
 pub fn default_window_config() -> WindowConfig {
     WindowConfig {
+        popup_display_mode: PopupDisplayMode::Windows,
         popup_placement: PopupPlacement::Left,
         focus_popup_on_show: default_focus_popup_on_show(),
         auto_resize: window::DEFAULT_AUTO_RESIZE,

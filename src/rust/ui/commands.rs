@@ -78,13 +78,48 @@ fn restore_standalone_previous_frontmost_application() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn dismiss_standalone_mcp_window(app: AppHandle) -> Result<(), String> {
+pub async fn dismiss_standalone_mcp_window(app: AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "standalone MCP window not found".to_string())?;
+    let target = window.clone();
+    let (completed, result) = tokio::sync::oneshot::channel();
+    window
+        .run_on_main_thread(move || {
+            let _ = completed.send(hide_mcp_window_on_main_thread(&target));
+        })
+        .map_err(|error| format!("failed to schedule MCP window dismissal: {error}"))?;
+    result
+        .await
+        .map_err(|error| format!("MCP window dismissal was not confirmed: {error}"))?
+}
+
+fn hide_mcp_window_on_main_thread(window: &tauri::WebviewWindow) -> Result<(), String> {
+    crate::ui::popup_tabs::prepare_send_handoff(window)?;
     window
         .hide()
         .map_err(|error| format!("failed to hide standalone MCP window: {error}"))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE};
+
+        // center_window uses SW_SHOWNOACTIVATE for a non-focusing popup. That
+        // native show does not update Tao's VISIBLE flag, so hide() alone can
+        // acknowledge a no-op. Hide the same HWND and confirm before sending.
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("failed to resolve MCP window handle: {error}"))?;
+        unsafe { ShowWindow(hwnd.0, SW_HIDE) };
+        if unsafe { IsWindowVisible(hwnd.0) } != 0 {
+            return Err("MCP window remained visible; response was not sent".to_string());
+        }
+        log::info!(
+            "[MCP dismissal] pid={} window={} hidden=true",
+            std::process::id(),
+            window.label()
+        );
+    }
 
     #[cfg(target_os = "macos")]
     if let Err(error) = restore_standalone_previous_frontmost_application() {
@@ -537,6 +572,11 @@ pub async fn set_window_settings(
                 serde_json::from_value(placement.clone())
                     .map_err(|e| format!("弹窗位置无效: {}", e))?;
         }
+        if let Some(mode) = window_settings.get("popup_display_mode") {
+            config.ui_config.window_config.popup_display_mode =
+                serde_json::from_value(mode.clone())
+                    .map_err(|e| format!("显示方式无效: {}", e))?;
+        }
         if let Some(focus) = window_settings.get("focus_popup_on_show") {
             config.ui_config.window_config.focus_popup_on_show = focus
                 .as_bool()
@@ -601,6 +641,11 @@ pub async fn set_window_settings(
     save_config(&state, &app)
         .await
         .map_err(|e| format!("保存配置失败: {}", e))?;
+
+    if let Some(mode) = window_settings.get("popup_display_mode") {
+        crate::ui::popup_tabs::set_mode(&app, serde_json::from_value(mode.clone())
+            .map_err(|e| format!("显示方式无效: {}", e))?)?;
+    }
 
     if disable_always_on_top {
         if let Some(window) = app.get_webview_window("main") {
@@ -2050,7 +2095,10 @@ pub fn read_mcp_request(file_path: String) -> Result<serde_json::Value, String> 
                 return Err("文件内容为空".to_string());
             }
             match serde_json::from_str(&content) {
-                Ok(json) => Ok(json),
+                Ok(mut json) => {
+                    crate::mcp::conversation_title::normalize_local_request(&mut json);
+                    Ok(json)
+                },
                 Err(e) => Err(format!("解析JSON失败: {}", e)),
             }
         }
@@ -2188,15 +2236,13 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn open_local_path(
+    app: AppHandle,
     path: String,
     project_path: String,
     prefer_editor: Option<bool>,
 ) -> Result<(), String> {
-    use std::process::Command;
-
     let target = resolve_local_open_target(&path, &project_path)?;
     let metadata = std::fs::metadata(&target.path).map_err(|e| format!("读取文件失败: {}", e))?;
-    let resolved_path_string = target.path.to_string_lossy().to_string();
 
     if prefer_editor.unwrap_or(false) && metadata.is_file() {
         if open_local_target_in_editor(&target).is_ok() {
@@ -2204,59 +2250,73 @@ pub async fn open_local_path(
         }
     }
 
-    let result = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "start", "", &resolved_path_string])
-            .without_console_window()
-            .spawn()
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        if metadata.is_file() {
-            command.arg("-R");
-        }
-        command.arg(&target.path).spawn()
-    } else {
-        Command::new("xdg-open").arg(&target.path).spawn()
-    };
+    #[cfg(target_os = "windows")]
+    {
+        open_windows_local_path(&app, &target.path)
+            .map_err(|e| format!("无法打开本地文件: {}", e))
+    }
 
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("无法打开本地文件: {}", e)),
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let _ = app;
+        let result = if cfg!(target_os = "macos") {
+            let mut command = Command::new("open");
+            if metadata.is_file() {
+                command.arg("-R");
+            }
+            command.arg(&target.path).spawn()
+        } else {
+            Command::new("xdg-open").arg(&target.path).spawn()
+        };
+
+        result.map(|_| ()).map_err(|e| format!("无法打开本地文件: {}", e))
     }
 }
 
 #[tauri::command]
-pub async fn open_confirmed_external_file(path: String) -> Result<(), String> {
-    use std::process::Command;
-
+pub async fn open_confirmed_external_file(app: AppHandle, path: String) -> Result<(), String> {
     let target = resolve_confirmed_external_file_target(&path)?;
-    let resolved_path_string = target.to_string_lossy().to_string();
 
-    let result = if cfg!(target_os = "windows") {
-        let shell_path = windows_explorer_path(&resolved_path_string);
-        let mut command = Command::new("explorer");
-        if target.is_file() {
-            command.arg(format!("/select,{}", shell_path));
+    #[cfg(target_os = "windows")]
+    {
+        open_windows_local_path(&app, &target)
+            .map_err(|e| format!("无法打开跨项目文件或文件夹: {}", e))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let _ = app;
+        let result = if cfg!(target_os = "macos") {
+            let mut command = Command::new("open");
+            if target.is_file() {
+                command.arg("-R");
+            }
+            command.arg(&target).spawn()
         } else {
-            command.arg(shell_path);
-        }
-        command.spawn()
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        if target.is_file() {
-            command.arg("-R");
-        }
-        command.arg(&target).spawn()
-    } else {
-        Command::new("xdg-open").arg(&target).spawn()
-    };
+            Command::new("xdg-open").arg(&target).spawn()
+        };
 
-    result
-        .map(|_| ())
-        .map_err(|e| format!("无法在文件管理器中打开跨项目文件或文件夹: {}", e))
+        result.map(|_| ()).map_err(|e| {
+            format!("无法在文件管理器中打开跨项目文件或文件夹: {}", e)
+        })
+    }
 }
 
-// canonicalize() returns extended-length Windows paths; Explorer expects shell paths.
+#[cfg(target_os = "windows")]
+fn open_windows_local_path(app: &AppHandle, path: &std::path::Path) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+
+    // The installed shell plugin enables open's shellexecute-on-windows feature:
+    // its default opener calls ShellExecuteExW without a command interpreter.
+    #[allow(deprecated)]
+    app.shell()
+        .open(windows_explorer_path(&path.to_string_lossy()), None)
+        .map_err(|e| e.to_string())
+}
+
+// canonicalize() returns extended-length Windows paths; the shell expects shell paths.
 fn windows_explorer_path(path: &str) -> String {
     if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{}", unc_path)
@@ -3993,6 +4053,9 @@ pub fn position_window_left(app: AppHandle) -> Result<(), String> {
 /// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
 #[tauri::command]
 pub async fn center_window(app: AppHandle) -> Result<(), String> {
+    if !crate::ui::popup_tabs::should_present_current()? {
+        return Ok(());
+    }
     let window = place_main_window(&app)?;
     let focus_on_show = app.state::<AppState>()
         .config
@@ -4014,11 +4077,7 @@ pub async fn center_window(app: AppHandle) -> Result<(), String> {
     } else {
         #[cfg(target_os = "windows")]
         {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
-
-            let hwnd = window.hwnd().map_err(|e| format!("获取窗口句柄失败: {}", e))?;
-            // Tauri's show/unminimize may activate the window on Windows.
-            unsafe { ShowWindow(hwnd.0, SW_SHOWNOACTIVATE) };
+            crate::ui::popup_presentation::show_behind_existing(&window)?;
         }
         #[cfg(not(target_os = "windows"))]
         window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
@@ -4628,6 +4687,18 @@ fn has_dangerous_local_open_extension(path: &Path) -> bool {
         extension.as_str(),
         "app" | "command" | "terminal" | "exe" | "bat" | "cmd" | "com" | "scr" | "ps1"
     )
+        // Windows default associations can execute scripts, follow shortcuts or
+        // install packages even though these files have no executable permission bit.
+        || (cfg!(target_os = "windows")
+            && matches!(
+                extension.as_str(),
+                "vbs" | "vbe" | "js" | "jse" | "wsf" | "wsh" | "hta"
+                    | "lnk" | "url" | "pif" | "scf" | "appref-ms"
+                    | "msi" | "msp" | "msu" | "application" | "appinstaller"
+                    | "appx" | "appxbundle" | "msix" | "msixbundle"
+                    | "cpl" | "msc" | "reg" | "diagcab"
+                    | "py" | "pyw" | "pyc" | "pyo"
+            ))
 }
 
 #[cfg(unix)]
@@ -4788,7 +4859,7 @@ mod local_file_path_tests {
     fn resolves_windows_url_style_drive_paths() {
         let root = std::env::temp_dir().join(format!("iterate-drive-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let file = root.join("中文 screenshot.png");
+        let file = root.join("中文 screenshot & %TEMP%.png");
         std::fs::write(&file, b"path normalization fixture").unwrap();
         let drive_path = file.to_string_lossy().replace('\\', "/");
         for input in [drive_path.clone(), format!("/{drive_path}"), format!("file:///{drive_path}")] {
@@ -4966,6 +5037,7 @@ mod local_file_path_tests {
     #[test]
     fn normalizes_windows_explorer_paths() {
         assert_eq!(super::windows_explorer_path(r"\\?\C:\中文 空格\folder"), r"C:\中文 空格\folder");
+        assert_eq!(super::windows_explorer_path(r"\\?\C:\中文 空格 & %TEMP%\file.txt"), r"C:\中文 空格 & %TEMP%\file.txt");
         assert_eq!(super::windows_explorer_path(r"\\?\UNC\server\share\folder"), r"\\server\share\folder");
         assert_eq!(super::windows_explorer_path(r"C:\folder"), r"C:\folder");
     }
@@ -4978,6 +5050,50 @@ mod local_file_path_tests {
             .expect_err("executable should remain rejected");
         assert!(error.contains("可执行文件"));
         std::fs::remove_file(file).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rejects_windows_execution_associations_before_local_or_external_open() {
+        let root = tempfile::tempdir().expect("create isolated resolver fixtures");
+        let execution_categories: &[(&str, &[&str])] = &[
+            ("Windows Script Host", &["vbs", "vbe", "js", "jse", "wsf", "wsh"]),
+            ("HTML application", &["hta"]),
+            ("shortcuts", &["lnk", "url", "pif", "scf", "appref-ms"]),
+            ("installers", &["msi", "msp", "msu", "application", "appinstaller", "appx", "appxbundle", "msix", "msixbundle"]),
+            ("system actions", &["cpl", "msc", "reg", "diagcab"]),
+            ("Python handlers", &["py", "pyw", "pyc", "pyo"]),
+        ];
+
+        for &(category, extensions) in execution_categories {
+            for extension in extensions {
+                for spelling in [extension.to_string(), extension.to_ascii_uppercase()] {
+                    let file = root.path().join(format!("禁止运行 中文 空格 & %TEMP%.{spelling}"));
+                    // These fixtures are only canonicalized and classified, never opened.
+                    std::fs::write(&file, b"resolver-only fixture").expect("write inert fixture");
+                    let local_error = resolve_local_open_target(
+                        &file.to_string_lossy(),
+                        &root.path().to_string_lossy(),
+                    ).expect_err("local resolver must reject executable associations");
+                    let external_error = resolve_confirmed_external_file_target(&file.to_string_lossy())
+                        .expect_err("external resolver must reject executable associations");
+                    assert!(local_error.contains("可执行文件"), "{category}: {spelling}");
+                    assert!(external_error.contains("可执行文件"), "{category}: {spelling}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_execution_protection_preserves_ordinary_documents() {
+        let root = tempfile::tempdir().expect("create ordinary document fixtures");
+        for extension in ["txt", "md", "png", "pdf", "json", "zip"] {
+            let file = root.path().join(format!("中文 空格 & %TEMP%.{extension}"));
+            std::fs::write(&file, b"resolver-only ordinary document").expect("write fixture");
+            assert!(resolve_local_open_target(&file.to_string_lossy(), &root.path().to_string_lossy()).is_ok());
+            assert!(resolve_confirmed_external_file_target(&file.to_string_lossy()).is_ok());
+        }
     }
 
     #[test]

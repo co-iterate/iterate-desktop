@@ -89,6 +89,19 @@ fn settings() -> Result<Settings> {
     Ok(value)
 }
 
+// Leases are the existing liveness authority. Filter them before opening old
+// registrations or their locks: history grows, but pending windows stay small.
+fn live_registration_keys(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir.join("leases")).into_iter().flatten().flatten()
+        .filter_map(|entry| {
+            let key = entry.file_name().to_str()?.to_owned();
+            uuid::Uuid::parse_str(&key).ok()?;
+            let age = entry.metadata().ok()?.modified().ok()?.elapsed().ok()?;
+            (age < Duration::from_secs(15)).then_some(key)
+        })
+        .collect()
+}
+
 // Display-only computer identity. Reading it never creates settings, credentials,
 // or a pairing, and it must never be replaced with the replying phone's identity.
 pub(crate) fn local_computer_identity() -> (Option<String>, Option<String>) {
@@ -1104,13 +1117,10 @@ async fn snapshot(
     }
     let config = settings().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut requests = Vec::new();
-    if let Ok(entries) = fs::read_dir(
-        directory()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .join("requests"),
-    ) {
-        for entry in entries.flatten() {
-            if let Ok(reg) = read_json::<Registration>(&entry.path()) {
+    let dir = directory().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if config.enabled {
+        for key in live_registration_keys(&dir) {
+            if let Ok(reg) = read_json::<Registration>(&dir.join("requests").join(format!("{key}.json"))) {
                 if config.enabled && reg.published && reg.active() && !reg.response_file.exists()
                     && text_mirror_supported(&reg.request) {
                     requests.push(
@@ -1134,8 +1144,22 @@ async fn sync_open_windows(
 ) -> std::result::Result<Json<Value>, StatusCode> {
     if !authorized(&headers, &state) { return Err(StatusCode::UNAUTHORIZED); }
     let _admission = hub_transport::submission_guard(false).map_err(|_|StatusCode::CONFLICT)?;
+    let dir = directory().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if transport::route_key().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? != state.revision
+        || !settings().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.enabled {
+        return Err(StatusCode::CONFLICT);
+    }
+    let needs_publication = live_registration_keys(&dir).iter().any(|key| {
+        load_registration(key).is_ok_and(|reg| !reg.published && reg.active()
+            && !reg.response_file.exists() && text_mirror_supported(&reg.request))
+    });
+    if !needs_publication {
+        // Cloud publication holds connection.lock while awaiting network ACKs.
+        // Reading already-published windows must not wait for unrelated writes.
+        // A newly registered deferred window is picked up by the next poll.
+        return snapshot(State(state), headers).await;
+    }
     {
-        let dir = directory().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let _guard = lock(&dir, "connection.lock").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if transport::route_key().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? != state.revision {
             return Err(StatusCode::CONFLICT);
@@ -1145,22 +1169,22 @@ async fn sync_open_windows(
         }
         // Separate deferred records are invisible to old daemons. Read the old
         // layout as well so already registered source windows remain usable.
-        for folder in ["requests", "deferred-requests"] {
-            if let Ok(entries) = fs::read_dir(dir.join(folder)) {
-                for entry in entries.flatten() {
-                    if let Ok(reg) = read_json::<Registration>(&entry.path()) {
-                        let _request=reg.request_lock().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
-                        let Ok(mut reg)=load_registration(&reg.key) else {continue};
-                        if !reg.published && reg.active() && !reg.response_file.exists()
-                            && text_mirror_supported(&reg.request) {
-                            reg.published = true;
-                            atomic_json(&reg.path().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?, &reg)
-                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                            if folder == "deferred-requests" {
-                                fs::remove_file(entry.path()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                            }
-                        }
-                    }
+        for key in live_registration_keys(&dir) {
+            let Ok(reg) = load_registration(&key) else { continue };
+            // Published and completed records need no publication lock.
+            // Recheck under the lock before changing any live record.
+            if reg.published || !reg.active() || reg.response_file.exists()
+                || !text_mirror_supported(&reg.request) { continue; }
+            let _request = reg.request_lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let Ok(mut reg) = load_registration(&key) else { continue };
+            if !reg.published && reg.active() && !reg.response_file.exists()
+                && text_mirror_supported(&reg.request) {
+                reg.published = true;
+                atomic_json(&reg.path().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?, &reg)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let deferred = dir.join("deferred-requests").join(format!("{key}.json"));
+                if deferred.exists() {
+                    fs::remove_file(deferred).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
             }
         }
@@ -2081,6 +2105,51 @@ mod tests {
         restore_dismissals(temp.path(), &keys, &before_reap, &mut dismissed);
         assert!(dismissed.contains(&key));
         assert!(temp.path().join("dismissed").join(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn window_sync_skips_history_and_does_not_lock_published_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ITERATE_CROSS_DEVICE_DIR");
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR", temp.path());
+        atomic_json(&temp.path().join("settings.json"),
+            &Settings { device_id: "source".into(), enabled: true }).unwrap();
+        let state = Arc::new(Broker { token: "test-token".into(), revision: transport::route_key().unwrap(),
+            device_id: "source".into(), network_ready: std::sync::atomic::AtomicBool::new(true) });
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+        let request_file = temp.path().join("popup.json");
+        fs::write(&request_file, b"{}").unwrap();
+        let live = Registration { key: uuid::Uuid::new_v4().to_string(), origin_device_id: "source".into(),
+            origin_name: "source".into(), origin_platform: None, request: json!({"message":"pending"}),
+            request_file, response_file: temp.path().join("response.json"), published: true };
+        atomic_json(&live.path().unwrap(), &live).unwrap();
+        live.renew();
+        // A published request must remain visible even when its write lock
+        // cannot be opened (e.g. another reply path is finalizing it).
+        fs::create_dir_all(temp.path().join("locks").join(&live.key)).unwrap();
+        // Make the write-route lock unavailable without a blocking test: a
+        // read-only pull must succeed even when it cannot open this lock.
+        fs::create_dir_all(temp.path().join("connection.lock")).unwrap();
+        for index in 0..64 {
+            let stale = Registration { key: uuid::Uuid::new_v4().to_string(), published: index % 2 == 0, ..live.clone() };
+            atomic_json(&stale.path().unwrap(), &stale).unwrap();
+            if index % 3 != 0 {
+                stale.renew();
+                File::options().write(true).open(temp.path().join("leases").join(&stale.key)).unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH)).unwrap();
+            }
+            fs::create_dir_all(temp.path().join("locks").join(&stale.key)).unwrap();
+        }
+        let pulled = sync_open_windows(State(state.clone()), headers.clone()).await.unwrap().0;
+        assert_eq!(pulled["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(pulled["requests"][0]["key"], live.key);
+        assert_eq!(snapshot(State(state), headers).await.unwrap().0["requests"], pulled["requests"]);
+        // History is retained; skipping old work is not garbage collection.
+        assert_eq!(fs::read_dir(temp.path().join("requests")).unwrap().count(), 33);
+        assert_eq!(fs::read_dir(temp.path().join("deferred-requests")).unwrap().count(), 32);
+        match previous { Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR", value),
+            None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR") }
     }
 
     #[tokio::test]

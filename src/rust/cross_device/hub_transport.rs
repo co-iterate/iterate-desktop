@@ -395,18 +395,8 @@ impl Client {
         for binding in registration_publications(&self.config)? {
             self.publish_binding(&binding,epoch).await?;
         }
-        for binding in bindings()? {
-            self.progress.enter("publication_cleanup");
-            if binding.kind=="native" {
-                if crate::codex_questions::hub_native_closed(&binding.request_id)? {
-                    self.call("/source/close",Some(&json!({"source_request_id":binding.request_id,"version":binding.version,"registration_key":binding.registration_key}))).await?;
-                }
-                continue;
-            }
-            let reg=super::load_registration(&binding.registration_key)?;
-            if !reg.active() || reg.response_file.exists(){self.call("/source/close",Some(&json!({"source_request_id":binding.request_id,"version":binding.version,"registration_key":binding.registration_key}))).await?;}
-        }
-        if !super::settings()?.enabled {return Ok(());}
+        let cleanup = self.close_bindings(&bindings()?).await;
+        if super::settings()?.enabled {
         for wire in crate::codex_questions::snapshot(){
             let request=&wire["payload"]["request"];
             let id=text(request,"id");if id.is_empty(){continue;}
@@ -416,6 +406,45 @@ impl Client {
                 atomic_json(&path,&b)?;b
             };
             self.publish_binding(&binding,epoch).await?;
+        }
+        }
+        cleanup
+    }
+
+    async fn close_bindings(&self, bindings: &[Binding]) -> Result<()> {
+        let mut incomplete = false;
+        for binding in bindings {
+            self.progress.enter("publication_cleanup");
+            if let Err(error) = self.close_binding(binding).await {
+                // Keep the unknown binding for retry; it must not strand
+                // independent completed requests later in this batch.
+                log::warn!("cloud request cleanup incomplete: {}", error);
+                incomplete = true;
+            }
+        }
+        if incomplete { Err("hub_closures_incomplete".into()) } else { Ok(()) }
+    }
+
+    async fn close_binding(&self, binding: &Binding) -> Result<()> {
+        let acknowledged = json!([self.config.endpoint, self.config.device_id,
+            binding.source_id, binding.request_id, binding.registration_key, binding.version]);
+        let acknowledgement_path = directory()?.join("hub-closure-acks")
+            .join(format!("{}.json", digest(&acknowledged.to_string())));
+        if read_json::<Value>(&acknowledgement_path).ok().as_ref() == Some(&acknowledged) {
+            return Ok(());
+        }
+        let closed = if binding.kind == "native" {
+            crate::codex_questions::hub_native_closed(&binding.request_id)?
+        } else {
+            let reg = super::load_registration(&binding.registration_key)?;
+            !reg.active() || reg.response_file.exists()
+        };
+        if closed {
+            self.call("/source/close", Some(&json!({
+                "source_request_id": binding.request_id, "version": binding.version,
+                "registration_key": binding.registration_key
+            }))).await?;
+            atomic_json(&acknowledgement_path, &acknowledged)?;
         }
         Ok(())
     }
@@ -523,9 +552,7 @@ impl Client {
         Ok(())
     }
 
-    async fn jobs(&self,next:&Value)->Result<()> {
-        for (key,query) in [("jobs",false),("reconcile",true)] {
-            for job in next[key].as_array().into_iter().flatten(){
+    async fn process_job(&self,job:&Value,query:bool)->Result<()> {
                 self.progress.enter("job_dispatch");
                 if job["kind"]=="action" {self.action(job,query).await?;}
                 else {
@@ -549,9 +576,22 @@ impl Client {
                     }
                     self.call("/source/respond",Some(&json!({"job_id":job["id"],"epoch":job["epoch"],"response":response}))).await?;
                 }
+        Ok(())
+    }
+
+    async fn jobs(&self,next:&Value)->Result<()> {
+        let mut incomplete = false;
+        for (key,query) in [("jobs",false),("reconcile",true)] {
+            for job in next[key].as_array().into_iter().flatten(){
+                // An unknown old RPC must remain unknown, but it must not
+                // prevent independent durable replies later in this batch.
+                if self.process_job(job,query).await.is_err() {
+                    incomplete = true;
+                }
             }
         }
-        Ok(())
+        // Preserve the drain/barrier guard: partial success is not quiescence.
+        if incomplete { Err("hub_jobs_incomplete".into()) } else { Ok(()) }
     }
 
     async fn process_next(&self, dir: &Path, next: &Value) -> Result<()> {
@@ -634,6 +674,140 @@ async fn run_async(watchdog_limit: Option<Duration>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_closures_do_not_strand_completed_requests_or_close_live_requests() {
+        use axum::{extract::State, routing::post, Json};
+        use std::sync::{Arc, Mutex};
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR", value),
+                    None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR"),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = RestoreEnv(std::env::var_os("ITERATE_CROSS_DEVICE_DIR"));
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR", dir.path());
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = axum::Router::new().route("/source/close", post(
+            |State(received): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                let status = match body["source_request_id"].as_str().unwrap() {
+                    "unpublished" => axum::http::StatusCode::BAD_REQUEST,
+                    "offline" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    _ => axum::http::StatusCode::OK,
+                };
+                received.lock().unwrap().push(body);
+                (status, Json(json!({})))
+            })).with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client { config: HubConfig { endpoint, device_id: "fixture".into(),
+            token_env: "TEST_UNUSED_TOKEN".into(), ca_certificate: None },
+            token: "fixture-token".into(), session: "fixture-session".into(),
+            http: reqwest::Client::builder().no_proxy().build().unwrap(), progress: Progress::new() };
+        let mut registrations = Vec::new();
+        let mut batch = Vec::new();
+        for id in ["unpublished", "offline", "completed", "live"] {
+            let reg = super::super::Registration { key: uuid::Uuid::new_v4().to_string(), origin_device_id: "fixture".into(),
+                origin_name: "fixture".into(), origin_platform: Some("windows".into()),
+                request: json!({"id": id}), request_file: dir.path().join(format!("{id}-request.json")),
+                response_file: dir.path().join(format!("{id}-response.json")), published: true };
+            atomic_json(&reg.path().unwrap(), &reg).unwrap();
+            if id == "live" { atomic_json(&reg.request_file, &reg.request).unwrap(); reg.renew(); }
+            if id == "completed" { atomic_json(&reg.result_path().unwrap(), &json!({"response":"original reply"})).unwrap(); }
+            let binding = Binding { source_id: "fixture".into(), request_id: id.into(),
+                registration_key: reg.key.clone(), version: 1, route_id: id.into(), kind: "mcp".into(),
+                project_path: "G:/isolated".into(), wire: json!({}) };
+            atomic_json(&binding_path(&reg.key).unwrap(), &binding).unwrap();
+            registrations.push(reg);
+            batch.push(binding);
+        }
+        let mut missing = batch[0].clone();
+        missing.registration_key = uuid::Uuid::new_v4().to_string();
+        batch.insert(0, missing);
+        let original_result = fs::read(registrations[2].result_path().unwrap()).unwrap();
+        assert_eq!(client.close_bindings(&batch).await.unwrap_err(), "hub_closures_incomplete");
+        let calls = received.lock().unwrap().clone();
+        assert_eq!(calls.iter().map(|v| text(v, "source_request_id")).collect::<Vec<_>>(),
+            vec!["unpublished", "offline", "completed"]);
+        assert_eq!(calls[2], json!({"source_request_id":"completed", "version":1, "registration_key":registrations[2].key}));
+        assert_eq!(fs::read(registrations[2].result_path().unwrap()).unwrap(), original_result);
+        for binding in &batch[1..] { assert!(binding_path(&binding.registration_key).unwrap().exists()); }
+        assert!(!registrations[0].response_file.exists());
+        assert!(!registrations[1].response_file.exists());
+        assert!(client.close_bindings(&batch[3..]).await.is_ok());
+        assert_eq!(received.lock().unwrap().len(), 3, "confirmed closure must not repeat; live request must never receive a close");
+        received.lock().unwrap().clear();
+        assert_eq!(client.close_bindings(&batch).await.unwrap_err(), "hub_closures_incomplete");
+        assert_eq!(received.lock().unwrap().iter().map(|v| text(v, "source_request_id").to_owned()).collect::<Vec<_>>(),
+            vec!["unpublished", "offline"], "failed closures must retry without suppressing another identity");
+        let mut changed = batch[3].clone();
+        changed.version = 2;
+        assert!(client.close_bindings(&[changed]).await.is_ok());
+        assert_eq!(received.lock().unwrap().last().unwrap()["version"], 2, "a different version cannot use the old confirmation");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_jobs_do_not_starve_later_durable_receipts_or_report_quiescence() {
+        use axum::{extract::State, routing::post, Json};
+        use std::sync::{Arc, Mutex};
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR",value),
+                    None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR"),
+                }
+            }
+        }
+        let dir=tempfile::tempdir().unwrap();
+        let _restore=RestoreEnv(std::env::var_os("ITERATE_CROSS_DEVICE_DIR"));
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR",dir.path());
+        let received=Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app=axum::Router::new().route("/source/respond",post(
+            |State(received):State<Arc<Mutex<Vec<Value>>>>,Json(body):Json<Value>|async move {
+                let status=if body["job_id"]=="http-failure" {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }else{axum::http::StatusCode::OK};
+                received.lock().unwrap().push(body);
+                (status,Json(json!({"ok":true})))
+            })).with_state(received.clone());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let client=Client{config:HubConfig{endpoint,device_id:"fixture".into(),
+            token_env:"TEST_UNUSED_TOKEN".into(),ca_certificate:None},
+            token:"fixture-token".into(),session:"fixture-session".into(),
+            http:reqwest::Client::builder().no_proxy().build().unwrap(),progress:Progress::new()};
+        let reply=json!({"events":[{"message_type":"fixture_receipt","payload":{"value":"original"}}]});
+        for id in ["durable-reply","http-failure"] {
+            atomic_json(&dir.path().join("hub-rpc-receipts").join(format!("{}.json",digest(id))),&reply).unwrap();
+        }
+        let good=json!({"id":"durable-reply","kind":"sync","epoch":2,"payload":{"operation":"sync"}});
+        for (queue,bad,expected_calls) in [
+            ("reconcile",json!({"id":"unknown-old-rpc","kind":"open_codex","epoch":2,"payload":{"operation":"open_codex"}}),1),
+            ("jobs",json!({"id":"invalid-action","kind":"action","epoch":2,"payload":{"registration_key":"missing-binding"}}),1),
+            ("reconcile",json!({"id":"http-failure","kind":"sync","epoch":2,"payload":{"operation":"sync"}}),2),
+        ] {
+            received.lock().unwrap().clear();
+            let mut next=json!({"jobs":[],"reconcile":[]});
+            next[queue]=json!([bad,good]);
+            assert_eq!(client.jobs(&next).await.unwrap_err(),"hub_jobs_incomplete");
+            let calls=received.lock().unwrap();
+            assert_eq!(calls.len(),expected_calls);
+            assert_eq!(calls.last().unwrap(),&json!({"job_id":"durable-reply","epoch":2,"response":reply}));
+            assert!(!dir.path().join("hub-rpc-receipts").join(format!("{}.json",digest("unknown-old-rpc"))).exists(),
+                "unknown RPC must not be replayed or falsely acknowledged");
+        }
+        assert!(client.jobs(&json!({"jobs":[],"reconcile":[good]})).await.is_ok());
+        server.abort();
+    }
+
     #[test]
     fn source_loop_watchdog_child_fixture() {
         let Ok(mode) = std::env::var("ITERATE_SOURCE_WATCHDOG_FIXTURE") else { return; };

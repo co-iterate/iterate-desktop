@@ -12,7 +12,7 @@ interface CrossDeviceStatus {
   origin_name?: string
   resolved?: boolean
   local_only?: boolean
-  source_pending?: { response: unknown, request_id: string, project_path: string | null }
+  source_pending?: { response: unknown, request_id: string, project_path: string | null, timeline_route_id?: string | null }
   error?: string
 }
 
@@ -31,7 +31,7 @@ export async function refreshCrossDevice() {
     state.value = await invoke<CrossDeviceStatus>('get_cross_device_status')
     if (state.value.source_pending) {
       const pending = state.value.source_pending
-      await invoke('send_mcp_response', { response: pending.response, requestId: pending.request_id, projectPath: pending.project_path, timelineRouteId: null })
+      await invoke('send_mcp_response', { response: pending.response, requestId: pending.request_id, projectPath: pending.project_path, timelineRouteId: pending.timeline_route_id ?? null })
       await publishCompletedMcpRequest(pending.request_id, pending.project_path)
       // Deferred sources retain their GUI until the HTTP handoff completes.
       // Only close after success; a failed handoff must keep its error window.

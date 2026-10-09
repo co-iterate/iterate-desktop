@@ -5,6 +5,12 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
+pub async fn list_native_conversation_histories() -> Result<Vec<super::manager::NativeHistorySession>, String> {
+    let manager = ConversationManager::new_with_forced_persistence();
+    Ok(manager.list_native_history_sessions().await)
+}
+
+#[tauri::command]
 pub async fn migrate_timeline_image_storage(
     confirmation: String,
 ) -> Result<super::manager::TimelineImageMigrationReport, String> {
@@ -219,7 +225,13 @@ pub async fn get_conversation_path(
             "node_id": node_id,
         }),
     );
-    let path = manager.get_node_path(&tree_id, &node_id).await;
+    let mut path = manager.get_node_path(&tree_id, &node_id).await;
+    if path.is_err() {
+        let persisted = ConversationManager::new_with_forced_persistence();
+        if persisted.list_native_history_sessions().await.iter().any(|session| session.tree_id == tree_id) {
+            path = persisted.get_node_path(&tree_id, &node_id).await;
+        }
+    }
     match &path {
         Ok(nodes) => {
             append_timeline_debug_log(

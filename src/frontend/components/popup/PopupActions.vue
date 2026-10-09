@@ -23,7 +23,7 @@ const props = withDefaults(defineProps<Props>(), {
   loading: false,
   submitting: false,
   canSubmit: false,
-  connectionStatus: '已连接',
+  connectionStatus: '状态待确认',
   continueReplyEnabled: true,
   inputStatusText: '',
 })
@@ -111,7 +111,7 @@ onMounted(() => {
       <!-- 左侧状态信息 -->
       <div class="flex items-center min-w-0 flex-1">
         <div class="flex items-center gap-2 text-xs text-gray-600 min-w-0">
-          <div class="popup-status-dot w-2 h-2 rounded-full" />
+          <div v-if="connectionStatus === '等待调用方接收'" class="popup-status-dot w-2 h-2 rounded-full" />
           <span class="font-medium">{{ connectionStatus }}</span>
           <span class="opacity-60">|</span>
           <span class="opacity-60 truncate">{{ statusText }}</span>

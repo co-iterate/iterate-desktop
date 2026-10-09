@@ -5,7 +5,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useMessage } from 'naive-ui'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { crossDeviceSendError, useCrossDevice } from '../../composables/useCrossDevice'
-import { useMcpDelivery } from '../../composables/useMcpDelivery'
+import { mcpDeliveryError } from '../../composables/useMcpDelivery'
 import { hasOpenModifier } from '../../utils/clickModifiers'
 import CrossDeviceToggle from '../common/CrossDeviceToggle.vue'
 import ThemeIcon from '../common/ThemeIcon.vue'
@@ -75,7 +75,6 @@ const props = withDefaults(defineProps<Props>(), {
 
 const emit = defineEmits<Emits>()
 const message = useMessage()
-const { mcpDeliveryError } = useMcpDelivery()
 const { crossState } = useCrossDevice()
 let suppressNextProjectPathClick = false
 const preventSleepEnabled = ref(false)

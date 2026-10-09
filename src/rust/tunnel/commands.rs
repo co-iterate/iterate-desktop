@@ -1137,7 +1137,7 @@ pub fn configured_formal_mobile_route() -> Option<FormalMobileRouteConfig> {
         if route.schema_version == 1
             && matches!(
                 route.transport.as_str(),
-                "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel"
+                "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel" | "cloud_hub"
             )
             && normalize_formal_mobile_route_base_url(&route.transport, &route.base_url).is_ok()
         {
@@ -1195,9 +1195,9 @@ fn unconfigured_formal_mobile_route_status() -> FormalMobileRouteStatus {
 
 async fn probe_formal_mobile_route(route: &FormalMobileRouteConfig) -> FormalMobileRouteStatus {
     let checked_at = chrono::Utc::now().to_rfc3339();
-    let origin_healthy = manager::check_origin_health().await.unwrap_or(false);
-    let endpoint_identity_ok =
-        origin_healthy && manager::public_endpoint_proves_current_install(&route.base_url).await;
+    let origin_healthy = route.transport=="cloud_hub" || manager::check_origin_health().await.unwrap_or(false);
+    let endpoint_identity_ok = if route.transport=="cloud_hub" {probe_cloud_hub(&route.base_url).await}
+        else {origin_healthy && manager::public_endpoint_proves_current_install(&route.base_url).await};
     let repair_reason = if endpoint_identity_ok {
         None
     } else if !origin_healthy {
@@ -1230,6 +1230,17 @@ pub async fn get_formal_mobile_route_status() -> FormalMobileRouteStatus {
     }
 }
 
+async fn probe_cloud_hub(base_url:&str)->bool {
+    let Ok(client)=build_cloudflare_probe_client() else{return false;};
+    let Ok(response)=client.get(format!("{base_url}/health")).send().await else{return false;};
+    if !response.status().is_success(){return false;}
+    let Ok(value)=response.json::<serde_json::Value>().await else{return false;};
+    if value["service"]!="iterate-hub" || value["protocol"]!=1 || value["status"]!="ok"{return false;}
+    let endpoint=format!("{}/ws",base_url.replacen("https://","wss://",1));
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(5),connect_async(&endpoint)).await,
+        Ok(Err(WsError::Http(response))) if response.status().as_u16()==401)
+}
+
 pub async fn register_formal_mobile_route(
     transport: &str,
     base_url: &str,
@@ -1237,7 +1248,7 @@ pub async fn register_formal_mobile_route(
 ) -> Result<FormalMobileRouteStatus, String> {
     if !matches!(
         transport,
-        "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel"
+        "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel" | "cloud_hub"
     ) {
         return Err("formal_route_transport_not_supported".to_string());
     }
@@ -1248,10 +1259,10 @@ pub async fn register_formal_mobile_route(
         _ => return Err("formal_route_source_invalid".to_string()),
     };
     let base_url = normalize_formal_mobile_route_base_url(transport, base_url)?;
-    if !manager::check_origin_health().await? {
+    if transport!="cloud_hub" && !manager::check_origin_health().await? {
         return Err("bridge_unhealthy".to_string());
     }
-    if !manager::public_endpoint_proves_current_install(&base_url).await {
+    if !(if transport=="cloud_hub"{probe_cloud_hub(&base_url).await}else{manager::public_endpoint_proves_current_install(&base_url).await}) {
         return Err("endpoint_identity_mismatch".to_string());
     }
 
