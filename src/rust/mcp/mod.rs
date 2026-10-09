@@ -1,5 +1,6 @@
 pub mod codex_deeplink;
 pub mod codex_home;
+pub mod conversation_title;
 pub mod commands;
 pub mod handlers;
 pub mod server;

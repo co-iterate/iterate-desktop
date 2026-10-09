@@ -25,6 +25,9 @@ use std::{
     time::Duration as StdDuration,
 };
 
+#[cfg(target_os = "windows")]
+mod windows_broker;
+
 #[cfg(target_os = "macos")]
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(target_os = "macos")]
@@ -515,7 +518,7 @@ fn request_token_from_broker_at(
         .ok_or_else(|| "bridge_auth_broker_response_invalid".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn request_token_from_broker(
     _audience: BridgeTokenAudience,
     _method: &str,
@@ -677,7 +680,12 @@ async fn start_internal_auth_broker_at(socket_path: &Path) -> Result<InternalAut
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(crate) async fn start_internal_auth_broker() -> Result<InternalAuthBroker, String> {
+    windows_broker::start().await
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) async fn start_internal_auth_broker() -> Result<InternalAuthBroker, String> {
     // The signed-code broker is a macOS hardening boundary. Keep other
     // platforms on the 0.5.8 transport behavior until they have an equivalent
@@ -714,8 +722,8 @@ fn desktop_route_allowed(method: &str, path: &str) -> bool {
     matches!(
         (method, path),
         ("GET", "/api/connection-status")
-            | ("GET", "/api/mobile/pairing")
-            | ("GET", "/api/mobile/pairing/status")
+            | ("GET", "/api/android/pairing")
+            | ("GET", "/api/android/pairing/status")
             | ("GET", "/api/mobile/paired-device-file-roots")
             | ("POST", "/api/mobile/paired-device-file-roots")
             | ("GET", "/api/config")
@@ -727,7 +735,7 @@ fn desktop_route_allowed(method: &str, path: &str) -> bool {
             | ("POST", "/api/desktop-codex-live/lease")
             | ("POST", "/api/desktop-codex-live/status")
             | ("GET", "/ws/codex-live")
-    ) || (method == "GET" && path_has_one_nonempty_child(path, "/api/mobile/pairing/sessions/"))
+    ) || (method == "GET" && path_has_one_nonempty_child(path, "/api/android/pairing/sessions/"))
 }
 
 fn internal_route_allowed(method: &str, path: &str) -> bool {
@@ -742,7 +750,7 @@ fn internal_route_allowed(method: &str, path: &str) -> bool {
             | ("GET", "/api/phone-action-result")
             | ("GET", "/api/connection-status")
             | ("GET", "/api/active-sessions")
-            | ("GET", "/api/mobile/pairing/status")
+            | ("GET", "/api/android/pairing/status")
             | ("POST", "/api/apns/notify")
             | ("POST", "/api/recover-tailscale-funnel")
             | ("POST", "/api/restart-service")
@@ -753,7 +761,7 @@ fn internal_route_allowed(method: &str, path: &str) -> bool {
             | ("GET", "/api/prevent-sleep")
             | ("POST", "/api/prevent-sleep")
     ) || (method == "GET"
-        && (path_has_one_nonempty_child(path, "/api/mobile/pairing/sessions/")
+        && (path_has_one_nonempty_child(path, "/api/android/pairing/sessions/")
             || path_has_one_nonempty_child(path, "/api/phone-action-jobs/")))
 }
 
@@ -890,6 +898,24 @@ fn verify_bridge_token_at(
     Ok(claims.audience)
 }
 
+#[cfg(target_os = "windows")]
+fn issue_windows_desktop_bridge_token(method: &str, path: &str) -> Result<String, String> {
+    // A GUI that owns the Bridge already has its process-local key and must
+    // retain the full, existing DesktopRenderer route allowlist. Only the
+    // separate GUI process needs the narrower pairing-only pipe broker.
+    match server_master_key() {
+        Ok(key) => sign_bridge_token_at(
+            key,
+            BridgeTokenAudience::DesktopRenderer,
+            method,
+            path,
+            None,
+            Utc::now(),
+        ),
+        Err(_) => windows_broker::request_desktop_token(method, path),
+    }
+}
+
 pub fn issue_desktop_bridge_token(method: &str, path: &str) -> Result<String, String> {
     #[cfg(test)]
     {
@@ -906,7 +932,11 @@ pub fn issue_desktop_bridge_token(method: &str, path: &str) -> Result<String, St
     {
         request_token_from_broker(BridgeTokenAudience::DesktopRenderer, method, path, None)
     }
-    #[cfg(all(not(test), not(target_os = "macos")))]
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        issue_windows_desktop_bridge_token(method, path)
+    }
+    #[cfg(all(not(test), not(target_os = "macos"), not(target_os = "windows")))]
     {
         sign_bridge_token_at(
             server_master_key()?,
@@ -1360,6 +1390,33 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_bridge_owner_keeps_existing_desktop_routes() {
+        initialize_server_master_key().expect("Bridge owner initializes its process key");
+        for (method, path) in [
+            ("GET", "/ws/codex-live"),
+            ("POST", "/api/desktop-codex-live/lease"),
+            ("GET", "/api/android/pairing"),
+        ] {
+            let token = issue_windows_desktop_bridge_token(method, path)
+                .expect("Bridge owner signs its allowed desktop route locally");
+            assert_eq!(
+                verify_bridge_token_at(
+                    server_master_key().expect("process key"),
+                    &token,
+                    method,
+                    path,
+                    None,
+                    Utc::now(),
+                )
+                .expect("local token verifies"),
+                BridgeTokenAudience::DesktopRenderer,
+            );
+        }
+        assert!(issue_windows_desktop_bridge_token("POST", "/api/restart-service").is_err());
+    }
+
     #[test]
     fn desktop_live_control_capabilities_are_desktop_only_and_method_bound() {
         let now = DateTime::from_timestamp(1_700_000_000, 0).expect("fixed time");
@@ -1621,7 +1678,7 @@ mod tests {
             &test_key(),
             BridgeTokenAudience::DesktopRenderer,
             "GET",
-            "/api/mobile/pairing/sessions/session-1",
+            "/api/android/pairing/sessions/session-1",
             None,
             now,
         )
@@ -1630,7 +1687,16 @@ mod tests {
             &test_key(),
             BridgeTokenAudience::DesktopRenderer,
             "GET",
-            "/api/mobile/pairing/sessions/session-1/escape",
+            "/api/android/pairing/sessions/session-1/escape",
+            None,
+            now,
+        )
+        .is_err());
+        assert!(sign_bridge_token_at(
+            &test_key(),
+            BridgeTokenAudience::DesktopRenderer,
+            "GET",
+            "/api/mobile/pairing/sessions/session-1",
             None,
             now,
         )

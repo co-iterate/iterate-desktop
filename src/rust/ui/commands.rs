@@ -3,7 +3,7 @@ use crate::bridge::ws::{
 };
 use crate::config::{
     load_config, save_config, AppConfig, AppState, CustomPrompt, CustomPromptConfig, ReplyConfig,
-    ShortcutBinding, ShortcutConfig, WindowConfig,
+    PopupPlacement, ShortcutBinding, ShortcutConfig, WindowConfig,
 };
 use crate::constants::{ui, validation, window};
 use crate::conversation::{resolve_tree_route_key, ConversationManager, NodeMetadata, NodeType};
@@ -78,13 +78,48 @@ fn restore_standalone_previous_frontmost_application() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn dismiss_standalone_mcp_window(app: AppHandle) -> Result<(), String> {
+pub async fn dismiss_standalone_mcp_window(app: AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "standalone MCP window not found".to_string())?;
+    let target = window.clone();
+    let (completed, result) = tokio::sync::oneshot::channel();
+    window
+        .run_on_main_thread(move || {
+            let _ = completed.send(hide_mcp_window_on_main_thread(&target));
+        })
+        .map_err(|error| format!("failed to schedule MCP window dismissal: {error}"))?;
+    result
+        .await
+        .map_err(|error| format!("MCP window dismissal was not confirmed: {error}"))?
+}
+
+fn hide_mcp_window_on_main_thread(window: &tauri::WebviewWindow) -> Result<(), String> {
+    crate::ui::popup_tabs::prepare_send_handoff(window)?;
     window
         .hide()
         .map_err(|error| format!("failed to hide standalone MCP window: {error}"))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE};
+
+        // center_window uses SW_SHOWNOACTIVATE for a non-focusing popup. That
+        // native show does not update Tao's VISIBLE flag, so hide() alone can
+        // acknowledge a no-op. Hide the same HWND and confirm before sending.
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("failed to resolve MCP window handle: {error}"))?;
+        unsafe { ShowWindow(hwnd.0, SW_HIDE) };
+        if unsafe { IsWindowVisible(hwnd.0) } != 0 {
+            return Err("MCP window remained visible; response was not sent".to_string());
+        }
+        log::info!(
+            "[MCP dismissal] pid={} window={} hidden=true",
+            std::process::id(),
+            window.label()
+        );
+    }
 
     #[cfg(target_os = "macos")]
     if let Err(error) = restore_standalone_previous_frontmost_application() {
@@ -524,11 +559,32 @@ pub async fn set_window_settings(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    let disable_always_on_top = window_settings.get("focus_popup_on_show")
+        == Some(&serde_json::Value::Bool(false));
     {
         let mut config = state
             .config
             .lock()
             .map_err(|e| format!("获取配置失败: {}", e))?;
+
+        if let Some(placement) = window_settings.get("popup_placement") {
+            config.ui_config.window_config.popup_placement =
+                serde_json::from_value(placement.clone())
+                    .map_err(|e| format!("弹窗位置无效: {}", e))?;
+        }
+        if let Some(mode) = window_settings.get("popup_display_mode") {
+            config.ui_config.window_config.popup_display_mode =
+                serde_json::from_value(mode.clone())
+                    .map_err(|e| format!("显示方式无效: {}", e))?;
+        }
+        if let Some(focus) = window_settings.get("focus_popup_on_show") {
+            config.ui_config.window_config.focus_popup_on_show = focus
+                .as_bool()
+                .ok_or_else(|| "弹窗自动聚焦设置无效".to_string())?;
+            if disable_always_on_top {
+                config.ui_config.always_on_top = false;
+            }
+        }
 
         // 更新窗口配置
         if let Some(fixed) = window_settings.get("fixed").and_then(|v| v.as_bool()) {
@@ -586,6 +642,22 @@ pub async fn set_window_settings(
         .await
         .map_err(|e| format!("保存配置失败: {}", e))?;
 
+    if let Some(mode) = window_settings.get("popup_display_mode") {
+        crate::ui::popup_tabs::set_mode(&app, serde_json::from_value(mode.clone())
+            .map_err(|e| format!("显示方式无效: {}", e))?)?;
+    }
+
+    if disable_always_on_top {
+        if let Some(window) = app.get_webview_window("main") {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            window
+                .set_always_on_top(false)
+                .map_err(|e| format!("取消窗口置顶失败: {}", e))?;
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let _ = window;
+        }
+    }
+
     Ok(())
 }
 
@@ -595,6 +667,10 @@ pub fn ack_mcp_request_ready(
     request_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if crate::codex_questions::ready(request_id.as_deref())
+        || request_id.as_deref().is_some_and(crate::codex_questions::registered) {
+        return Ok(());
+    }
     let route_key = resolve_tree_route_key(request_id.as_deref(), project_path.as_deref())
         .ok_or_else(|| "缺少 request_id/project_path，无法确认 MCP 请求已接收".to_string())?;
 
@@ -733,9 +809,41 @@ pub async fn send_mcp_response(
     state: State<'_, AppState>,
     conversation_manager: State<'_, Arc<ConversationManager>>,
 ) -> Result<(), String> {
+    // Native IDs are registered by the local monitor; isolate them before global MCP state.
+    let native_id = request_id.as_deref().or_else(|| response.pointer("/metadata/request_id").and_then(serde_json::Value::as_str));
+    if let Some(id) = native_id {
+        if crate::codex_questions::registered(id) {
+            return crate::codex_questions::respond(id, &response).await;
+        }
+        if id.starts_with("native-codex:") {
+            return Err("该 CLI 问题路由已失效，不能回答".into());
+        }
+    }
+    // Cross-device requests arbitrate before conversation/checkpoint side effects.
+    let closing = response.as_str() == Some("CANCELLED")
+        || response.pointer("/metadata/source").and_then(serde_json::Value::as_str) == Some("popup_closed");
+    if crate::delivery::get_mcp_delivery_status()? == "returned" {
+        return Err("这条请求已经送达，不能再次提交".to_string());
+    }
+    if !closing { crate::delivery::ensure_connected()?; }
+    if crate::cross_device::submit(&response).await? {
+        return Ok(());
+    }
+    let cross_finalize_guard = crate::cross_device::source_finalize_guard()?;
+    let source_identity = crate::cross_device::source_reply_identity(&response);
+    if cross_finalize_guard.is_some() && source_identity.is_none() {
+        return Err("无法核对跨设备获胜回复的原始请求".into());
+    }
+    if let Some((event_id, _)) = &source_identity {
+        if let Some(metadata) = response.get_mut("metadata").and_then(serde_json::Value::as_object_mut) {
+            metadata.insert("run_id".into(), serde_json::Value::String(event_id.clone()));
+        }
+    }
     let normalized_project_path = normalize_non_empty(project_path.clone());
     let normalized_request_id = normalize_non_empty(request_id.clone());
-    let normalized_timeline_route_id = normalize_non_empty(timeline_route_id.clone());
+    let normalized_timeline_route_id = source_identity
+        .map(|(_, route)| route)
+        .or_else(|| normalize_non_empty(timeline_route_id.clone()));
     let metadata_request_id = extract_response_request_id(&response);
     let effective_request_id = normalized_request_id
         .clone()
@@ -767,6 +875,24 @@ pub async fn send_mcp_response(
     // 检查是否为MCP模式
     let args: Vec<String> = std::env::args().collect();
     let is_mcp_mode = args.len() >= 3 && args[1] == "--mcp-request";
+    let mut response_file_claim = if (is_standalone_mode || is_mcp_mode)
+        && cross_finalize_guard.is_none()
+    {
+        std::env::var_os("ITERATE_RESPONSE_FILE")
+            .map(|path| {
+                crate::delivery::ResponseFileClaim::acquire(std::path::Path::new(&path))
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            "这条请求已从其他端提交".to_string()
+                        } else {
+                            format!("无法占用回复通道: {error}")
+                        }
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let route_key = resolve_tree_route_key(
         effective_request_id.as_deref(),
         normalized_project_path.as_deref(),
@@ -877,9 +1003,19 @@ pub async fn send_mcp_response(
 
         // 如果设置了 ITERATE_RESPONSE_FILE，同时写入文件（--serve 模式需要）
         if let Ok(response_file) = std::env::var("ITERATE_RESPONSE_FILE") {
-            std::fs::write(&response_file, &response_str)
-                .map_err(|e| format!("写入响应文件失败: {}", e))?;
+            if cross_finalize_guard.is_some() {
+                crate::cross_device::publish_source_response(std::path::Path::new(&response_file), &response)?;
+            } else {
+                crate::delivery::publish_claimed_response_file(
+                    std::path::Path::new(&response_file), &response_str,
+                )
+                    .map_err(|e| format!("写入响应文件失败: {}", e))?;
+                if let Some(claim) = response_file_claim.as_mut() {
+                    claim.commit();
+                }
+            }
         }
+        if !closing { crate::delivery::wait_for_handoff().await?; }
         // 对话已结束，通知主进程清除 MCP_STATE_CACHE（子进程内存与主进程隔离）
         // 这里必须等待请求返回；standalone 子进程退出很快，fire-and-forget 会导致清理丢失。
         if let Some(ref rid) = effective_request_id {
@@ -1590,17 +1726,14 @@ pub(crate) async fn record_user_response_node(
         source: Some(source.to_string()),
     };
 
-    let node_id = match manager
-        .add_node(
-            &tree_id,
-            parent_id.clone(),
-            NodeType::User,
-            content,
-            false,
-            metadata,
-        )
-        .await
-    {
+    let node_result = if metadata.run_id.as_deref().is_some_and(|id| id.starts_with("cross-device-reply:")) {
+        manager.add_node_for_event(&tree_id, NodeType::User, content, metadata)
+            .await.map(|outcome| outcome.node_id)
+    } else {
+        manager.add_node(&tree_id, parent_id.clone(), NodeType::User, content, false, metadata)
+            .await
+    };
+    let node_id = match node_result {
         Ok(node_id) => node_id,
         Err(err) => {
             append_timeline_debug_log(
@@ -1962,7 +2095,10 @@ pub fn read_mcp_request(file_path: String) -> Result<serde_json::Value, String> 
                 return Err("文件内容为空".to_string());
             }
             match serde_json::from_str(&content) {
-                Ok(json) => Ok(json),
+                Ok(mut json) => {
+                    crate::mcp::conversation_title::normalize_local_request(&mut json);
+                    Ok(json)
+                },
                 Err(e) => Err(format!("解析JSON失败: {}", e)),
             }
         }
@@ -2100,15 +2236,13 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn open_local_path(
+    app: AppHandle,
     path: String,
     project_path: String,
     prefer_editor: Option<bool>,
 ) -> Result<(), String> {
-    use std::process::Command;
-
     let target = resolve_local_open_target(&path, &project_path)?;
     let metadata = std::fs::metadata(&target.path).map_err(|e| format!("读取文件失败: {}", e))?;
-    let resolved_path_string = target.path.to_string_lossy().to_string();
 
     if prefer_editor.unwrap_or(false) && metadata.is_file() {
         if open_local_target_in_editor(&target).is_ok() {
@@ -2116,47 +2250,79 @@ pub async fn open_local_path(
         }
     }
 
-    let result = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "start", "", &resolved_path_string])
-            .without_console_window()
-            .spawn()
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        if metadata.is_file() {
-            command.arg("-R");
-        }
-        command.arg(&target.path).spawn()
-    } else {
-        Command::new("xdg-open").arg(&target.path).spawn()
-    };
+    #[cfg(target_os = "windows")]
+    {
+        open_windows_local_path(&app, &target.path)
+            .map_err(|e| format!("无法打开本地文件: {}", e))
+    }
 
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("无法打开本地文件: {}", e)),
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let _ = app;
+        let result = if cfg!(target_os = "macos") {
+            let mut command = Command::new("open");
+            if metadata.is_file() {
+                command.arg("-R");
+            }
+            command.arg(&target.path).spawn()
+        } else {
+            Command::new("xdg-open").arg(&target.path).spawn()
+        };
+
+        result.map(|_| ()).map_err(|e| format!("无法打开本地文件: {}", e))
     }
 }
 
 #[tauri::command]
-pub async fn open_confirmed_external_file(path: String) -> Result<(), String> {
-    use std::process::Command;
-
+pub async fn open_confirmed_external_file(app: AppHandle, path: String) -> Result<(), String> {
     let target = resolve_confirmed_external_file_target(&path)?;
-    let resolved_path_string = target.to_string_lossy().to_string();
 
-    let result = if cfg!(target_os = "windows") {
-        Command::new("explorer").arg(&resolved_path_string).spawn()
-    } else if cfg!(target_os = "macos") {
-        Command::new("open")
-            .args(["-R", &resolved_path_string])
-            .spawn()
+    #[cfg(target_os = "windows")]
+    {
+        open_windows_local_path(&app, &target)
+            .map_err(|e| format!("无法打开跨项目文件或文件夹: {}", e))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let _ = app;
+        let result = if cfg!(target_os = "macos") {
+            let mut command = Command::new("open");
+            if target.is_file() {
+                command.arg("-R");
+            }
+            command.arg(&target).spawn()
+        } else {
+            Command::new("xdg-open").arg(&target).spawn()
+        };
+
+        result.map(|_| ()).map_err(|e| {
+            format!("无法在文件管理器中打开跨项目文件或文件夹: {}", e)
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_local_path(app: &AppHandle, path: &std::path::Path) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+
+    // The installed shell plugin enables open's shellexecute-on-windows feature:
+    // its default opener calls ShellExecuteExW without a command interpreter.
+    #[allow(deprecated)]
+    app.shell()
+        .open(windows_explorer_path(&path.to_string_lossy()), None)
+        .map_err(|e| e.to_string())
+}
+
+// canonicalize() returns extended-length Windows paths; the shell expects shell paths.
+fn windows_explorer_path(path: &str) -> String {
+    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", unc_path)
     } else {
-        Command::new("xdg-open").arg(&target).spawn()
-    };
-
-    result
-        .map(|_| ())
-        .map_err(|e| format!("无法在 Finder 中定位跨项目文件: {}", e))
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
 }
 
 #[tauri::command]
@@ -3807,10 +3973,35 @@ pub async fn open_in_ide(project_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 在当前活动工作区显示窗口（跟随当前页面）
-/// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
-#[tauri::command]
-pub async fn center_window(app: AppHandle) -> Result<(), String> {
+fn popup_window_coordinates(
+    placement: PopupPlacement,
+    work_x: i32,
+    work_y: i32,
+    work_width: i32,
+    work_height: i32,
+    window_width: i32,
+    window_height: i32,
+    left_margin: i32,
+) -> (i32, i32) {
+    let available_width = (work_width - window_width).max(0);
+    let x = work_x
+        + match placement {
+            PopupPlacement::Left => left_margin.min(available_width),
+            PopupPlacement::Center => available_width / 2,
+        };
+    let y = work_y + (work_height - window_height).max(0) / 2;
+    (x, y)
+}
+
+fn place_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    let placement = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map_err(|e| format!("获取配置失败: {}", e))?
+        .ui_config
+        .window_config
+        .popup_placement;
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "未找到主窗口".to_string())?;
@@ -3831,26 +4022,97 @@ pub async fn center_window(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("获取窗口尺寸失败: {}", e))?;
     let work_area = target_monitor.work_area();
 
-    let centered_x =
-        work_area.position.x + ((work_area.size.width as i32 - window_size.width as i32) / 2);
-    let centered_y =
-        work_area.position.y + ((work_area.size.height as i32 - window_size.height as i32) / 2);
+    let left_margin = (24.0 * target_monitor.scale_factor()).round() as i32;
+    let (x, y) = popup_window_coordinates(
+        placement,
+        work_area.position.x,
+        work_area.position.y,
+        work_area.size.width as i32,
+        work_area.size.height as i32,
+        window_size.width as i32,
+        window_size.height as i32,
+        left_margin,
+    );
 
     window
         .set_position(Position::Physical(PhysicalPosition::new(
-            centered_x, centered_y,
+            x, y,
         )))
         .map_err(|e| format!("设置窗口位置失败: {}", e))?;
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    window
-        .unminimize()
-        .map_err(|e| format!("恢复窗口失败: {}", e))?;
-    window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
-    window
-        .set_focus()
-        .map_err(|e| format!("聚焦窗口失败: {}", e))?;
+
+    Ok(window)
+}
+
+/// 按已保存的弹窗位置调整窗口，不改变窗口可见性、最小化状态或焦点。
+#[tauri::command]
+pub fn position_window_left(app: AppHandle) -> Result<(), String> {
+    place_main_window(&app).map(|_| ())
+}
+
+/// 按已保存的位置在鼠标所在屏幕的工作区显示窗口。
+/// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
+#[tauri::command]
+pub async fn center_window(app: AppHandle) -> Result<(), String> {
+    if !crate::ui::popup_tabs::should_present_current()? {
+        return Ok(());
+    }
+    let window = place_main_window(&app)?;
+    let focus_on_show = app.state::<AppState>()
+        .config
+        .lock()
+        .map_err(|e| format!("获取配置失败: {}", e))?
+        .ui_config
+        .window_config
+        .focus_popup_on_show;
+
+    if focus_on_show {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        window
+            .unminimize()
+            .map_err(|e| format!("恢复窗口失败: {}", e))?;
+        window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
+        window
+            .set_focus()
+            .map_err(|e| format!("聚焦窗口失败: {}", e))?;
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            crate::ui::popup_presentation::show_behind_existing(&window)?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod popup_placement_tests {
+    use super::{popup_window_coordinates, PopupPlacement};
+
+    #[test]
+    fn left_and_center_use_selected_monitor_work_area() {
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Left, 1920, 40, 1280, 900, 600, 700, 24),
+            (1944, 140)
+        );
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Center, 1920, 40, 1280, 900, 600, 700, 24),
+            (2260, 140)
+        );
+    }
+
+    #[test]
+    fn placement_keeps_oversized_window_at_work_area_origin() {
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Left, -1920, 0, 700, 500, 900, 700, 24),
+            (-1920, 0)
+        );
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Center, -1920, 0, 700, 500, 900, 700, 24),
+            (-1920, 0)
+        );
+    }
 }
 
 #[tauri::command]
@@ -4318,6 +4580,19 @@ fn normalize_local_file_path(path: &str) -> String {
         decoded = next;
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let bytes = decoded.as_bytes();
+        // URL-style /C:/... is not a valid Win32 absolute filename.
+        if bytes.len() >= 4
+            && matches!(bytes[0], b'/' | b'\\')
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+            && matches!(bytes[3], b'/' | b'\\')
+        {
+            decoded.remove(0);
+        }
+    }
     decoded
 }
 
@@ -4412,6 +4687,18 @@ fn has_dangerous_local_open_extension(path: &Path) -> bool {
         extension.as_str(),
         "app" | "command" | "terminal" | "exe" | "bat" | "cmd" | "com" | "scr" | "ps1"
     )
+        // Windows default associations can execute scripts, follow shortcuts or
+        // install packages even though these files have no executable permission bit.
+        || (cfg!(target_os = "windows")
+            && matches!(
+                extension.as_str(),
+                "vbs" | "vbe" | "js" | "jse" | "wsf" | "wsh" | "hta"
+                    | "lnk" | "url" | "pif" | "scf" | "appref-ms"
+                    | "msi" | "msp" | "msu" | "application" | "appinstaller"
+                    | "appx" | "appxbundle" | "msix" | "msixbundle"
+                    | "cpl" | "msc" | "reg" | "diagcab"
+                    | "py" | "pyw" | "pyc" | "pyo"
+            ))
 }
 
 #[cfg(unix)]
@@ -4498,8 +4785,8 @@ fn resolve_confirmed_external_file_target(path: &str) -> Result<PathBuf, String>
     let metadata =
         std::fs::metadata(&canonical_path).map_err(|e| format!("读取文件失败: {}", e))?;
 
-    if !metadata.is_file() {
-        return Err("跨项目仅支持在 Finder 中定位普通文件".to_string());
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("跨项目仅支持普通文件或文件夹".to_string());
     }
 
     if has_dangerous_local_open_extension(&canonical_path) || is_executable_file(&metadata) {
@@ -4566,6 +4853,22 @@ mod local_file_path_tests {
         normalize_local_file_path, read_file_base64, resolve_confirmed_external_file_target,
         resolve_local_open_path, resolve_local_open_target,
     };
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolves_windows_url_style_drive_paths() {
+        let root = std::env::temp_dir().join(format!("iterate-drive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("中文 screenshot & %TEMP%.png");
+        std::fs::write(&file, b"path normalization fixture").unwrap();
+        let drive_path = file.to_string_lossy().replace('\\', "/");
+        for input in [drive_path.clone(), format!("/{drive_path}"), format!("file:///{drive_path}")] {
+            let target = resolve_local_open_target(&input, &root.to_string_lossy()).unwrap();
+            assert_eq!(target.path, file.canonicalize().unwrap());
+        }
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn normalizes_encoded_local_image_paths() {
@@ -4717,18 +5020,86 @@ mod local_file_path_tests {
     }
 
     #[test]
-    fn rejects_confirmed_external_directory() {
+    fn resolves_confirmed_external_directory() {
         let directory = std::env::temp_dir().join(format!(
-            "iterate-confirmed-external-dir-{}",
+            "iterate-confirmed-external-dir-中文 空格-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&directory).expect("create external directory");
 
-        let error = resolve_confirmed_external_file_target(&directory.to_string_lossy())
-            .expect_err("external directory should be rejected");
+        let resolved = resolve_confirmed_external_file_target(&directory.to_string_lossy())
+            .expect("external directory should resolve");
 
-        assert!(error.contains("普通文件"));
+        assert_eq!(resolved, directory.canonicalize().expect("canonical directory"));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn normalizes_windows_explorer_paths() {
+        assert_eq!(super::windows_explorer_path(r"\\?\C:\中文 空格\folder"), r"C:\中文 空格\folder");
+        assert_eq!(super::windows_explorer_path(r"\\?\C:\中文 空格 & %TEMP%\file.txt"), r"C:\中文 空格 & %TEMP%\file.txt");
+        assert_eq!(super::windows_explorer_path(r"\\?\UNC\server\share\folder"), r"\\server\share\folder");
+        assert_eq!(super::windows_explorer_path(r"C:\folder"), r"C:\folder");
+    }
+
+    #[test]
+    fn rejects_confirmed_external_executable() {
+        let file = std::env::temp_dir().join(format!("iterate-external-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"test").expect("write executable fixture");
+        let error = resolve_confirmed_external_file_target(&file.to_string_lossy())
+            .expect_err("executable should remain rejected");
+        assert!(error.contains("可执行文件"));
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rejects_windows_execution_associations_before_local_or_external_open() {
+        let root = tempfile::tempdir().expect("create isolated resolver fixtures");
+        let execution_categories: &[(&str, &[&str])] = &[
+            ("Windows Script Host", &["vbs", "vbe", "js", "jse", "wsf", "wsh"]),
+            ("HTML application", &["hta"]),
+            ("shortcuts", &["lnk", "url", "pif", "scf", "appref-ms"]),
+            ("installers", &["msi", "msp", "msu", "application", "appinstaller", "appx", "appxbundle", "msix", "msixbundle"]),
+            ("system actions", &["cpl", "msc", "reg", "diagcab"]),
+            ("Python handlers", &["py", "pyw", "pyc", "pyo"]),
+        ];
+
+        for &(category, extensions) in execution_categories {
+            for extension in extensions {
+                for spelling in [extension.to_string(), extension.to_ascii_uppercase()] {
+                    let file = root.path().join(format!("禁止运行 中文 空格 & %TEMP%.{spelling}"));
+                    // These fixtures are only canonicalized and classified, never opened.
+                    std::fs::write(&file, b"resolver-only fixture").expect("write inert fixture");
+                    let local_error = resolve_local_open_target(
+                        &file.to_string_lossy(),
+                        &root.path().to_string_lossy(),
+                    ).expect_err("local resolver must reject executable associations");
+                    let external_error = resolve_confirmed_external_file_target(&file.to_string_lossy())
+                        .expect_err("external resolver must reject executable associations");
+                    assert!(local_error.contains("可执行文件"), "{category}: {spelling}");
+                    assert!(external_error.contains("可执行文件"), "{category}: {spelling}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_execution_protection_preserves_ordinary_documents() {
+        let root = tempfile::tempdir().expect("create ordinary document fixtures");
+        for extension in ["txt", "md", "png", "pdf", "json", "zip"] {
+            let file = root.path().join(format!("中文 空格 & %TEMP%.{extension}"));
+            std::fs::write(&file, b"resolver-only ordinary document").expect("write fixture");
+            assert!(resolve_local_open_target(&file.to_string_lossy(), &root.path().to_string_lossy()).is_ok());
+            assert!(resolve_confirmed_external_file_target(&file.to_string_lossy()).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_confirmed_external_relative_path() {
+        assert!(resolve_confirmed_external_file_target("relative-folder")
+            .unwrap_err().contains("绝对路径"));
     }
 
     #[cfg(unix)]
@@ -4757,12 +5128,22 @@ mod local_file_path_tests {
 
 /// 保存提示词库到文件（供 Bridge Server API 读取）
 #[tauri::command]
-pub fn save_prompt_library_file(content: String) -> Result<(), String> {
+pub fn save_prompt_library_file(content: String, expected_items: Option<serde_json::Value>) -> Result<(), String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = std::path::Path::new(&home).join(".cunzhi");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
     let path = dir.join("prompt-library.json");
-    std::fs::write(&path, &content).map_err(|e| format!("写入失败: {}", e))
+    let current: serde_json::Value = serde_json::from_str(&load_prompt_library_file()?).map_err(|e| e.to_string())?;
+    if expected_items.as_ref() != Some(&current["items"]) {
+        return Err("提示词库已改变，请重新加载后重试；本机内容未覆盖".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir).map_err(|e| e.to_string())?;
+    serde_json::to_writer_pretty(&mut temp, &value).map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 读取提示词库文件（跨进程共享源）
@@ -4845,12 +5226,13 @@ pub fn get_speech_muscle_memory_entries() -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub fn save_speech_muscle_memory_entries(
     entries: serde_json::Value,
+    expected_entries: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let array = entries
         .as_array()
         .cloned()
         .ok_or_else(|| "entries 必须是数组".to_string())?;
-    let saved = speech_memory::save_entries(array)?;
+    let saved = speech_memory::save_entries_checked(array, expected_entries)?;
     Ok(serde_json::Value::Array(saved))
 }
 

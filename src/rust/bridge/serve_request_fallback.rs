@@ -8,6 +8,31 @@ const SERVE_REQUEST_MAX_BYTES: u64 = 1024 * 1024;
 const SERVE_ROUTE_MAX_BYTES: u64 = 16 * 1024;
 const CLOCK_SKEW_ALLOWANCE_SECS: i64 = 5 * 60;
 
+// Only separator spelling in ordinary Windows drive-absolute paths may differ.
+// Keep case, components, prefixes and relative paths exact; Unix '/' and '\\'
+// are different characters. This comparison does not resolve filesystem aliases.
+pub(super) fn local_project_paths_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let drive_absolute = |path: &str| {
+            let bytes = path.as_bytes();
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'/' | b'\\')
+        };
+        let separator = |byte| if byte == b'/' { b'\\' } else { byte };
+        return drive_absolute(left)
+            && drive_absolute(right)
+            && left.bytes().map(separator).eq(right.bytes().map(separator));
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
 #[derive(Debug)]
 pub(super) struct ServeRequestFallback {
     pub(super) payload: serde_json::Value,
@@ -47,6 +72,8 @@ struct ServeResponseRoute {
     project_path: String,
     response_file: PathBuf,
     created_at: i64,
+    #[serde(default)]
+    original_created_at: Option<i64>,
 }
 
 pub(super) fn load_live_serve_request_fallback(
@@ -80,7 +107,7 @@ fn load_live_serve_request_fallback_from_dir(
 
     let live_binding = instances.iter().find(|instance| {
         instance.request_id.as_deref().map(str::trim) == Some(request_id)
-            && instance.project_path.trim() == project_path
+            && local_project_paths_match(instance.project_path.trim(), project_path)
     });
     let Some(live_binding) = live_binding else {
         return Err(ServeRequestFallbackMiss::NoLiveWindowBinding);
@@ -96,13 +123,17 @@ fn load_live_serve_request_fallback_from_dir(
         .map_err(|_| ServeRequestFallbackMiss::InvalidRouteFile)?;
 
     let route_age_secs = now_unix_secs.saturating_sub(route.created_at);
+    let original_created_at = route.original_created_at.unwrap_or(route.created_at);
     if route.created_at > now_unix_secs.saturating_add(CLOCK_SKEW_ALLOWANCE_SECS) {
+        return Err(ServeRequestFallbackMiss::StaleRoute);
+    }
+    if original_created_at > route.created_at {
         return Err(ServeRequestFallbackMiss::StaleRoute);
     }
 
     let expected_response_path = temp_dir.join(format!("iterate_response_{request_id}.json"));
     if route.request_id.trim() != request_id
-        || route.project_path.trim() != project_path
+        || !local_project_paths_match(route.project_path.trim(), project_path)
         || route.response_file != expected_response_path
     {
         return Err(ServeRequestFallbackMiss::RouteMismatch);
@@ -111,7 +142,7 @@ fn load_live_serve_request_fallback_from_dir(
     let registered_at = chrono::DateTime::parse_from_rfc3339(&live_binding.registered_at)
         .map_err(|_| ServeRequestFallbackMiss::NoLiveWindowBinding)?
         .timestamp();
-    if registered_at.saturating_sub(route.created_at).abs() > CLOCK_SKEW_ALLOWANCE_SECS {
+    if registered_at.saturating_sub(original_created_at).abs() > CLOCK_SKEW_ALLOWANCE_SECS {
         return Err(ServeRequestFallbackMiss::NoLiveWindowBinding);
     }
 
@@ -127,8 +158,7 @@ fn load_live_serve_request_fallback_from_dir(
         && request
             .get("project_path")
             .and_then(|value| value.as_str())
-            .map(str::trim)
-            == Some(project_path)
+            .is_some_and(|path| local_project_paths_match(path.trim(), project_path))
         && request
             .get("message")
             .and_then(|value| value.as_str())
@@ -148,9 +178,18 @@ fn load_live_serve_request_fallback_from_dir(
 }
 
 fn is_serve_request_id(request_id: &str) -> bool {
-    request_id.strip_prefix("serve-").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.len() <= 20 && suffix.bytes().all(|b| b.is_ascii_digit())
-    })
+    let Some(suffix) = request_id.strip_prefix("serve-") else {
+        return false;
+    };
+    if !suffix.is_empty() && suffix.len() <= 20 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let Some((timestamp, uuid)) = suffix.split_once('-') else {
+        return false;
+    };
+    timestamp.len() == 13
+        && timestamp.bytes().all(|b| b.is_ascii_digit())
+        && uuid::Uuid::parse_str(uuid).is_ok()
 }
 
 fn validate_secure_temp_directory(temp_dir: &Path) -> Result<(), ServeRequestFallbackMiss> {
@@ -311,6 +350,103 @@ mod tests {
     }
 
     #[test]
+    fn loads_current_serve_request_id_with_uuid() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1790436233047-8218c42c-7a73-452d-a8a2-5a8ec969e763";
+        let project_path = "/tmp/iterate-desktop";
+        write_fixture(temp_dir.path(), request_id, project_path, NOW);
+        let fallback = load_live_serve_request_fallback_from_dir(
+            temp_dir.path(),
+            request_id,
+            project_path,
+            &[window_instance(request_id, project_path)],
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(fallback.payload["request"]["id"], request_id);
+    }
+
+    #[test]
+    fn project_identity_does_not_merge_case_components_prefixes_or_relative_paths() {
+        assert!(local_project_paths_match("E:/Github/iterate-desktop", "E:/Github/iterate-desktop"));
+        for other in [
+            "E:/Github/other", "E:/Github/iterate-desktop-old", "e:/Github/iterate-desktop",
+            "E:/github/iterate-desktop", "E:/Github/./iterate-desktop",
+            "E:/Github/child/../iterate-desktop", "E:/Github/iterate-desktop/",
+            r"\\?\E:\Github\iterate-desktop", "Github/iterate-desktop",
+        ] {
+            assert!(!local_project_paths_match("E:/Github/iterate-desktop", other), "{other}");
+        }
+        assert!(!local_project_paths_match("Github/iterate-desktop", r"Github\iterate-desktop"));
+        assert!(!local_project_paths_match("E:Github/iterate-desktop", r"E:Github\iterate-desktop"));
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!local_project_paths_match("E:/Github/iterate-desktop", r"E:\Github\iterate-desktop"));
+            assert!(!local_project_paths_match("/tmp/project", r"\tmp\project"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn loads_windows_route_with_mixed_separators_at_each_identity_check() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1790913331998-e8e52f66-620c-4589-a59f-4bc6fd6820f3";
+        let forward = "E:/Github/iterate-desktop";
+        let backward = r"E:\Github\iterate-desktop";
+        for (target, live, route, request) in [
+            (backward, forward, forward, forward),
+            (forward, backward, forward, forward),
+            (forward, forward, backward, forward),
+            (forward, forward, forward, backward),
+        ] {
+            write_fixture(temp_dir.path(), request_id, route, NOW);
+            let request_path = temp_dir.path().join(format!("iterate_request_{request_id}.json"));
+            let mut payload: serde_json::Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+            payload["project_path"] = serde_json::json!(request);
+            fs::write(request_path, serde_json::to_vec(&payload).unwrap()).unwrap();
+            let loaded = load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, target, &[window_instance(request_id, live)], NOW,
+            ).unwrap();
+            assert_eq!(loaded.payload["request"], payload);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mixed_separators_still_require_exact_request_and_project_at_each_source() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1790913331998-e8e52f66-620c-4589-a59f-4bc6fd6820f3";
+        let forward = "E:/Github/iterate-desktop";
+        let backward = r"E:\Github\iterate-desktop";
+        write_fixture(temp_dir.path(), request_id, forward, NOW);
+        for live in [window_instance("serve-1790913331999", backward), window_instance(request_id, r"E:\Github\other")] {
+            assert_eq!(load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, backward, &[live], NOW,
+            ).unwrap_err(), ServeRequestFallbackMiss::NoLiveWindowBinding);
+        }
+        let route_path = temp_dir.path().join(format!("iterate_response_route_{request_id}.json"));
+        for (field, value) in [("request_id", "serve-1790913331999"), ("project_path", "E:/Github/other")] {
+            write_fixture(temp_dir.path(), request_id, forward, NOW);
+            let mut route: serde_json::Value = serde_json::from_slice(&fs::read(&route_path).unwrap()).unwrap();
+            route[field] = serde_json::json!(value);
+            fs::write(&route_path, serde_json::to_vec(&route).unwrap()).unwrap();
+            assert_eq!(load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, backward, &[window_instance(request_id, backward)], NOW,
+            ).unwrap_err(), ServeRequestFallbackMiss::RouteMismatch);
+        }
+        let request_path = temp_dir.path().join(format!("iterate_request_{request_id}.json"));
+        for (field, value) in [("id", "serve-1790913331999"), ("project_path", "E:/Github/other")] {
+            write_fixture(temp_dir.path(), request_id, forward, NOW);
+            let mut request: serde_json::Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+            request[field] = serde_json::json!(value);
+            fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+            assert_eq!(load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, backward, &[window_instance(request_id, backward)], NOW,
+            ).unwrap_err(), ServeRequestFallbackMiss::RequestMismatch);
+        }
+    }
+
+    #[test]
     fn rejects_non_serve_request_ids() {
         let temp_dir = private_temp_dir();
         let result = load_live_serve_request_fallback_from_dir(
@@ -321,6 +457,16 @@ mod tests {
             NOW,
         );
         assert_eq!(result.unwrap_err(), ServeRequestFallbackMiss::InvalidRoute);
+        for request_id in [
+            "serve-1790436233047-../../secret",
+            "serve-1790436233047-not-a-uuid",
+            "serve-1790436233047-8218c42c-7a73-452d-a8a2-5a8ec969e763/evil",
+        ] {
+            let result = load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, "/tmp/cunzhi", &[], NOW,
+            );
+            assert_eq!(result.unwrap_err(), ServeRequestFallbackMiss::InvalidRoute);
+        }
     }
 
     #[test]
@@ -414,6 +560,37 @@ mod tests {
 
         assert_eq!(fallback.payload["request"]["id"], request_id);
         assert_eq!(fallback.age_ms, 24 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn renewed_route_still_matches_original_window_creation_time() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1786277363180";
+        let project_path = "/tmp/cunzhi";
+        let original_created_at = NOW - 24 * 60 * 60;
+        write_fixture(temp_dir.path(), request_id, project_path, NOW);
+        let route_path = temp_dir.path().join(format!("iterate_response_route_{request_id}.json"));
+        let mut route: serde_json::Value = serde_json::from_slice(&fs::read(&route_path).unwrap()).unwrap();
+        route["original_created_at"] = serde_json::json!(original_created_at);
+        fs::write(&route_path, serde_json::to_vec(&route).unwrap()).unwrap();
+        let mut live_window = window_instance(request_id, project_path);
+        live_window.registered_at = chrono::DateTime::from_timestamp(original_created_at, 0)
+            .unwrap().to_rfc3339();
+
+        let fallback = load_live_serve_request_fallback_from_dir(
+            temp_dir.path(), request_id, project_path, &[live_window.clone()], NOW,
+        ).unwrap();
+        assert_eq!(fallback.payload["request"]["id"], request_id);
+        assert_eq!(fallback.age_ms, 0);
+
+        live_window.registered_at = chrono::DateTime::from_timestamp(NOW, 0)
+            .unwrap().to_rfc3339();
+        assert_eq!(
+            load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, project_path, &[live_window], NOW,
+            ).unwrap_err(),
+            ServeRequestFallbackMiss::NoLiveWindowBinding,
+        );
     }
 
     #[test]

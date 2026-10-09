@@ -6,6 +6,9 @@ import { computed, onScopeDispose, ref } from 'vue'
  * 自定义快捷键管理
  */
 export function useShortcuts() {
+  const refreshSyncedShortcuts = () => { void loadShortcutConfig() }
+  window.addEventListener('iterate:settings-synced', refreshSyncedShortcuts)
+  onScopeDispose(() => window.removeEventListener('iterate:settings-synced', refreshSyncedShortcuts))
   const shortcutConfig = ref<ShortcutConfig>({
     shortcuts: {},
   })

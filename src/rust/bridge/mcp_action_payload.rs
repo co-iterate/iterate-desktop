@@ -138,7 +138,7 @@ fn append_goal_selected_options_context(goal_text: &str, selected_options: &[Str
     }
 }
 
-pub(super) fn build_goal_payload_parts(
+pub(crate) fn build_goal_payload_parts(
     payload: &serde_json::Value,
 ) -> (String, String, serde_json::Value) {
     let cleaned_input = strip_goal_image_reference_context(
@@ -201,7 +201,7 @@ pub(super) fn render_goal_submit_prompt(goal: &str, template: &str) -> String {
     )
 }
 
-pub(super) fn build_goal_submit_prompt(goal: &str) -> String {
+pub(crate) fn build_goal_submit_prompt(goal: &str) -> String {
     let template = crate::config::load_standalone_config()
         .map(|config| config.reply_config.goal_prompt_template)
         .unwrap_or_else(|_| crate::constants::mcp::DEFAULT_GOAL_PROMPT_TEMPLATE.to_string());

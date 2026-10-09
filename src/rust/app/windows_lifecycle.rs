@@ -114,17 +114,37 @@ pub fn activate_manual_launch_if_requested(args: &[String]) -> anyhow::Result<()
             return Ok(());
         }
 
-        if is_manually_stopped() {
-            let _ = terminate_registered_instances(Duration::ZERO, None);
-        }
-        reset_shutdown_event()?;
-        match std::fs::remove_file(manual_stop_path()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
+        reactivate_after_manual_stop()
     }
+}
+
+/// Allow an explicit foreground MCP request to summon iterate again after the
+/// user closed every window. Closing still stops the current processes; the
+/// next interaction is the new explicit activation signal.
+pub fn activate_mcp_launch() -> anyhow::Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        reactivate_after_manual_stop()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reactivate_after_manual_stop() -> anyhow::Result<()> {
+    if is_manually_stopped() {
+        let _ = terminate_registered_instances(Duration::ZERO, None);
+    }
+    reset_shutdown_event()?;
+    match std::fs::remove_file(manual_stop_path()) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 pub fn request_global_shutdown() -> anyhow::Result<()> {

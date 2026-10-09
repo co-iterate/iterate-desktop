@@ -1097,12 +1097,49 @@ pub async fn check_origin_health() -> Result<bool, String> {
     manager::check_origin_health().await
 }
 
+fn publicly_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !matches!(a, 0 | 10 | 127 | 224..=255)
+        && !(a == 100 && (64..=127).contains(&b))
+        && !(a == 169 && b == 254)
+        && !(a == 172 && (16..=31).contains(&b))
+        && !(a == 192 && ((b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99) || b == 168))
+        && !(a == 198 && ((b == 18 || b == 19) || (b == 51 && c == 100)))
+        && !(a == 203 && b == 0 && c == 113)
+}
+
+pub(crate) fn aliyun_ip_origin_is_public(value: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(value.trim().trim_end_matches('/')) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed
+            .host_str()
+            .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+            .is_some_and(publicly_routable_ipv4)
+}
+
+fn normalize_formal_mobile_route_base_url(transport: &str, value: &str) -> Result<String, String> {
+    if transport == "aliyun_ssh_reverse_tunnel" && !aliyun_ip_origin_is_public(value) {
+        return Err("formal_route_ip_origin_invalid".to_string());
+    }
+    manager::normalize_public_hostname(value)
+}
+
 pub fn configured_formal_mobile_route() -> Option<FormalMobileRouteConfig> {
     let config = load_standalone_config().ok()?;
     if let Some(route) = config.mobile_config.formal_route {
         if route.schema_version == 1
-            && route.transport == "cloudflare_named_tunnel"
-            && manager::normalize_public_hostname(&route.base_url).is_ok()
+            && matches!(
+                route.transport.as_str(),
+                "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel" | "cloud_hub"
+            )
+            && normalize_formal_mobile_route_base_url(&route.transport, &route.base_url).is_ok()
         {
             return Some(route);
         }
@@ -1158,9 +1195,9 @@ fn unconfigured_formal_mobile_route_status() -> FormalMobileRouteStatus {
 
 async fn probe_formal_mobile_route(route: &FormalMobileRouteConfig) -> FormalMobileRouteStatus {
     let checked_at = chrono::Utc::now().to_rfc3339();
-    let origin_healthy = manager::check_origin_health().await.unwrap_or(false);
-    let endpoint_identity_ok =
-        origin_healthy && manager::public_endpoint_proves_current_install(&route.base_url).await;
+    let origin_healthy = route.transport=="cloud_hub" || manager::check_origin_health().await.unwrap_or(false);
+    let endpoint_identity_ok = if route.transport=="cloud_hub" {probe_cloud_hub(&route.base_url).await}
+        else {origin_healthy && manager::public_endpoint_proves_current_install(&route.base_url).await};
     let repair_reason = if endpoint_identity_ok {
         None
     } else if !origin_healthy {
@@ -1193,12 +1230,26 @@ pub async fn get_formal_mobile_route_status() -> FormalMobileRouteStatus {
     }
 }
 
+async fn probe_cloud_hub(base_url:&str)->bool {
+    let Ok(client)=build_cloudflare_probe_client() else{return false;};
+    let Ok(response)=client.get(format!("{base_url}/health")).send().await else{return false;};
+    if !response.status().is_success(){return false;}
+    let Ok(value)=response.json::<serde_json::Value>().await else{return false;};
+    if value["service"]!="iterate-hub" || value["protocol"]!=1 || value["status"]!="ok"{return false;}
+    let endpoint=format!("{}/ws",base_url.replacen("https://","wss://",1));
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(5),connect_async(&endpoint)).await,
+        Ok(Err(WsError::Http(response))) if response.status().as_u16()==401)
+}
+
 pub async fn register_formal_mobile_route(
     transport: &str,
     base_url: &str,
     source: &str,
 ) -> Result<FormalMobileRouteStatus, String> {
-    if transport != "cloudflare_named_tunnel" {
+    if !matches!(
+        transport,
+        "cloudflare_named_tunnel" | "aliyun_ssh_reverse_tunnel" | "cloud_hub"
+    ) {
         return Err("formal_route_transport_not_supported".to_string());
     }
     let source = match source.trim() {
@@ -1207,11 +1258,11 @@ pub async fn register_formal_mobile_route(
         "legacy_migration" => "legacy_migration",
         _ => return Err("formal_route_source_invalid".to_string()),
     };
-    let base_url = manager::normalize_public_hostname(base_url)?;
-    if !manager::check_origin_health().await? {
+    let base_url = normalize_formal_mobile_route_base_url(transport, base_url)?;
+    if transport!="cloud_hub" && !manager::check_origin_health().await? {
         return Err("bridge_unhealthy".to_string());
     }
-    if !manager::public_endpoint_proves_current_install(&base_url).await {
+    if !(if transport=="cloud_hub"{probe_cloud_hub(&base_url).await}else{manager::public_endpoint_proves_current_install(&base_url).await}) {
         return Err("endpoint_identity_mismatch".to_string());
     }
 
@@ -2066,5 +2117,43 @@ mod tests {
         .expect_err("unknown route provenance must be rejected");
 
         assert_eq!(error, "formal_route_source_invalid");
+    }
+
+    #[test]
+    fn aliyun_formal_route_accepts_https_ip_origin_on_configured_port() {
+        for port in [8443, 9443] {
+            let origin = format!("https://8.8.8.8:{port}");
+            assert_eq!(
+                normalize_formal_mobile_route_base_url("aliyun_ssh_reverse_tunnel", &origin),
+                Ok(origin)
+            );
+        }
+        for origin in [
+            "https://example.com:8443",
+            "https://user:secret@8.8.8.8:8443",
+            "https://8.8.8.8:8443/path",
+            "http://8.8.8.8:8443",
+            "https://127.0.0.1:8443",
+            "https://0.1.2.3:8443",
+            "https://10.1.2.3:8443",
+            "https://100.64.1.2:8443",
+            "https://169.254.1.2:8443",
+            "https://172.16.1.2:8443",
+            "https://192.168.1.2:8443",
+            "https://192.0.0.1:8443",
+            "https://192.0.2.1:8443",
+            "https://192.88.99.1:8443",
+            "https://198.18.1.2:8443",
+            "https://198.51.100.2:8443",
+            "https://203.0.113.10:8443",
+            "https://224.0.0.1:8443",
+            "https://240.0.0.1:8443",
+            "https://255.255.255.255:8443",
+        ] {
+            assert!(
+                normalize_formal_mobile_route_base_url("aliyun_ssh_reverse_tunnel", origin)
+                    .is_err()
+            );
+        }
     }
 }

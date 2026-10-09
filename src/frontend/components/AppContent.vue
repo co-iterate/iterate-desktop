@@ -6,7 +6,8 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
 import { useMessage } from 'naive-ui'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { isBridgeActionForWindow } from '../composables/useEventHandlers'
 import { setupExitWarningListener } from '../composables/useExitWarning'
 import { useKeyboard } from '../composables/useKeyboard'
 import { useVersionCheck } from '../composables/useVersionCheck'
@@ -16,14 +17,14 @@ import {
   toggleDesktopCodexLive,
   toggleDesktopCodexLiveMicrophone,
 } from '../services/desktopCodexLiveControl'
-import { stripAutoPrompt } from '../utils/textUtils'
 import UpdateModal from './common/UpdateModal.vue'
-import TimelineView from './conversation/TimelineView.vue'
 import LayoutWrapper from './layout/LayoutWrapper.vue'
 import HtmlArtifactRenderer from './popup/HtmlArtifactRenderer.vue'
 import McpPopup from './popup/McpPopup.vue'
 import PopupHeader from './popup/PopupHeader.vue'
+import PopupTabs from './popup/PopupTabs.vue'
 import MobileConnectionWizard from './settings/MobileConnectionWizard.vue'
+import SettingsTab from './tabs/SettingsTab.vue'
 
 interface AppConfig {
   theme: string
@@ -125,10 +126,36 @@ interface UsageProvider {
 
 interface McpPopupRef {
   applyTimelinePrefill: (payload: TimelinePrefillPayload) => void
+  getDraft: () => TimelinePrefillPayload
 }
 
 const props = defineProps<Props>()
 const emit = defineEmits<Emits>()
+
+// Keep the last request's owner through null so native teardown cannot clear Bridge.
+// A real MCP request restores normal state pushes, including its subsequent close.
+let bridgeNativeOwner = props.mcpRequest?.source === 'codex_native'
+let bridgeStateRevision = 0
+watch(() => [props.mcpRequest, props.mcpRequest?.source, props.showMcpPopup] as const, ([request]) => {
+  if (request)
+    bridgeNativeOwner = request.source === 'codex_native'
+  bridgeStateRevision++
+}, { flush: 'sync' })
+
+function canSyncBridgeState() {
+  return !bridgeNativeOwner && props.mcpRequest?.source !== 'codex_native'
+}
+
+interface NativeHistorySession {
+  routeId: string
+  treeId: string
+  currentNodeId: string
+  projectPath: string
+  launchId: string
+  threadId: string
+  title: string
+  updatedAt: string
+}
 const message = useMessage()
 
 // 版本检查相关
@@ -136,15 +163,46 @@ const { versionInfo, showUpdateModal } = useVersionCheck()
 
 // 弹窗中的设置显示控制
 const showPopupSettings = ref(false)
+const popupTabsVisible = ref(false)
 
 const showIteratePairingModal = ref(false)
 
 // 对话时间线状态
-const showTimelineDrawer = ref(false)
+const boundNativeHistory = ref<NativeHistorySession | null>(null)
 const conversationTreeId = ref<string | null>(null)
 const currentConversationNodeId = ref<string | null>(null)
 const activeConversationRouteKey = ref<string | null>(null)
+const popupTimelineTreeId = computed(() => boundNativeHistory.value?.treeId || conversationTreeId.value)
+const popupTimelineNodeId = computed(() => boundNativeHistory.value?.currentNodeId || currentConversationNodeId.value)
+let nativeHistoryPollTimer: number | null = null
 const mcpPopupRef = ref<McpPopupRef | null>(null)
+let popupSettingsDraft: TimelinePrefillPayload | null = null
+
+async function refreshNativeHistoryBinding() {
+  const request = props.mcpRequest
+  const thread = request?.codex_thread_id?.trim()
+  const project = normalizeProjectPath(request)
+  const native = request?.source === 'codex_native'
+  const trustedOrdinary = request?.codex_thread_provenance === 'caller_meta'
+  if (!request || !thread || !project || (!native && !trustedOrdinary)) {
+    boundNativeHistory.value = null
+    return
+  }
+  try {
+    const sessions = await invoke<NativeHistorySession[]>('list_native_conversation_histories')
+    if (props.mcpRequest?.id !== request.id || props.mcpRequest?.codex_thread_id !== request.codex_thread_id)
+      return
+    const matches = sessions.filter(session => session.threadId === thread
+      && (!native || (session.projectPath === project && session.routeId === normalizeConversationRouteId(request))))
+    // A thread must identify exactly one monitored launch; never choose by cwd or recency.
+    boundNativeHistory.value = matches.length === 1 ? matches[0] : null
+  }
+  catch (error) {
+    console.warn('读取当前 CLI 历史失败:', error)
+    boundNativeHistory.value = null
+  }
+}
+
 const activeArtifact = ref<PopupArtifact | null>(null)
 const activeArtifactContent = computed(() => activeArtifact.value?.content || '')
 let skipNextBridgePush = false
@@ -769,10 +827,18 @@ async function ensureConversationAssistantNode(treeId: string, request: any, rou
 async function syncConversationRequestNode(request: any) {
   if (!request) {
     console.info('[Timeline] mcpRequest 为空，重置时间线状态')
-    showTimelineDrawer.value = false
+    boundNativeHistory.value = null
     conversationTreeId.value = null
     currentConversationNodeId.value = null
     activeConversationRouteKey.value = null
+    return
+  }
+
+  if (request.source === 'codex_native') {
+    conversationTreeId.value = null
+    currentConversationNodeId.value = null
+    activeConversationRouteKey.value = null
+    await refreshNativeHistoryBinding()
     return
   }
 
@@ -834,36 +900,6 @@ async function syncConversationRequestNode(request: any) {
   catch (error) {
     console.error('[Timeline] 获取当前节点失败:', error)
     currentConversationNodeId.value = null
-  }
-}
-
-async function handleTimelineNodeSwitch(nodeId: string) {
-  if (!conversationTreeId.value)
-    return
-
-  try {
-    skipNextBridgePush = true
-    const node = await invoke<TimelineNodeSwitchResult>('switch_conversation_node', {
-      treeId: conversationTreeId.value,
-      nodeId,
-    })
-    currentConversationNodeId.value = node?.id ?? nodeId
-
-    const rawContent = typeof node?.content === 'string' ? node.content : ''
-    const prefillContent = stripAutoPrompt(rawContent)
-    mcpPopupRef.value?.applyTimelinePrefill({
-      userInput: prefillContent,
-      selectedOptions: [],
-      draggedImages: [],
-      attachedFiles: [],
-      focus: true,
-    })
-
-    message.success('已切换到历史节点')
-  }
-  catch (error) {
-    console.error('[Timeline] 切换节点失败:', error)
-    message.error('切换历史节点失败')
   }
 }
 
@@ -956,6 +992,8 @@ let visibilityHandler: (() => void) | null = null
 let unlistenConversationNodeRecorded: (() => void) | null = null
 
 async function pullCachedBridgeAction(reason: string) {
+  if (props.mcpRequest?.source === 'codex_native')
+    return
   const projectPath = props.mcpRequest?.project_path
   if (!projectPath || actionPollInFlight)
     return
@@ -974,8 +1012,10 @@ async function pullCachedBridgeAction(reason: string) {
       return
     const data = await res.json()
     const action = data?.action
-    if (action && !handleWindowConditionalAction(action))
-      emit('bridgeAction', action)
+    if (props.mcpRequest?.source !== 'codex_native' && action && isBridgeActionForWindow(action, props.mcpRequest)) {
+      if (!handleWindowConditionalAction(action))
+        emit('bridgeAction', action)
+    }
   }
   catch (e) {
     const now = Date.now()
@@ -1012,12 +1052,24 @@ async function triggerShortcutToggle() {
 }
 
 // 切换弹窗设置显示
-function togglePopupSettings() {
-  showPopupSettings.value = !showPopupSettings.value
+async function togglePopupSettings() {
+  if (!showPopupSettings.value) {
+    popupSettingsDraft = mcpPopupRef.value?.getDraft() ?? null
+    showPopupSettings.value = true
+    return
+  }
+
+  showPopupSettings.value = false
+  await nextTick()
+  if (popupSettingsDraft) {
+    mcpPopupRef.value?.applyTimelinePrefill(popupSettingsDraft)
+    popupSettingsDraft = null
+  }
 }
 
 // 监听 MCP 请求变化，当有新请求时重置设置页面状态并更新窗口注册
 watch(() => props.mcpRequest, async (newRequest) => {
+  popupSettingsDraft = null
   const timelinePayload = {
     hasRequest: !!newRequest,
     requestId: normalizeRequestId(newRequest),
@@ -1034,6 +1086,7 @@ watch(() => props.mcpRequest, async (newRequest) => {
   }
 
   await syncConversationRequestNode(newRequest)
+  await refreshNativeHistoryBinding()
 
   const nextProjectPath = resolveDisplayProjectPath(newRequest)
   if (nextProjectPath && nextProjectPath !== lastValidProjectPath.value) {
@@ -1091,14 +1144,6 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   if (event.key === 'Tab' && event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && props.showMcpPopup) {
     event.preventDefault()
     restoreWindow()
-    return
-  }
-
-  // Tab 键最小化当前弹窗 - 仅在 MCP 弹窗显示时生效
-  // 排除 Cmd/Ctrl/Alt 等系统组合键
-  if (event.key === 'Tab' && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && props.showMcpPopup) {
-    event.preventDefault()
-    minimizeWindow()
     return
   }
 
@@ -1243,7 +1288,7 @@ watch(() => props.showMcpPopup, async (newValue) => {
     void refreshUsageQuotaProviders()
   }
   else {
-    showTimelineDrawer.value = false
+    boundNativeHistory.value = null
     await unregisterShortcuts()
   }
 })
@@ -1255,6 +1300,10 @@ onMounted(async () => {
   // 设置退出警告监听器（统一处理主界面和弹窗）
   setupExitWarningListener(message)
   await initializeDesktopCodexLiveControl()
+  nativeHistoryPollTimer = window.setInterval(() => {
+    if (props.showMcpPopup && props.mcpRequest?.codex_thread_id)
+      void refreshNativeHistoryBinding()
+  }, 2000)
 
   // 添加全局键盘事件监听器
   document.addEventListener('keydown', handleGlobalKeydown)
@@ -1322,6 +1371,9 @@ onMounted(async () => {
     const { message_type, payload } = bridgeMsg
 
     if (message_type === 'request_sync') {
+      if (!canSyncBridgeState())
+        return
+      const syncRevision = bridgeStateRevision
       const currentRequestId = normalizeRequestId(props.mcpRequest)
       const targetRequestId = normalizeRequestId(payload)
       if (currentRequestId && targetRequestId && currentRequestId !== targetRequestId) {
@@ -1367,6 +1419,8 @@ onMounted(async () => {
         showPopup: props.showMcpPopup,
       })
       const liveGoal = await getLiveGoalForBridge()
+      if (!canSyncBridgeState() || syncRevision !== bridgeStateRevision)
+        return
       invoke('send_to_web_bridge', {
         message: {
           message_type: 'mcp_state',
@@ -1382,7 +1436,11 @@ onMounted(async () => {
       })
     }
     else if (message_type === 'mcp_action') {
+      if (props.mcpRequest?.source === 'codex_native' || payload?.source === 'codex_native')
+        return
       // 转发 Web 端的动作到本地处理逻辑
+      if (!isBridgeActionForWindow(payload, props.mcpRequest))
+        return
       if (handleWindowConditionalAction(payload))
         return
       emit('bridgeAction', payload)
@@ -1472,8 +1530,15 @@ onMounted(async () => {
   let bridgePushTimeout: ReturnType<typeof setTimeout> | null = null
   let bridgePushSequence = 0
   function debouncedBridgePush() {
-    const scheduledAt = Date.now()
     const sequence = ++bridgePushSequence
+    if (!canSyncBridgeState()) {
+      if (bridgePushTimeout)
+        clearTimeout(bridgePushTimeout)
+      bridgePushTimeout = null
+      return
+    }
+    const scheduledAt = Date.now()
+    const scheduledRevision = bridgeStateRevision
     const requestId = normalizeRequestId(props.mcpRequest)
     const timelineRouteId = activeConversationRouteKey.value
     const projectPath = normalizeProjectPath(props.mcpRequest)
@@ -1490,6 +1555,8 @@ onMounted(async () => {
       clearTimeout(bridgePushTimeout)
     }
     bridgePushTimeout = setTimeout(async () => {
+      if (!canSyncBridgeState() || scheduledRevision !== bridgeStateRevision || sequence !== bridgePushSequence)
+        return
       const firedAt = Date.now()
       reportBridgeTiming('fire_mcp_state_push', {
         sequence,
@@ -1540,6 +1607,8 @@ onMounted(async () => {
         timelineNodeCount: timelineNodes.length,
         elapsedSinceScheduleMs: invokeAt - scheduledAt,
       })
+      if (!canSyncBridgeState() || scheduledRevision !== bridgeStateRevision || sequence !== bridgePushSequence)
+        return
       invoke('send_to_web_bridge', {
         message: {
           message_type: 'mcp_state',
@@ -1630,6 +1699,10 @@ onMounted(async () => {
 })
 
 onUnmounted(async () => {
+  if (nativeHistoryPollTimer !== null) {
+    window.clearInterval(nativeHistoryPollTimer)
+    nativeHistoryPollTimer = null
+  }
   if (desktopCodexLivePollTimer !== null) {
     window.clearInterval(desktopCodexLivePollTimer)
     desktopCodexLivePollTimer = null
@@ -1678,6 +1751,7 @@ onUnmounted(async () => {
     >
       <!-- 头部 - 固定在顶部 -->
       <div class="sticky top-0 z-50 flex-shrink-0 bg-black-100 border-b-2 border-black-200">
+        <PopupTabs :request-id="props.mcpRequest?.id" @visibility-change="popupTabsVisible = $event" />
         <PopupHeader
           :current-theme="props.appConfig.theme"
           :loading="false"
@@ -1687,6 +1761,7 @@ onUnmounted(async () => {
           :shortcut-enabled="localShortcutEnabled"
           :project-path="effectiveProjectPath"
           :codex-thread-id="props.mcpRequest?.codex_thread_id"
+          :conversation-title="popupTabsVisible ? undefined : props.mcpRequest?.conversation_title"
           :link-url="props.mcpRequest?.link_url"
           :link-title="props.mcpRequest?.link_title"
           :quota-providers="quotaProviders"
@@ -1709,37 +1784,19 @@ onUnmounted(async () => {
 
       <MobileConnectionWizard v-model:show="showIteratePairingModal" />
 
-      <n-drawer
-        v-model:show="showTimelineDrawer"
-        placement="left"
-        :width="360"
-      >
-        <n-drawer-content
-          title="对话时间线"
-          closable
-          body-content-class="p-0 bg-black"
-        >
-          <TimelineView
-            v-if="conversationTreeId && currentConversationNodeId"
-            :tree-id="conversationTreeId"
-            :current-node-id="currentConversationNodeId"
-            @node-click="handleTimelineNodeSwitch"
-          />
-          <div v-else class="h-full flex items-center justify-center bg-black">
-            <n-empty description="暂无对话节点" />
-          </div>
-        </n-drawer-content>
-      </n-drawer>
-
       <!-- 设置界面 -->
       <div
         v-if="showPopupSettings"
-        class="flex-1 overflow-y-auto scrollbar-thin"
+        class="flex-1 overflow-y-auto scrollbar-thin p-4"
       >
-        <LayoutWrapper
-          :app-config="props.appConfig"
-          :codex-live-phase="globalCodexLivePhase"
-          :codex-live-status="globalCodexLiveStatus"
+        <SettingsTab
+          :current-theme="props.appConfig.theme"
+          :always-on-top="props.appConfig.window.alwaysOnTop"
+          :audio-notification-enabled="props.appConfig.audio.enabled"
+          :audio-url="props.appConfig.audio.url"
+          :window-width="props.appConfig.window.width"
+          :window-height="props.appConfig.window.height"
+          :fixed-window-size="props.appConfig.window.fixed"
           @theme-change="$emit('themeChange', $event)"
           @toggle-always-on-top="$emit('toggleAlwaysOnTop')"
           @toggle-audio-notification="$emit('toggleAudioNotification')"
@@ -1748,8 +1805,6 @@ onUnmounted(async () => {
           @stop-audio="$emit('stopAudio')"
           @test-audio-error="$emit('testAudioError', $event)"
           @update-window-size="$emit('updateWindowSize', $event)"
-          @toggle-codex-live="handleToggleCodexLive"
-          @toggle-codex-live-mute="handleToggleCodexLiveMute"
         />
       </div>
 
@@ -1762,15 +1817,14 @@ onUnmounted(async () => {
           :context-prompt-state="currentPromptContextState"
           :app-config="props.appConfig"
           :is-muted="props.isMuted"
-          :timeline-tree-id="conversationTreeId"
-          :timeline-current-node-id="currentConversationNodeId"
+          :timeline-tree-id="popupTimelineTreeId"
+          :timeline-current-node-id="popupTimelineNodeId"
           class="flex-1 flex flex-col overflow-hidden min-h-0"
           @response="$emit('mcpResponse', $event)"
           @cancel="$emit('mcpCancel')"
           @theme-change="$emit('themeChange', $event)"
           @toggle-mute="$emit('toggleMute')"
           @open-artifact="handleOpenArtifact"
-          @timeline-node-click="handleTimelineNodeSwitch"
           @conditional-state-change="handlePopupConditionalStateChange"
         />
       </div>
@@ -1947,23 +2001,26 @@ onUnmounted(async () => {
     </div>
 
     <!-- 主界面 - 只在非弹窗模式且非初始化时显示 -->
-    <LayoutWrapper
-      v-else
-      :app-config="props.appConfig"
-      :codex-live-phase="globalCodexLivePhase"
-      :codex-live-status="globalCodexLiveStatus"
-      @theme-change="$emit('themeChange', $event)"
-      @toggle-always-on-top="$emit('toggleAlwaysOnTop')"
-      @toggle-audio-notification="$emit('toggleAudioNotification')"
-      @update-audio-url="$emit('updateAudioUrl', $event)"
-      @test-audio="$emit('testAudio')"
-      @stop-audio="$emit('stopAudio')"
-      @test-audio-error="$emit('testAudioError', $event)"
-      @update-window-size="$emit('updateWindowSize', $event)"
-      @toggle-codex-live="handleToggleCodexLive"
-      @toggle-codex-live-mute="handleToggleCodexLiveMute"
-      @config-reloaded="$emit('configReloaded')"
-    />
+    <div v-else class="relative min-h-screen">
+      <LayoutWrapper
+        :app-config="props.appConfig"
+        :is-muted="props.isMuted"
+        :codex-live-phase="globalCodexLivePhase"
+        :codex-live-status="globalCodexLiveStatus"
+        @theme-change="$emit('themeChange', $event)"
+        @toggle-always-on-top="$emit('toggleAlwaysOnTop')"
+        @toggle-mute="$emit('toggleMute')"
+        @toggle-audio-notification="$emit('toggleAudioNotification')"
+        @update-audio-url="$emit('updateAudioUrl', $event)"
+        @test-audio="$emit('testAudio')"
+        @stop-audio="$emit('stopAudio')"
+        @test-audio-error="$emit('testAudioError', $event)"
+        @update-window-size="$emit('updateWindowSize', $event)"
+        @toggle-codex-live="handleToggleCodexLive"
+        @toggle-codex-live-mute="handleToggleCodexLiveMute"
+        @config-reloaded="$emit('configReloaded')"
+      />
+    </div>
 
     <!-- 更新弹窗 -->
     <UpdateModal

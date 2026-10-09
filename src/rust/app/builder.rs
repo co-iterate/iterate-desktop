@@ -25,21 +25,23 @@ fn is_standalone_mcp_launch(args: &[String]) -> bool {
 
 fn should_show_main_window_on_launch(args: &[String]) -> bool {
     if is_standalone_mcp_launch(args) {
-        return true;
+        // The frontend owns the first presentation after reading do-not-disturb.
+        // Showing here produces a visible flash before a muted popup minimizes.
+        return false;
     }
 
     if args.iter().any(|arg| arg == "--show-main-window") {
         return true;
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         // Windows 直接双击 iterate.exe 时，默认展示主界面，
         // 避免应用已启动但只剩控制台/隐藏窗口，造成“没打开”的体验。
         args.len() == 1
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         cfg!(debug_assertions)
             && std::env::var("ITERATE_DEV_SHOW_MAIN")
@@ -534,6 +536,13 @@ mod tests {
             "--show-main-window".to_string(),
         ]));
     }
+
+    #[test]
+    fn standalone_popup_waits_for_notification_preference_before_showing() {
+        assert!(!super::should_show_main_window_on_launch(&[
+            "iterate".to_string(), "--mcp-request".to_string(), "{}".to_string(),
+        ]));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -573,6 +582,7 @@ fn forward_macos_native_text_drop(window: &tauri::Window<tauri::Wry>, event: &ta
 pub fn build_tauri_app() -> Builder<tauri::Wry> {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init());
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -590,6 +600,17 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             should_stop: Arc::new(AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
+            crate::delivery::get_mcp_delivery_status,
+            crate::cross_device::get_cross_device_status,
+            crate::cross_device::sync_cross_device_windows,
+            crate::cross_device::settings_sync::settings_sync_export,
+            crate::cross_device::settings_sync::settings_sync_preview,
+            crate::cross_device::settings_sync::settings_sync_apply,
+            crate::cross_device::set_cross_device_enabled,
+            crate::cross_device::transport::get_cross_device_config,
+            crate::cross_device::transport::generate_cross_device_pairing,
+            crate::cross_device::transport::save_cross_device_config,
+            crate::cross_device::transport::test_cross_device_connection,
             // 基础应用命令
             crate::bridge::auth::get_bridge_desktop_token,
             get_app_info,
@@ -619,6 +640,11 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             get_theme,
             set_theme,
             get_window_config,
+            crate::ui::popup_tabs::register_popup_tab,
+            crate::ui::popup_tabs::get_popup_tabs,
+            crate::ui::popup_tabs::select_popup_tab,
+            crate::ui::popup_tabs::complete_popup_tab,
+            crate::ui::popup_tabs::restore_popup_tab,
             set_window_config,
             get_reply_config,
             set_reply_config,
@@ -725,6 +751,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             build_mcp_continue_response,
             create_test_popup,
             // 对话树命令
+            list_native_conversation_histories,
             create_conversation_tree,
             add_conversation_node,
             ensure_conversation_assistant_node,
@@ -781,6 +808,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_terminal,
             open_in_ide,
             center_window,
+            position_window_left,
             dismiss_standalone_mcp_window,
             activate_app_window,
             probe_codex_automation_permission,
@@ -903,6 +931,11 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
 
 /// 运行Tauri应用
 pub fn run_tauri_app() {
+    crate::cross_device::transport::start_if_configured();
+    let _cross_mirror_guard = match crate::cross_device::mirror_process_guard() {
+        Ok(guard) => guard,
+        Err(error) => { eprintln!("{error}"); return; }
+    };
     install_android_rustls_crypto_provider();
 
     let args: Vec<String> = std::env::args().collect();

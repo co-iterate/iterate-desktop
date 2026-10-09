@@ -45,20 +45,6 @@ export function useGlobalSpeechRuntimeHost() {
     return []
   }
 
-  async function preloadPermissions() {
-    const checks = [
-      ['microphone_status', 'request_microphone_permission'],
-      ['speech_recognition_status', 'request_speech_recognition_permission'],
-      ['accessibility_status', 'request_accessibility_permission'],
-      ['input_monitoring_status', 'request_input_monitoring_permission'],
-    ] as const
-    for (const [statusCommand, requestCommand] of checks) {
-      const granted = await invoke<boolean>(statusCommand).catch(() => false)
-      if (!granted)
-        await invoke(requestCommand).catch(() => undefined)
-    }
-  }
-
   async function refreshRecognitionResources() {
     const [muscleResult, correctionResult, vocabularyResult] = await Promise.all([
       invoke<unknown>('get_speech_muscle_memory_entries').catch(() => []),
@@ -182,7 +168,8 @@ export function useGlobalSpeechRuntimeHost() {
     unlistenTranscript = await listen<ProcessTranscriptPayload>('speech://process-transcript', event => void processTranscript(event.payload))
     const snapshot = await invoke<SpeechSnapshot>('get_speech_control_snapshot')
     acceptSnapshot(snapshot)
-    void preloadPermissions()
+    // Permission requests belong to explicit user actions in speech settings.
+    // Starting a host (including a mirrored popup) must not open System Settings.
   }
 
   function dispose() {

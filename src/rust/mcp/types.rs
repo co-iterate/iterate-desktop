@@ -57,6 +57,10 @@ pub struct ZhiRequest {
     #[schemars(description = "调用本次 MCP 的 Codex 会话 ID（可选，用于回到原会话）")]
     #[serde(default)]
     pub codex_thread_id: Option<String>,
+    /// Set only after the MCP producer resolves the real caller or explicit argument.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub codex_thread_provenance: Option<String>,
     #[schemars(description = "调用本次 MCP 的 Codex 会话 deep link（可选）")]
     #[serde(default)]
     pub codex_deeplink: Option<String>,
@@ -147,6 +151,8 @@ pub struct PopupRequest {
     pub codex_home: Option<String>,
     #[serde(default)]
     pub codex_thread_id: Option<String>,
+    #[serde(default)]
+    pub codex_thread_provenance: Option<String>,
     #[serde(default)]
     pub codex_deeplink: Option<String>,
     #[serde(default)]

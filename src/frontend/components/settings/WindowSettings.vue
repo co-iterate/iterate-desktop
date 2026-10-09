@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { NRadioButton, NRadioGroup } from 'naive-ui'
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useSettings } from '../../composables/useSettings'
 
 const props = defineProps({
   alwaysOnTop: {
@@ -23,11 +25,88 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['toggleAlwaysOnTop', 'updateWindowSize'])
+const settings = useSettings()
 
 // 窗口设置状态 - 完全依赖后端
 const localFixed = ref(props.fixedWindowSize)
 const localWidth = ref(props.windowWidth)
 const localHeight = ref(props.windowHeight)
+const popupPlacement = ref<'left' | 'center'>('left')
+const savingPopupPlacement = ref(false)
+const popupPlacementError = ref('')
+const focusPopupOnShow = ref(true)
+const savingPopupFocus = ref(false)
+const popupFocusError = ref('')
+const popupDisplayMode = ref<'windows' | 'tabs'>('windows')
+const savingPopupDisplayMode = ref(false)
+const popupDisplayModeError = ref('')
+
+async function updatePopupDisplayMode(value: string | number | null) {
+  if ((value !== 'windows' && value !== 'tabs') || savingPopupDisplayMode.value)
+    return
+  savingPopupDisplayMode.value = true
+  popupDisplayModeError.value = ''
+  try {
+    await invoke('set_window_settings', { windowSettings: { popup_display_mode: value } })
+    popupDisplayMode.value = value
+  }
+  catch (error) { popupDisplayModeError.value = `保存显示方式失败：${error}` }
+  finally { savingPopupDisplayMode.value = false }
+}
+
+async function loadPopupPlacement() {
+  try {
+    const config = await invoke<{ popup_placement?: string, focus_popup_on_show?: boolean, popup_display_mode?: string }>('get_window_config')
+    popupDisplayMode.value = config.popup_display_mode === 'tabs' ? 'tabs' : 'windows'
+    // Other popup processes can change the shared display mode while this
+    // process keeps its original in-memory window configuration.
+    const display = await invoke<{ mode: 'windows' | 'tabs' }>('get_popup_tabs')
+    popupDisplayMode.value = display.mode
+    popupPlacement.value = config.popup_placement === 'center' ? 'center' : 'left'
+    focusPopupOnShow.value = config.focus_popup_on_show !== false
+  }
+  catch (error) {
+    popupPlacementError.value = `加载弹窗位置失败：${error}`
+  }
+}
+
+async function updatePopupFocus(value: boolean) {
+  if (savingPopupFocus.value || focusPopupOnShow.value === value)
+    return
+  savingPopupFocus.value = true
+  popupFocusError.value = ''
+  try {
+    await invoke('set_window_settings', { windowSettings: { focus_popup_on_show: value } })
+    focusPopupOnShow.value = value
+    if (!value)
+      settings.alwaysOnTop.value = false
+  }
+  catch (error) {
+    popupFocusError.value = `保存弹窗聚焦设置失败：${error}`
+  }
+  finally {
+    savingPopupFocus.value = false
+  }
+}
+
+async function updatePopupPlacement(value: string | number | null) {
+  if (value !== 'left' && value !== 'center')
+    return
+  if (savingPopupPlacement.value || popupPlacement.value === value)
+    return
+  savingPopupPlacement.value = true
+  popupPlacementError.value = ''
+  try {
+    await invoke('set_window_settings', { windowSettings: { popup_placement: value } })
+    popupPlacement.value = value
+  }
+  catch (error) {
+    popupPlacementError.value = `保存弹窗位置失败：${error}`
+  }
+  finally {
+    savingPopupPlacement.value = false
+  }
+}
 
 // 实时窗口大小
 const currentWidth = ref(0)
@@ -246,6 +325,7 @@ function removeWindowResizeListener() {
 
 // 组件挂载时获取当前窗口大小并设置监听器
 onMounted(async () => {
+  await loadPopupPlacement()
   await loadWindowConstraints()
   getCurrentWindowSize()
   loadWindowSettingsForMode(localFixed.value)
@@ -261,6 +341,79 @@ onUnmounted(() => {
 <template>
   <!-- 设置内容 -->
   <n-space vertical size="large">
+    <div class="flex items-start">
+      <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 mt-2 flex-shrink-0" />
+      <div>
+        <div class="text-sm font-medium leading-relaxed mb-1">
+          显示方式
+        </div>
+        <NRadioGroup :value="popupDisplayMode" :disabled="savingPopupDisplayMode" size="small" @update:value="updatePopupDisplayMode">
+          <NRadioButton value="windows">
+            分窗
+          </NRadioButton>
+          <NRadioButton value="tabs">
+            标签页
+          </NRadioButton>
+        </NRadioGroup>
+        <div v-if="popupDisplayModeError" class="text-xs text-red-500 mt-2" role="alert">
+          {{ popupDisplayModeError }}
+        </div>
+      </div>
+    </div>
+    <div class="flex items-start">
+      <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 mt-2 flex-shrink-0" />
+      <div>
+        <div class="text-sm font-medium leading-relaxed mb-1">
+          弹窗位置
+        </div>
+        <div class="text-xs opacity-60 mb-3">
+          新的 iterate 弹窗显示在鼠标所在屏幕的工作区
+        </div>
+        <NRadioGroup
+          :value="popupPlacement"
+          :disabled="savingPopupPlacement"
+          size="small"
+          @update:value="updatePopupPlacement"
+        >
+          <NRadioButton value="left">
+            靠左
+          </NRadioButton>
+          <NRadioButton value="center">
+            居中
+          </NRadioButton>
+        </NRadioGroup>
+        <div v-if="popupPlacementError" class="text-xs text-red-500 mt-2" role="alert">
+          {{ popupPlacementError }}
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-between">
+      <div class="flex items-center">
+        <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 flex-shrink-0" />
+        <div>
+          <div class="text-sm font-medium leading-relaxed">
+            弹窗出现时自动聚焦
+          </div>
+          <div class="text-xs opacity-60">
+            关闭后弹窗不会抢走键盘输入，并同时关闭“总在最前”；点击弹窗后可输入
+          </div>
+          <div v-if="!focusPopupOnShow && alwaysOnTop" class="text-xs text-amber-500 mt-1">
+            “总在最前”已单独开启，弹窗仍可能遮挡其他窗口
+          </div>
+          <div v-if="popupFocusError" class="text-xs text-red-500 mt-2" role="alert">
+            {{ popupFocusError }}
+          </div>
+        </div>
+      </div>
+      <n-switch
+        :value="focusPopupOnShow"
+        :disabled="savingPopupFocus"
+        size="small"
+        @update:value="updatePopupFocus"
+      />
+    </div>
+
     <!-- 置顶显示设置 -->
     <div class="flex items-center justify-between">
       <div class="flex items-center">

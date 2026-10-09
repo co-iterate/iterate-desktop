@@ -168,7 +168,7 @@ pub(super) async fn broadcast_latest_timeline_node(
         return;
     }
 
-    let delta_msg = TimelineSyncService::build_delta_message(route_id, Some(project_path), &node);
+    let Some(delta_msg) = TimelineSyncService::build_delta_message(route_id, Some(project_path), &node) else { return; };
     if let Err(err) = BRIDGE_BROADCAST.send(delta_msg) {
         log::debug!(
             "[TimelineSync] 广播用户增量节点失败（可能无订阅者）: {}",
@@ -343,13 +343,14 @@ async fn record_bridge_response_node(
     );
 
     if let Some(new_node) = manager.get_node(&tree_id, &node_id).await {
-        let delta_msg = TimelineSyncService::build_delta_message(
+        if let Some(delta_msg) = TimelineSyncService::build_delta_message(
             request_key.as_deref(),
             Some(project_path),
             &new_node,
-        );
-        if let Err(err) = BRIDGE_BROADCAST.send(delta_msg) {
-            log::debug!("[TimelineSync] 广播增量节点失败（可能无订阅者）: {}", err);
+        ) {
+            if let Err(err) = BRIDGE_BROADCAST.send(delta_msg) {
+                log::debug!("[TimelineSync] 广播增量节点失败（可能无订阅者）: {}", err);
+            }
         }
     }
 

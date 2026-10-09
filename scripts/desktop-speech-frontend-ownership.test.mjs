@@ -1,8 +1,36 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
+import { stripTypeScriptTypes } from 'node:module'
+import { runInNewContext } from 'node:vm'
 
 const root = new URL('../', import.meta.url)
+
+test('starting and restarting a speech host never requests system permissions', async () => {
+  const source = await readFile(new URL('src/frontend/composables/useGlobalSpeechRuntimeHost.ts', root), 'utf8')
+  const script = stripTypeScriptTypes(source.replace(/\r\n/g, '\n'))
+    .replace(/^import .*\n/gm, '')
+    .replace('export function useGlobalSpeechRuntimeHost', 'function useGlobalSpeechRuntimeHost')
+  const commands = []
+  const host = runInNewContext(`${script}\nuseGlobalSpeechRuntimeHost()`, {
+    invoke: async (command) => {
+      commands.push(command)
+      if (command.endsWith('_status')) return false
+      if (command === 'get_speech_control_snapshot') return { phase: 'Idle' }
+      return []
+    },
+    listen: async () => () => {},
+    GlobalSpeechSessionGuard: class { applySnapshot() { return false } },
+    buildSpeechContextualStrings: () => [],
+  })
+  await host.initialize()
+  host.dispose()
+  await host.initialize()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(commands.filter(command => command === 'get_speech_control_snapshot').length, 2)
+  assert.deepEqual(commands.filter(command => command.startsWith('request_')), [])
+  host.dispose()
+})
 
 test('overlay composable is a Rust snapshot projection without a second controller', async () => {
   const source = await readFile(new URL('src/frontend/composables/useGlobalSpeechInput.ts', root), 'utf8')

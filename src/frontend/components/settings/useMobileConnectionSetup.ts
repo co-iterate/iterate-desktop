@@ -64,8 +64,20 @@ interface SetupOptions {
 
 const DEFAULT_PAIRING_BASE_URL = 'http://127.0.0.1:8080'
 
+export function buildAliyunIpRouteSetupPrompt() {
+  return `请为 iterate 配置独立于 Windows 的阿里云中心，公网入口使用可信 IP 证书的 https://服务器公网IP:8443。
+
+1. 只读检查现有 8443、443、云服务及两台源设备的有效配置；不要覆盖健康的既有路线。
+2. 中心运行独立 iterate-hub 与持久 SQLite；Windows/Mac 使用各自源凭据主动连接，源端保留原注册与获胜账本。手机继承现有权限，Mac 只发布获准文字镜像。
+3. HTTPS/WSS 代理指向云端 loopback hub，不转发到 Windows。保留可信 IP 证书与主机身份校验；管理员接口限运维通道。不得修改现有 443 网站或使用跳过证书校验的客户端。
+4. 切换前冻结并排空，查询未知结果，取得当轮每个源的真实全入口屏障；保留 5311 主会话。验证 /health 的 service=iterate-hub、protocol=1，/ws 未授权返回 401，以及 Windows 离线时 Mac 镜像仍可用。
+5. 实际部署及验收成功后运行 --mobile-route-register --transport cloud_hub --base-url "https://服务器公网IP:8443" --source ai_configured，再运行 --mobile-route-verify。未验证前不改变正式配置。
+
+不得在输出中展示 SSH 私钥、凭据、配对链接或原始日志。任何需要新增费用、改变现有公网服务或安全边界的步骤，先说明影响并取得用户决定。`
+}
+
 export function buildFormalRouteSetupPrompt() {
-  return `请帮我为当前电脑上的 iterate 配置一条长期稳定、重启后仍可用的正式 iPhone 公网路线，优先使用 Cloudflare Named Tunnel；不要创建临时测试路线。
+  return `请帮我为当前电脑上的 iterate 配置一条长期稳定、重启后仍可用的正式 Android 公网路线，优先使用 Cloudflare Named Tunnel；不要创建临时测试路线。
 
 平台识别：
 - 执行任何安装或修改前，先识别当前系统是 macOS、Windows 还是 Linux，并定位实际可运行的 iterate 与官方 cloudflared；不要猜测安装路径。
@@ -91,12 +103,23 @@ export function buildFormalRouteSetupPrompt() {
 如果任一需要用户决定或授权的步骤尚未完成，就停在该步骤等待，不得用测试通道代替正式配置。`
 }
 
-export function buildFormalRouteRepairPrompt(baseUrl: string, code: string) {
+export function buildFormalRouteRepairPrompt(baseUrl: string, code: string, transport?: string | null) {
   const safeBaseUrl = /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(baseUrl.trim())
     ? baseUrl.trim()
     : '已配置的正式 HTTPS 域名（请从 iterate 脱敏状态中读取）'
   const safeCode = String(code || 'formal_route_unhealthy').replace(/[^\w.:-]/g, '_').slice(0, 120)
-  return `请只修复当前电脑上 iterate 已经配置的正式 iPhone 公网路线，不要创建或切换到另一条路线。
+  if (transport === 'cloud_hub') {
+    return `请只检查已配置的 iterate 阿里云中心 ${safeBaseUrl}，错误码 ${safeCode}。运行 --mobile-route-status 和 --mobile-route-verify，确认 TLS 证书及主机身份、/health 的 service=iterate-hub 与 protocol=1、/ws 未授权返回 401。分别检查 Windows/Mac 源客户端的独立连接与原账本；Windows 离线不应使获准 Mac 镜像消失。不要重建 Windows 反向 SSH 隧道，不关闭 5311，不输出 token，不重放确认未知的动作。变更或受控接管前先对账现有任务。`
+  }
+  if (transport === 'aliyun_ssh_reverse_tunnel') {
+    return `请只修复当前电脑上 iterate 已配置的阿里云 IP + SSH 正式手机路线。
+
+已配置地址：${safeBaseUrl}
+脱敏错误码：${safeCode}
+
+先运行 --mobile-route-status 和 --mobile-route-verify；检查本机 8080、Windows 出站 SSH 自动重连、阿里云回环 18080、IP:8443 的可信 HTTPS 证书及 WSS，并验证公网端点属于当前安装。确认 nginx 保留公网 Host（含端口）、传递真实客户端 X-Forwarded-For，且无凭据访问 /api/config、/api/active-sessions 与 /ws WebSocket Upgrade 均返回 401。只恢复这条路线，保留现有 443 网站和其他接口，不得关闭 Bridge 鉴权。不要输出私钥、凭据或配对链接；需要改变安全边界或产生费用时先请用户决定。完成后再次运行 --mobile-route-verify，并报告实际恢复动作和结果。`
+  }
+  return `请只修复当前电脑上 iterate 已经配置的正式 Android 公网路线，不要创建或切换到另一条路线。
 
 已配置地址：${safeBaseUrl}
 脱敏错误码：${safeCode}
@@ -248,7 +271,7 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
   }
 
   async function readPairingStatus() {
-    return await requestJson<PairingStatusResponse>(`${pairingBaseUrl}/api/mobile/pairing/status`)
+    return await requestJson<PairingStatusResponse>(`${pairingBaseUrl}/api/android/pairing/status`)
   }
 
   function startClock() {
@@ -373,7 +396,7 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
     clearPollTimer()
     try {
       const data = await requestJson<{ ok?: boolean, pairing?: MobilePairingPayload, error?: string }>(
-        `${pairingBaseUrl}/api/mobile/pairing`,
+        `${pairingBaseUrl}/api/android/pairing`,
       )
       if (!lifecycleIsActive(generation))
         return
@@ -464,7 +487,7 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
     pollInFlight = true
     try {
       const data = await requestJson<{ ok?: boolean, session?: MobilePairingSession }>(
-        `${pairingBaseUrl}/api/mobile/pairing/sessions/${encodeURIComponent(sessionId)}`,
+        `${pairingBaseUrl}/api/android/pairing/sessions/${encodeURIComponent(sessionId)}`,
       )
       if (!lifecycleIsActive(generation) || data.session?.session_id !== sessionId)
         return
@@ -563,7 +586,7 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
     bridgeOriginHealthy,
     aiSetupPrompt: computed(() => (
       formalRoute.value?.configured
-        ? buildFormalRouteRepairPrompt(formalRoute.value.base_url || '', state.value.error?.code || error.value)
+        ? buildFormalRouteRepairPrompt(formalRoute.value.base_url || '', state.value.error?.code || error.value, formalRoute.value.transport)
         : buildFormalRouteSetupPrompt()
     )),
     bootstrap,

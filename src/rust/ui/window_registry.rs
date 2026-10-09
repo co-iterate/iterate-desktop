@@ -130,7 +130,7 @@ impl WindowRegistry {
 
     fn cleanup_stale_instances(&mut self) {
         self.instances
-            .retain(|instance| is_process_running(instance.pid));
+            .retain(|instance| is_process_running(instance.pid, &instance.registered_at));
         let live_pids = self
             .instances
             .iter()
@@ -343,7 +343,9 @@ fn truncate_request_title(title: &str) -> String {
     title.trim().chars().take(80).collect()
 }
 
-fn is_process_running(pid: u32) -> bool {
+fn is_process_running(pid: u32, registered_at: &str) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    let _ = registered_at;
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -356,9 +358,9 @@ fn is_process_running(pid: u32) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         const STILL_ACTIVE_EXIT_CODE: u32 = 259;
 
@@ -371,8 +373,33 @@ fn is_process_running(pid: u32) -> bool {
             let mut exit_code = 0u32;
             let running = GetExitCodeProcess(handle, &mut exit_code) != 0
                 && exit_code == STILL_ACTIVE_EXIT_CODE;
+            // A live PID can belong to a different process after the original
+            // window exits. Old registry entries already carry the registration
+            // timestamp, so no data migration or executable-name guess is needed.
+            let same_process = if running {
+                let mut created: FILETIME = std::mem::zeroed();
+                let mut exited: FILETIME = std::mem::zeroed();
+                let mut kernel: FILETIME = std::mem::zeroed();
+                let mut user: FILETIME = std::mem::zeroed();
+                if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+                    let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+                    match chrono::DateTime::parse_from_rfc3339(registered_at) {
+                        Ok(registered) => {
+                            let created_unix_micros = i128::from(ticks / 10) - 11_644_473_600_000_000i128;
+                            created_unix_micros <= i128::from(registered.timestamp_micros())
+                        }
+                        // Keep legacy records whose timestamp cannot establish
+                        // process identity; do not close an unproven live request.
+                        Err(_) => true,
+                    }
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
             let _ = CloseHandle(handle);
-            running
+            running && same_process
         }
     }
 
@@ -715,6 +742,32 @@ mod tests {
 
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].port, Some(5311));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reused_live_pid_cannot_keep_a_registration_from_before_process_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iterate_windows.json");
+        let pid = std::process::id();
+        let stale = super::WindowInstance {
+            pid,
+            project_path: "C:/closed-cli".into(),
+            window_title: "closed CLI".into(),
+            registered_at: "2000-01-01T00:00:00Z".into(),
+            port: None,
+            request_id: Some("closed-request".into()),
+            request_title: Some("closed".into()),
+        };
+        let mut registry = super::WindowRegistry {
+            instances: vec![stale],
+            ..Default::default()
+        };
+        super::save_registry_atomically(&path, &registry).unwrap();
+        assert!(registry.get_all_instances_at_path(&path).is_empty());
+        assert!(super::load_registry_from_path(&path).instances.is_empty());
+        assert!(super::is_process_running(pid, &chrono::Utc::now().to_rfc3339()));
+        assert!(super::is_process_running(pid, "legacy-unparseable"));
     }
 
     #[test]

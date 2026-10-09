@@ -1,12 +1,17 @@
 <script setup lang="ts">
+import type { DesktopMcpSubmission } from '../../composables/desktopMcpSubmission'
 import type { McpRequest, PopupArtifact, PopupFileAttachment, PopupInputData, PopupTextSelection, ShortcutBinding } from '../../types/popup'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { useMessage } from 'naive-ui'
+import { NCheckboxGroup, useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import { isDesktopSubmissionCurrent } from '../../composables/desktopMcpSubmission'
+import { mcpDeliveryStatus } from '../../composables/useMcpDelivery'
+import { resolveMcpLaunchContext } from '../../composables/useMcpHandler'
 import { useShortcuts } from '../../composables/useShortcuts'
+import { copySubmissionToClipboard } from '../../utils/submissionClipboard'
 import { stripAutoPrompt } from '../../utils/textUtils'
 import TimelineDotBar from '../conversation/TimelineDotBar.vue'
 import PopupActions from './PopupActions.vue'
@@ -73,7 +78,6 @@ interface Emits {
   stopAudio: []
   testAudioError: [error: any]
   updateWindowSize: [size: { width: number, height: number, fixed: boolean }]
-  timelineNodeClick: [nodeId: string]
   conditionalStateChange: [payload: { promptId: string, current_state?: boolean, is_active?: boolean }]
   openArtifact: [artifact: PopupArtifact]
 }
@@ -86,7 +90,7 @@ interface TimelinePrefillPayload extends PopupInputData {
 interface PopupInputRef {
   statusText?: string
   updateData: (data: PopupInputData) => void
-  recordSubmittedInputForAutoPromotion: () => void
+  recordSubmittedInputForAutoPromotion: (input?: string) => void
   handleQuoteMessage: (messageContent: string) => void
   insertSelectedTextQuote: (selection: PopupTextSelection) => Promise<boolean>
   focusInput?: () => void
@@ -110,15 +114,25 @@ const { loadShortcutConfig, getShortcutByAction } = useShortcuts()
 
 // 响应式状态
 const loading = ref(false)
+const focusPopupOnShow = ref(false)
 const submitting = ref(false)
 const selectedOptions = ref<string[]>([])
 const userInput = ref('')
+const rawUserInput = ref('')
 const draggedImages = ref<string[]>([])
 const attachedFiles = ref<PopupFileAttachment[]>([])
 const contentRef = ref<PopupContentRef | null>(null)
 const inputRef = ref<PopupInputRef | null>(null)
 const pendingTimelinePrefill = ref<TimelinePrefillPayload | null>(null)
 const timelineEdgeActive = ref(false)
+const viewedHistoryNode = ref<ConversationNode | null>(null)
+const viewedHistoryContentRef = ref<HTMLElement | null>(null)
+const timelineSelectionRevision = ref(0)
+
+function returnToCurrentQuestion() {
+  viewedHistoryNode.value = null
+  timelineSelectionRevision.value++
+}
 const TIMELINE_EDGE_TRIGGER_PX = 16
 const TIMELINE_EDGE_ACTIVE_PX = 42
 
@@ -132,6 +146,7 @@ function handleAtTrigger() {
 
 // 继续回复配置
 const continueReplyEnabled = ref(true)
+const copySubmissionToClipboardEnabled = ref(false)
 const continuePrompt = ref('请按照最佳实践继续')
 const DEFAULT_LOOP_PROMPT = `进入 GoalRun 目标模式。
 
@@ -239,7 +254,14 @@ function resolveSubmitSource(userInput: string, options: string[] = []): 'popup'
   return intent?.action === 'start' ? 'popup_goal_submit' : 'popup'
 }
 
-async function applyLiveGoalIntent(userInput: string, options: string[] = []): Promise<any | null> {
+async function applyLiveGoalIntent(
+  userInput: string,
+  options: string[] = [],
+  request: McpRequest | null = props.request,
+  isCurrent: () => boolean = () => true,
+): Promise<any | null> {
+  if (!isCurrent())
+    return null
   const intent = resolveLiveGoalIntent(userInput, options)
   if (!intent)
     return null
@@ -248,28 +270,35 @@ async function applyLiveGoalIntent(userInput: string, options: string[] = []): P
     if (intent.action === 'start') {
       const goal = await invoke('start_live_goal', {
         title: intent.title,
-        projectPath: props.request?.project_path,
-        requestId: props.request?.id,
-        codexThreadId: props.request?.codex_thread_id,
-        codexDeeplink: props.request?.codex_deeplink,
+        projectPath: request?.project_path,
+        requestId: request?.id,
+        codexThreadId: request?.codex_thread_id,
+        codexDeeplink: request?.codex_deeplink,
       })
+      if (!isCurrent())
+        return null
       message.success('目标已登记到 Live Goal，正在提交给 Codex')
       return goal
     }
     else if (intent.action === 'complete') {
       const goal = await invoke('complete_live_goal')
+      if (!isCurrent())
+        return null
       message.success('目标已标记完成')
       return goal
     }
     else {
       await invoke('clear_live_goal')
+      if (!isCurrent())
+        return null
       message.success('目标已从菜单栏清除')
       return null
     }
   }
   catch (error) {
     console.error('同步 Live Goal 失败:', error)
-    message.warning(`目标同步失败: ${String(error)}`)
+    if (isCurrent())
+      message.warning(`目标同步失败: ${String(error)}`)
     return null
   }
 }
@@ -397,8 +426,34 @@ function buildGoalTitle(
 
 // 计算属性
 const isVisible = computed(() => !!props.request)
+const isNative = computed(() => props.request?.source === 'codex_native')
+const ordinaryDeliveryText = computed(() => {
+  switch (mcpDeliveryStatus.value) {
+    case 'waiting': return '等待调用方接收'
+    case 'returned': return '已交给调用方'
+    case 'disconnected': return '连接已断开'
+    case 'untracked': return '状态未跟踪'
+    default: return '状态待确认'
+  }
+})
+const nativeRetryConfirmed = ref(false)
+const nativeLocked = computed(() => ['sending', 'received'].includes(props.request?.native?.status || ''))
+const nativeStatusText = computed(() => {
+  const status = props.request?.native?.status
+  if (status === 'sending')
+    return '正在等待 CLI 接收确认…'
+  if (status === 'received')
+    return 'CLI 已接收（不代表模型已采用）'
+  if (status === 'unknown')
+    return '发送结果未知；未自动重发，人工重试可能重复'
+  return `CLI 问题 ${Number(props.request?.native?.index ?? 0) + 1} · 仅文字与选项，不支持附件`
+})
 const hasOptions = computed(() => (props.request?.predefined_options?.length ?? 0) > 0)
 const canSubmit = computed(() => {
+  if (isNative.value) {
+    return !nativeLocked.value && (props.request?.native?.status !== 'unknown' || nativeRetryConfirmed.value)
+      && (selectedOptions.value.length > 0 || userInput.value.trim().length > 0)
+  }
   if (hasOptions.value) {
     return selectedOptions.value.length > 0
       || userInput.value.trim().length > 0
@@ -554,7 +609,7 @@ async function scheduleInputFocus(
   reason: string,
   options: { preserveExistingFocus?: boolean, activateWindow?: boolean } = {},
 ) {
-  if (!isVisible.value || loading.value || !inputRef.value)
+  if (!focusPopupOnShow.value || !isVisible.value || loading.value || !inputRef.value)
     return
 
   if (options.preserveExistingFocus && shouldPreserveCurrentFocus()) {
@@ -576,7 +631,7 @@ async function scheduleInputFocus(
   await nextTick()
 
   const attemptFocus = () => {
-    if (!isVisible.value || loading.value || !inputRef.value)
+    if (!focusPopupOnShow.value || !isVisible.value || loading.value || !inputRef.value)
       return false
 
     inputRef.value.focusInput?.()
@@ -604,6 +659,7 @@ async function scheduleInputFocus(
 function syncInputData(data: PopupInputData) {
   if (data.userInput !== undefined) {
     userInput.value = data.userInput
+    rawUserInput.value = data.rawUserInput ?? data.userInput
   }
   if (data.selectedOptions !== undefined) {
     selectedOptions.value = [...data.selectedOptions]
@@ -664,6 +720,15 @@ function applyTimelinePrefill(payload: TimelinePrefillPayload) {
   flushTimelinePrefill()
 }
 
+function getDraft(): TimelinePrefillPayload {
+  return {
+    userInput: rawUserInput.value,
+    selectedOptions: [...selectedOptions.value],
+    draggedImages: [...draggedImages.value],
+    attachedFiles: attachedFiles.value.map(file => ({ ...file })),
+  }
+}
+
 // 加载继续回复配置
 async function loadReplyConfig() {
   try {
@@ -671,6 +736,7 @@ async function loadReplyConfig() {
     if (config) {
       const replyConfig = config as any
       continueReplyEnabled.value = replyConfig.enable_continue_reply ?? true
+      copySubmissionToClipboardEnabled.value = replyConfig.copy_submission_to_clipboard ?? false
       continuePrompt.value = replyConfig.continue_prompt ?? '请按照最佳实践继续'
       loopPrompt.value = replyConfig.loop_prompt ?? DEFAULT_LOOP_PROMPT
       goalPromptTemplate.value = replyConfig.goal_prompt_template ?? DEFAULT_GOAL_PROMPT_TEMPLATE
@@ -694,10 +760,28 @@ watch(() => props.appConfig.reply, (newReplyConfig) => {
 let telegramUnlisten: (() => void) | null = null
 
 // 监听请求变化
-watch(() => props.request, async (newRequest) => {
+watch(() => props.request, async (newRequest, oldRequest) => {
+  if (!newRequest || newRequest.id !== oldRequest?.id)
+    viewedHistoryNode.value = null
   if (newRequest) {
+    if (newRequest.source === 'codex_native' && oldRequest?.id === newRequest.id)
+      return
+    focusPopupOnShow.value = false
     resetForm()
+    nativeRetryConfirmed.value = false
+    if (newRequest.source === 'codex_native' && newRequest.native?.draft) {
+      userInput.value = newRequest.native.draft.userInput
+      selectedOptions.value = [...newRequest.native.draft.selectedOptions]
+    }
     loading.value = true
+    try {
+      const config = await invoke<{ focus_popup_on_show?: boolean }>('get_window_config')
+      focusPopupOnShow.value = config.focus_popup_on_show !== false
+    }
+    catch (error) {
+      console.warn('加载弹窗聚焦设置失败，使用默认行为:', error)
+      focusPopupOnShow.value = true
+    }
     // 每次显示弹窗时重新加载配置
     loadReplyConfig()
 
@@ -709,13 +793,14 @@ watch(() => props.request, async (newRequest) => {
       console.log('🔔 关键 loop 弹窗：自动取消静音')
     }
 
-    // 窗口居中到当前屏幕（静音模式下跳过，避免覆盖 minimize）
+    // 常驻窗口按请求重定位；独立 MCP 窗口由 useMcpHandler 在首次显示前定位。
     if (!props.isMuted || shouldForceShow) {
       try {
-        await invoke('center_window')
+        if (!(await resolveMcpLaunchContext()).isStandaloneMode)
+          await invoke('center_window')
       }
       catch (e) {
-        console.log('窗口居中失败:', e)
+        console.log('窗口定位失败:', e)
       }
     }
 
@@ -729,6 +814,10 @@ watch(() => props.request, async (newRequest) => {
     clearFocusRetryTimer()
   }
 }, { immediate: true })
+
+watch(() => props.timelineTreeId, () => {
+  viewedHistoryNode.value = null
+})
 
 watch(() => loading.value, (isLoading) => {
   if (!isLoading) {
@@ -785,6 +874,8 @@ async function setupTelegramListener() {
 
 // 处理Telegram事件
 function handleTelegramEvent(event: any) {
+  if (isNative.value)
+    return
   console.log('🎯 [McpPopup] 开始处理事件:', event.type)
 
   switch (event.type) {
@@ -905,57 +996,133 @@ onUnmounted(() => {
 function resetForm() {
   selectedOptions.value = []
   userInput.value = ''
+  rawUserInput.value = ''
   draggedImages.value = []
   attachedFiles.value = []
   submitting.value = false
+}
+
+async function backupCurrentSubmissionToClipboard(
+  snapshot = { enabled: copySubmissionToClipboardEnabled.value, userInput: rawUserInput.value, selectedOptions: [...selectedOptions.value] },
+  isCurrent: () => boolean = () => true,
+) {
+  if (!isCurrent())
+    return
+  try {
+    await copySubmissionToClipboard({
+      ...snapshot,
+      writeText: text => invoke('plugin:clipboard-manager|write_text', { text }),
+    })
+  }
+  catch (error) {
+    console.error('发送内容备份到剪贴板失败:', error)
+    if (isCurrent())
+      message.warning('未能备份到剪贴板，仍将继续发送')
+  }
 }
 
 // 桌面弹窗统一回复给当前 IDE/MCP 调用方。
 async function handleSubmit() {
   if (!canSubmit.value || submitting.value)
     return
+  if (isNative.value) {
+    emit('response', {
+      user_input: userInput.value,
+      selected_options: [...selectedOptions.value],
+      images: [],
+      file_paths: [],
+      image_paths: [],
+      native_retry: nativeRetryConfirmed.value,
+      metadata: { request_id: props.request?.id, source: 'codex_native' },
+    })
+    return
+  }
 
-  void invoke('timeline_debug_log', {
-    location: 'frontend/mcp_popup/handle_submit:start',
-    payload: {
-      userInput: userInput.value,
-      selectedOptions: selectedOptions.value,
-      hasInputRef: Boolean(inputRef.value),
-      hasRecordAutoPromotion: typeof inputRef.value?.recordSubmittedInputForAutoPromotion === 'function',
-      sendTarget: 'ide',
-    },
-  }).catch(() => {})
   submitting.value = true
-
-  try {
-    const finalUserInput = buildFinalUserInput(userInput.value, attachedFiles.value)
-    inputRef.value?.recordSubmittedInputForAutoPromotion()
+  const request: McpRequest | null = props.request ? JSON.parse(JSON.stringify(props.request)) : null
+  const requestId = request?.id || ''
+  const snapshot = {
+    request,
+    userInput: userInput.value,
+    rawUserInput: rawUserInput.value,
+    selectedOptions: [...selectedOptions.value],
+    draggedImages: [...draggedImages.value],
+    attachedFiles: attachedFiles.value.map(file => ({ ...file })),
+    copyToClipboard: copySubmissionToClipboardEnabled.value,
+    input: inputRef.value,
+  }
+  const ownsPopup = () => isDesktopSubmissionCurrent(props.request, snapshot.request)
+  const prepare = async (ownsHandler: () => boolean = () => true) => {
+    const isCurrent = () => ownsPopup() && ownsHandler()
+    const checkCurrent = () => {
+      if (!isCurrent())
+        throw new Error('请求已变化，已停止准备回复')
+    }
+    checkCurrent()
+    void invoke('timeline_debug_log', {
+      location: 'frontend/mcp_popup/handle_submit:start',
+      payload: {
+        userInput: snapshot.userInput,
+        selectedOptions: snapshot.selectedOptions,
+        hasInputRef: Boolean(snapshot.input),
+        hasRecordAutoPromotion: typeof snapshot.input?.recordSubmittedInputForAutoPromotion === 'function',
+        sendTarget: 'ide',
+      },
+    }).catch(() => {})
+    await backupCurrentSubmissionToClipboard({ enabled: snapshot.copyToClipboard, userInput: snapshot.rawUserInput, selectedOptions: snapshot.selectedOptions }, isCurrent)
+    checkCurrent()
+    const finalUserInput = buildFinalUserInput(snapshot.userInput, snapshot.attachedFiles)
+    snapshot.input?.recordSubmittedInputForAutoPromotion(snapshot.rawUserInput)
     const response = {
       user_input: finalUserInput,
-      selected_options: selectedOptions.value,
-      images: buildImageAttachments(draggedImages.value),
-      file_paths: buildFilePaths(attachedFiles.value),
+      selected_options: snapshot.selectedOptions,
+      images: buildImageAttachments(snapshot.draggedImages),
+      file_paths: buildFilePaths(snapshot.attachedFiles),
       image_paths: [],
       metadata: {
         timestamp: new Date().toISOString(),
-        request_id: props.request?.id || null,
-        source: resolveSubmitSource(finalUserInput, selectedOptions.value),
+        request_id: requestId || null,
+        source: resolveSubmitSource(finalUserInput ?? '', snapshot.selectedOptions),
       },
     }
 
     if (!response.user_input && response.selected_options.length === 0 && response.images.length === 0)
       response.user_input = '用户确认继续'
 
-    const liveGoalSnapshot = await applyLiveGoalIntent(response.user_input || '', response.selected_options)
-    if (liveGoalSnapshot)
-      Object.assign(response.metadata, await resolveLiveGoalResponseMetadata(liveGoalSnapshot))
+    const liveGoalSnapshot = await applyLiveGoalIntent(response.user_input || '', response.selected_options, snapshot.request, isCurrent)
+    checkCurrent()
+    if (liveGoalSnapshot) {
+      const metadata = await resolveLiveGoalResponseMetadata(liveGoalSnapshot, snapshot.request, isCurrent)
+      checkCurrent()
+      Object.assign(response.metadata, metadata)
+    }
 
     if (props.mockMode) {
       await new Promise(resolve => setTimeout(resolve, 1000))
+      checkCurrent()
       message.success('模拟响应发送成功')
     }
 
-    emit('response', response)
+    return response
+  }
+
+  if (!props.mockMode && !props.testMode) {
+    const submission: DesktopMcpSubmission = {
+      kind: 'desktop_mcp_submission',
+      requestId,
+      request: snapshot.request,
+      prepare,
+      settled: () => {
+        if (ownsPopup())
+          submitting.value = false
+      },
+    }
+    emit('response', submission)
+    return
+  }
+
+  try {
+    emit('response', await prepare())
   }
   catch (error) {
     console.error('提交失败:', error)
@@ -969,6 +1136,7 @@ async function handleSubmit() {
 // 处理输入更新
 function handleInputUpdate(data: PopupInputData) {
   userInput.value = data.userInput ?? ''
+  rawUserInput.value = data.rawUserInput ?? data.userInput ?? ''
   selectedOptions.value = data.selectedOptions ?? []
   draggedImages.value = data.draggedImages ?? []
   attachedFiles.value = data.attachedFiles ?? []
@@ -981,12 +1149,15 @@ function handleImageAdd(_image: string) {
 
 // 处理继续按钮点击
 async function handleContinue() {
+  if (isNative.value)
+    return
   if (submitting.value)
     return
 
   submitting.value = true
 
   try {
+    await backupCurrentSubmissionToClipboard()
     // 使用新的结构化数据格式
     const response = {
       user_input: continuePrompt.value,
@@ -1026,14 +1197,24 @@ function handleQuoteMessage(messageContent: string) {
   }
 }
 
-function handleTimelineNodeQuote(content: string) {
-  const normalized = content.trim()
+async function handleTimelineNodeQuote(content: string) {
+  const selection = window.getSelection()
+  const selectedText = selection?.anchorNode && viewedHistoryContentRef.value?.contains(selection.anchorNode)
+    ? selection.toString().trim()
+    : ''
+  const normalized = (selectedText || content).trim()
   if (!normalized)
     return
+  returnToCurrentQuestion()
+  await nextTick()
   handleQuoteMessage(normalized)
 }
 
 function handleFilesAdd(files: PopupFileAttachment[]) {
+  if (isNative.value) {
+    message.warning('CLI 问题不支持附件，请用文字或选项回答')
+    return
+  }
   const mergedFiles = [...attachedFiles.value]
 
   files.forEach((file) => {
@@ -1086,19 +1267,25 @@ function normalizeOptionalNumber(value: unknown): number | null {
   return Number.isFinite(numeric) && numeric >= 0 ? Math.trunc(numeric) : null
 }
 
-async function resolveLiveGoalResponseMetadata(liveGoal: any | null): Promise<LiveGoalRunMetadata> {
+async function resolveLiveGoalResponseMetadata(
+  liveGoal: any | null,
+  request: McpRequest | null = props.request,
+  isCurrent: () => boolean = () => true,
+): Promise<LiveGoalRunMetadata> {
   const runId = normalizeOptionalString(liveGoal?.run_id ?? liveGoal?.runId)
   const generation = normalizeOptionalNumber(liveGoal?.generation ?? liveGoal?.runGeneration)
   const fallback = emptyLiveGoalRunMetadata(runId, generation)
-  if (!runId && generation === null)
+  if (!isCurrent() || (!runId && generation === null))
     return fallback
 
   try {
     const metadata = await invoke<any>('resolve_live_goal_response_metadata', {
-      projectPath: props.request?.project_path,
+      projectPath: request?.project_path,
       runId,
       generation,
     })
+    if (!isCurrent())
+      return fallback
     return {
       run_id: normalizeOptionalString(metadata?.run_id ?? metadata?.runId) ?? runId,
       generation: normalizeOptionalNumber(metadata?.generation ?? metadata?.runGeneration) ?? generation,
@@ -1165,6 +1352,8 @@ function shouldPrefetchGoalRunHuiSnapshot(goal: string): boolean {
 
 // 处理目标按钮点击：启动 Live Goal，并提交一次非 loop 的目标模式请求。
 async function handleGoalSubmit() {
+  if (isNative.value)
+    return
   if (submitting.value)
     return
 
@@ -1195,6 +1384,7 @@ async function handleGoalSubmit() {
       return
     }
 
+    await backupCurrentSubmissionToClipboard()
     const liveGoalSnapshot = await applyLiveGoalIntent(`/goal ${goalTitle}`)
     const huiSnapshot = shouldPrefetchGoalRunHuiSnapshot(goalText)
       ? await getGoalRunHuiSnapshot(liveGoalSnapshot)
@@ -1242,6 +1432,7 @@ async function handleGoalSubmit() {
 
 defineExpose({
   applyTimelinePrefill,
+  getDraft,
 })
 </script>
 
@@ -1257,12 +1448,21 @@ defineExpose({
       <div class="flex-1 min-h-0 overflow-y-auto scrollbar-thin" @click="handleMiddleZoneClick">
         <!-- 消息内容 - 允许选中 -->
         <div class="mx-2 mt-2 mb-1 px-4 py-3 bg-black-100 rounded-lg select-text" data-guide="popup-content">
+          <div v-if="viewedHistoryNode" data-guide="popup-history-content">
+            <div class="mb-2 text-xs font-semibold text-gray-400">
+              {{ viewedHistoryNode.node_type === 'user' ? '用户' : '助手' }}
+            </div>
+            <div ref="viewedHistoryContentRef" class="whitespace-pre-wrap break-words">
+              {{ viewedHistoryNode.content }}
+            </div>
+          </div>
           <PopupContent
+            v-else
             ref="contentRef"
             :request="request"
             :loading="loading"
             :current-theme="props.appConfig.theme"
-            :browser-ai-response="browserAiResponse"
+            :browser-ai-response="isNative ? null : browserAiResponse"
             @add-files="handleFilesAdd"
             @open-artifact="handleOpenArtifact"
             @quote-message="handleQuoteMessage"
@@ -1271,7 +1471,32 @@ defineExpose({
 
         <!-- 输入和选项 - 允许选中 -->
         <div class="px-4 pb-3 bg-black select-text">
+          <div v-if="viewedHistoryNode" class="mb-2 flex items-center justify-between gap-2 text-xs text-gray-500">
+            <span>回复当前待回复请求 · {{ request?.conversation_title || request?.project_path || '当前请求' }}</span>
+            <div class="flex gap-2 flex-shrink-0">
+              <n-button v-if="!isNative" size="small" @click="handleTimelineNodeQuote(viewedHistoryNode.content)">引用</n-button>
+              <n-button size="small" @click="returnToCurrentQuestion">返回当前问题</n-button>
+            </div>
+          </div>
+          <div v-if="isNative" class="flex flex-col gap-2" data-guide="native-question-input">
+            <div class="text-xs text-gray-500">
+              {{ nativeStatusText }}
+            </div>
+            <NCheckboxGroup v-model:value="selectedOptions" :disabled="nativeLocked">
+              <div v-for="option in request?.predefined_options" :key="option" class="mb-2">
+                <n-checkbox :value="option" :label="option" />
+              </div>
+            </NCheckboxGroup>
+            <n-input v-model:value="userInput" type="textarea" :disabled="nativeLocked" placeholder="输入回答" :autosize="{ minRows: 3, maxRows: 10 }" />
+            <div v-if="request?.native?.error" class="text-xs text-red-500" role="status">
+              {{ request.native.error }}
+            </div>
+            <n-checkbox v-if="request?.native?.status === 'unknown'" v-model:checked="nativeRetryConfirmed">
+              我知道人工重试可能造成重复回答
+            </n-checkbox>
+          </div>
           <PopupInput
+            v-else
             ref="inputRef"
             :request="request"
             :context-key="popupContextKey"
@@ -1279,6 +1504,7 @@ defineExpose({
             :enable-context-append="true"
             :loading="loading"
             :submitting="submitting"
+            :auto-focus="focusPopupOnShow"
             @update="handleInputUpdate"
             @image-add="handleImageAdd"
             @conditional-state-change="emit('conditionalStateChange', $event)"
@@ -1291,12 +1517,13 @@ defineExpose({
       <!-- 右侧：时间线小球条（仅在内容区，不延伸到底部操作栏） -->
       <div class="timeline-dot-column flex-shrink-0 self-stretch min-h-0 overflow-hidden">
         <TimelineDotBar
+          :key="`${request?.id}:${timelineSelectionRevision}`"
           :tree-id="props.timelineTreeId ?? null"
           :current-node-id="props.timelineCurrentNodeId ?? null"
           :mock-nodes="props.timelineMockNodes"
           compact-hover
           :compact-expanded="timelineEdgeActive"
-          @node-click="emit('timelineNodeClick', $event)"
+          @node-click="viewedHistoryNode = $event"
           @node-quote="handleTimelineNodeQuote"
         />
       </div>
@@ -1304,8 +1531,21 @@ defineExpose({
 
     <!-- 底部操作栏 - 固定在底部 -->
     <div class="mt-auto flex-shrink-0 bg-black-100 border-t-2 border-black-200" data-guide="popup-actions">
+      <div v-if="isNative" class="px-4 py-3 flex items-center justify-between gap-3">
+        <span class="text-xs text-gray-500" role="status">{{ nativeStatusText }}</span>
+        <div class="flex gap-2 flex-shrink-0">
+          <n-button :disabled="request?.native?.status === 'sending'" @click="emit('cancel')">
+            关闭
+          </n-button>
+          <n-button v-if="request?.native?.status !== 'received'" type="primary" :disabled="!canSubmit" :loading="request?.native?.status === 'sending'" @click="handleSubmit">
+            {{ (request?.native?.remaining ?? 0) > 0 ? '下一题' : request?.native?.status === 'unknown' ? '重试发送' : '发送' }}
+          </n-button>
+        </div>
+      </div>
       <PopupActions
+        v-else
         :request="request" :loading="loading" :submitting="submitting" :can-submit="canSubmit"
+        :connection-status="ordinaryDeliveryText"
         :continue-reply-enabled="continueReplyEnabled" :input-status-text="inputStatusText"
         @submit="handleSubmit" @continue="handleContinue" @goal-submit="handleGoalSubmit"
       />

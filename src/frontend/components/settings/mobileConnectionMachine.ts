@@ -123,7 +123,7 @@ export function isHealthySecurePairingCandidate(candidate: PairingStatusCandidat
   if (candidate.disabled)
     return false
   const mode = String(candidate.transport_mode || '').toLowerCase()
-  if (!['public_tunnel', 'cloudflare_tunnel', 'relay'].includes(mode))
+  if (!['public_tunnel', 'cloudflare_tunnel', 'relay', 'cloud_hub'].includes(mode))
     return false
   const health = String(candidate.health || '').toLowerCase()
   if (!['healthy', 'ok'].includes(health))
@@ -158,7 +158,7 @@ export function resolveMobileConnectionBootstrap(
   const routeIsHealthy = String(formalRoute.health || '').toLowerCase() === 'healthy'
     && formalRoute.endpoint_identity_ok === true
   const matchingCandidate = normalizePairingStatusCandidates(pairingStatus).some(candidate => (
-    candidate.transport_mode === 'public_tunnel'
+    (candidate.transport_mode === 'public_tunnel' || (formalRoute.transport === 'cloud_hub' && candidate.transport_mode === 'cloud_hub'))
     && isHealthySecurePairingCandidate(candidate)
     && sameOrigin(String(candidate.base_url || ''), configuredBaseUrl)
   ))

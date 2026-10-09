@@ -2,7 +2,7 @@
 import { computed, watch } from 'vue'
 import { useLocalQrCode } from '../../composables/useLocalQrCode'
 import { mobileConnectionFailureText } from './mobileConnectionMachine'
-import { useMobileConnectionSetup } from './useMobileConnectionSetup'
+import { buildAliyunIpRouteSetupPrompt, useMobileConnectionSetup } from './useMobileConnectionSetup'
 
 const show = defineModel<boolean>('show', { default: false })
 
@@ -31,9 +31,9 @@ const stageText = computed(() => {
     case 'setup_required': return '需要配置正式公网连接'
     case 'recovering_formal_route': return '正在恢复正式公网连接'
     case 'issuing_pairing': return '正在生成一次性二维码'
-    case 'waiting_for_claim': return '用 iPhone 扫描二维码'
-    case 'waiting_for_connection': return 'iPhone 已认领，正在建立安全连接'
-    case 'complete': return 'iPhone 已连接'
+    case 'waiting_for_claim': return '用 Android 手机扫描二维码'
+    case 'waiting_for_connection': return 'Android 设备已认领，正在建立安全连接'
+    case 'complete': return 'Android 已连接'
     case 'repair_required': return '正式公网连接需要修复'
     case 'expired': return '二维码已过期'
     case 'cancelled': return '连接向导已取消'
@@ -71,6 +71,11 @@ async function copyAiPrompt() {
     : '正式连接配置提示词已复制。'
 }
 
+async function copyAliyunIpPrompt() {
+  await navigator.clipboard.writeText(buildAliyunIpRouteSetupPrompt())
+  notice.value = '阿里云 IP 配置提示词已复制。'
+}
+
 watch(show, (visible) => {
   if (visible)
     void bootstrap()
@@ -83,7 +88,7 @@ watch(show, (visible) => {
   <n-modal
     v-model:show="show"
     preset="card"
-    title="连接 iPhone"
+    title="连接 Android"
     class="mobile-connection-wizard"
     :bordered="false"
   >
@@ -124,7 +129,7 @@ watch(show, (visible) => {
 
       <template v-else-if="state.stage === 'setup_required'">
         <n-alert type="info" :bordered="false">
-          当前电脑还没有登记正式公网路线。复制下面的安全提示词交给 AI；遇到 Cloudflare 登录、域名、DNS、管理员权限或凭据步骤时，AI 必须停下来由你确认。
+          当前电脑还没有登记正式公网路线。可以选择 Cloudflare Named Tunnel 或阿里云 IP + SSH；涉及凭据、费用或安全边界的步骤需由你决定。
         </n-alert>
         <div class="prompt-preview">
           <div class="text-xs font-medium">
@@ -136,7 +141,10 @@ watch(show, (visible) => {
         </div>
         <div class="grid grid-cols-2 gap-2">
           <n-button size="large" class="tap-target" @click="copyAiPrompt">
-            复制 AI 配置提示词
+            复制 AI 配置提示词（Cloudflare）
+          </n-button>
+          <n-button size="large" class="tap-target" @click="copyAliyunIpPrompt">
+            复制阿里云 IP 配置提示词
           </n-button>
           <n-button type="primary" size="large" class="tap-target" @click="retry">
             重新检测
@@ -149,7 +157,7 @@ watch(show, (visible) => {
           正式配置仍然保留，只是当前自动恢复未通过。修复提示词只允许检查和恢复现有路线，不会退回首次配置或创建测试路线。
         </n-alert>
         <div v-if="formalRoute?.base_url" class="route-receipt text-xs">
-          已配置地址：{{ formalRoute.base_url }}
+          已配置{{ formalRoute.transport === 'aliyun_ssh_reverse_tunnel' ? '阿里云 IP + SSH' : 'Cloudflare' }}地址：{{ formalRoute.base_url }}
         </div>
         <div class="text-xs opacity-70">
           {{ terminalText }}
@@ -167,10 +175,10 @@ watch(show, (visible) => {
       <template v-else-if="state.stage === 'waiting_for_claim'">
         <div class="qr-card">
           <n-spin v-if="!qrCodeUrl" size="small" />
-          <img v-else :src="qrCodeUrl" alt="iPhone 一次性连接二维码" class="qr-image">
+          <img v-else :src="qrCodeUrl" alt="Android 一次性连接二维码" class="qr-image">
         </div>
         <div class="text-center text-xs opacity-70" aria-live="polite">
-          二维码将在 {{ remainingSeconds }} 秒后过期。请只在目标 iPhone 上扫描。
+          二维码将在 {{ remainingSeconds }} 秒后过期。请使用目标 Android 手机安装 iterate 后扫描。
         </div>
         <div v-if="pairingPayload?.device_name" class="text-center text-xs opacity-55">
           当前电脑：{{ pairingPayload.device_name }}
@@ -199,7 +207,7 @@ watch(show, (visible) => {
 
       <template v-else-if="state.stage === 'complete'">
         <n-alert type="success" :bordered="false">
-          iPhone 已通过正式公网路线连接。
+          Android 已通过正式公网路线连接。
         </n-alert>
         <div class="text-xs opacity-70">
           设备 ID：…{{ deviceSuffix(state.deviceId) }}

@@ -12,9 +12,12 @@ describe('MCP response immediate dismissal', () => {
   it('dismisses the popup before route lookup and response persistence', () => {
     const responseHandler = source.match(/async function handleMcpResponse\(response: any\) \{([\s\S]*?)\n {2}\}/)?.[1]
     assert.ok(responseHandler)
-    const dismissIndex = responseHandler.indexOf('await dismissMcpUiImmediately(request)')
-    const routeIndex = responseHandler.indexOf('await resolveConversationRouteIdWithFallback')
-    const sendIndex = responseHandler.indexOf('send_mcp_response')
+    // Legacy already-prepared actions retain their original dismissal path.
+    // Click-to-send preparation is exercised by desktopSubmission behavioral tests.
+    const legacyResponseHandler = responseHandler.slice(responseHandler.indexOf('let dismissal:'))
+    const dismissIndex = legacyResponseHandler.indexOf('await dismissMcpUiImmediately(request)')
+    const routeIndex = legacyResponseHandler.indexOf('await resolveConversationRouteIdWithFallback')
+    const sendIndex = legacyResponseHandler.indexOf('send_mcp_response')
     assert.ok(dismissIndex >= 0)
     assert.ok(routeIndex > dismissIndex)
     assert.ok(sendIndex > routeIndex)

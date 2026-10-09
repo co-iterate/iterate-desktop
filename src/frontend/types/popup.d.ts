@@ -4,6 +4,16 @@ export type { PopupTextSelection, PopupTextSelectionSource } from '../utils/popu
 
 export interface McpRequest {
   id: string
+  source?: 'codex_native'
+  native?: {
+    group_id: string
+    index: number
+    question_item_id: string
+    status: 'waiting' | 'sending' | 'unknown' | 'received'
+    remaining?: number
+    draft?: { userInput: string, selectedOptions: string[] }
+    error?: string
+  }
   message: string
   predefined_options?: string[]
   is_markdown?: boolean
@@ -12,7 +22,9 @@ export interface McpRequest {
   project_path?: string
   codex_home?: string
   codex_thread_id?: string
+  codex_thread_provenance?: 'caller_meta' | 'explicit_argument'
   codex_deeplink?: string
+  conversation_title?: string
   checkpoint_id?: string
   checkpoint_commit?: string
   checkpoint_message?: string
@@ -104,6 +116,7 @@ export interface PopupFileAttachment {
 
 export interface PopupInputData {
   userInput?: string
+  rawUserInput?: string
   selectedOptions?: string[]
   draggedImages?: string[]
   attachedFiles?: PopupFileAttachment[]

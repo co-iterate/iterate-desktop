@@ -217,6 +217,7 @@ fn active_interaction_matches(state: &ServerState, request_id: &str, workspace: 
 }
 
 struct DialogCleanupGuard {
+    delivery: Arc<crate::delivery::Delivery>,
     state: Arc<Mutex<ServerState>>,
     request_id: String,
     workspace: String,
@@ -230,8 +231,10 @@ impl DialogCleanupGuard {
         request_id: String,
         workspace: String,
         lifecycle_task: JoinHandle<()>,
+        delivery: Arc<crate::delivery::Delivery>,
     ) -> Self {
         Self {
+            delivery,
             state,
             request_id,
             workspace,
@@ -247,6 +250,7 @@ impl DialogCleanupGuard {
     }
 
     fn disarm(&mut self) {
+        self.delivery.returned();
         self.abort_lifecycle();
         self.active = false;
     }
@@ -257,7 +261,7 @@ impl Drop for DialogCleanupGuard {
         if !self.active {
             return;
         }
-
+        self.delivery.failed();
         self.abort_lifecycle();
         let state = Arc::clone(&self.state);
         let request_id = self.request_id.clone();
@@ -281,6 +285,8 @@ impl Drop for DialogCleanupGuard {
 /// 对话请求
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DialogRequest {
+    #[serde(skip)]
+    pub delivery: Option<Arc<crate::delivery::Delivery>>,
     /// MCP 父请求 ID，用于跨层关联日志
     #[serde(default)]
     pub request_id: String,
@@ -301,9 +307,15 @@ pub struct DialogRequest {
     /// 调用本次 MCP 的 Codex 会话 ID，用于回到原会话
     #[serde(default)]
     pub codex_thread_id: Option<String>,
+    /// Internal producer provenance; absent for old requests and project-based fallbacks.
+    #[serde(default)]
+    pub codex_thread_provenance: Option<String>,
     /// 调用本次 MCP 的 Codex 会话 deep link
     #[serde(default)]
     pub codex_deeplink: Option<String>,
+    /// 调用本次 MCP 的对话标题
+    #[serde(default)]
+    pub conversation_title: Option<String>,
     /// 当前请求对应的 checkpoint ID
     #[serde(default)]
     pub checkpoint_id: Option<String>,
@@ -429,6 +441,9 @@ pub struct DialogResponse {
     /// conversation / timeline metadata returned by the popup response path.
     #[serde(default)]
     pub metadata: crate::mcp::ResponseMetadata,
+    /// Internal exact serve request binding; never accepted from or sent to HTTP clients.
+    #[serde(skip)]
+    pub source_request_id: Option<String>,
     /// 错误信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -444,6 +459,7 @@ impl Default for DialogResponse {
             file_paths: vec![],
             image_paths: vec![],
             metadata: crate::mcp::ResponseMetadata::default(),
+            source_request_id: None,
             error: None,
         }
     }
@@ -705,6 +721,23 @@ fn renew_serve_response_route_file(
         });
     }
 
+    if response_file.exists() {
+        return Err(RenewServeResponseRouteResponse {
+            ok: false,
+            status: "rejected",
+            reason: Some("response_file_already_exists"),
+            request_id: request_id.to_string(),
+            project_path: Some(expected_project.to_string()),
+            route_file: route_file_str,
+            response_file: response_file_str,
+            renewed: false,
+            route_age_secs,
+            route_ttl_secs: SERVE_RESPONSE_ROUTE_TTL_SECS,
+            original_created_at: route.original_created_at,
+            renewal_count: route.renewal_count,
+        });
+    }
+
     let original_created_at = route.original_created_at.or(Some(route.created_at));
     let renewal_count = route.renewal_count.unwrap_or(0).saturating_add(1);
     route.created_at = now;
@@ -713,12 +746,15 @@ fn renew_serve_response_route_file(
     route.renewed_by = Some("iterate-server".to_string());
     route.renewal_count = Some(renewal_count);
 
-    if fs::write(
-        &route_file,
-        format!("{}\n", serde_json::to_string(&route).unwrap_or_default()),
-    )
-    .is_err()
-    {
+    // The source process may remove this route without taking ServerState's
+    // lock. Opening without create prevents a late renewal from resurrecting
+    // a route that the source has already closed.
+    let write_result = OpenOptions::new().write(true).open(&route_file)
+        .and_then(|mut file| {
+            file.set_len(0)?;
+            file.write_all(format!("{}\n", serde_json::to_string(&route).unwrap_or_default()).as_bytes())
+        });
+    if write_result.is_err() || !route_file.exists() {
         return Err(RenewServeResponseRouteResponse {
             ok: false,
             status: "rejected",
@@ -823,8 +859,8 @@ async fn renew_serve_response_route(
                 .into_response();
         }
     }
-    drop(state);
-
+    // Keep ServerState locked through the file update. A lifecycle event
+    // cannot change WaitingUser or the active route between check and write.
     match renew_serve_response_route_file(request_id, &active_workspace) {
         Ok(response) => Json(response).into_response(),
         Err(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
@@ -841,6 +877,13 @@ fn json_response(resp: &DialogResponse) -> Response {
         .header(header::CONTENT_LENGTH, body.len())
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn confirm_cross_device_handoff(response: &DialogResponse, workspace: &str) {
+    if response.error.is_some() { return; }
+    let Some(request_id) = response.source_request_id.as_deref() else { return; };
+    // Non-cross-device replies simply have no matching prepared receipt.
+    let _ = crate::cross_device::mark_source_handed_off(request_id, workspace);
 }
 
 async fn handle_dialog(
@@ -1056,6 +1099,11 @@ async fn handle_dialog(
     }
 
     let (response_tx, response_rx) = oneshot::channel();
+    let delivery = match crate::delivery::Delivery::new() {
+        Ok(delivery) => Arc::new(delivery),
+        Err(error) => return json_response(&DialogResponse { error: Some(error.to_string()), ..Default::default() }),
+    };
+    request.delivery = Some(Arc::clone(&delivery));
     request.response_tx = Some(response_tx);
     let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
     request.lifecycle_tx = Some(lifecycle_tx);
@@ -1079,6 +1127,7 @@ async fn handle_dialog(
         request_id_for_log.clone(),
         workspace_for_log.clone(),
         lifecycle_task,
+        delivery,
     );
 
     // 设置占用状态
@@ -1220,12 +1269,16 @@ async fn handle_dialog(
                     let mut state_guard = state.lock().await;
                     reset_active_interaction(&mut state_guard);
                     cleanup_guard.disarm();
-                    return json_response(&DialogResponse {
+                    let outgoing = json_response(&DialogResponse {
                         keep_going: false,
                         user_input: response.user_input.clone(),
                         response_source: response.response_source.clone(),
                         ..Default::default()
                     });
+                    if outgoing.status().is_success() {
+                        confirm_cross_device_handoff(&response, &workspace_for_log);
+                    }
+                    return outgoing;
                 }
                 _ => {}
             }
@@ -1240,7 +1293,11 @@ async fn handle_dialog(
         format!("request_id={}, state released", request_id_for_log),
     );
 
-    json_response(&response)
+    let outgoing = json_response(&response);
+    if outgoing.status().is_success() {
+        confirm_cross_device_handoff(&response, &workspace_for_log);
+    }
+    outgoing
 }
 
 /// 启动 HTTP 服务器
@@ -1524,5 +1581,89 @@ mod tests {
         assert_eq!(stored.renewal_count, None);
 
         let _ = fs::remove_file(route_file);
+    }
+
+    #[test]
+    fn renew_serve_response_route_file_rejects_already_written_response() {
+        let project = tempfile::tempdir().unwrap();
+        let request_id = format!("serve-renew-consumed-{}", uuid::Uuid::new_v4());
+        let route_file = serve_response_route_file(&request_id);
+        let response_file = std::env::temp_dir().join(format!("iterate_response_{request_id}.json"));
+        let old_created_at = Utc::now().timestamp() - SERVE_RESPONSE_ROUTE_TTL_SECS - 60;
+        let route = ServeResponseRoute {
+            request_id: request_id.clone(),
+            project_path: project.path().display().to_string(),
+            response_file: response_file.display().to_string(),
+            created_at: old_created_at,
+            original_created_at: None,
+            renewed_at: None,
+            renewed_by: None,
+            renewal_count: None,
+        };
+        fs::write(&route_file, serde_json::to_string(&route).unwrap()).unwrap();
+        fs::write(&response_file, "already answered").unwrap();
+
+        let rejected = renew_serve_response_route_file(
+            &request_id, &project.path().display().to_string(),
+        ).unwrap_err();
+        assert_eq!(rejected.reason, Some("response_file_already_exists"));
+        assert_eq!(fs::read_to_string(&response_file).unwrap(), "already answered");
+        let stored: ServeResponseRoute = serde_json::from_str(&fs::read_to_string(&route_file).unwrap()).unwrap();
+        assert_eq!(stored.created_at, old_created_at);
+        assert_eq!(stored.renewal_count, None);
+
+        fs::remove_file(route_file).unwrap();
+        fs::remove_file(response_file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renew_endpoint_rejects_closed_request_and_never_recreates_removed_route() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().display().to_string();
+        let request_id = format!("serve-renew-closed-{}", uuid::Uuid::new_v4());
+        let route_file = serve_response_route_file(&request_id);
+        let response_file = std::env::temp_dir().join(format!("iterate_response_{request_id}.json"));
+        let route = ServeResponseRoute {
+            request_id: request_id.clone(),
+            project_path: project_path.clone(),
+            response_file: response_file.display().to_string(),
+            created_at: Utc::now().timestamp() - SERVE_RESPONSE_ROUTE_TTL_SECS - 60,
+            original_created_at: None,
+            renewed_at: None,
+            renewed_by: None,
+            renewal_count: None,
+        };
+        fs::write(&route_file, serde_json::to_string(&route).unwrap()).unwrap();
+        let mut waiting = test_state();
+        waiting.active_workspace = Some(project_path.clone());
+        waiting.interaction_phase = InteractionPhase::WaitingUser;
+        waiting.active_serve_request_id = Some(request_id.clone());
+        let state = Arc::new(Mutex::new(waiting));
+        let request = || RenewServeResponseRouteRequest {
+            request_id: request_id.clone(),
+            project_path: Some(project_path.clone()),
+        };
+
+        {
+            let mut guard = state.lock().await;
+            guard.interaction_phase = InteractionPhase::Responded;
+        }
+        let closed = renew_serve_response_route(
+            State(state.clone()), Json(request()),
+        ).await;
+        assert_eq!(closed.status(), StatusCode::CONFLICT);
+        let unchanged: ServeResponseRoute = serde_json::from_str(&fs::read_to_string(&route_file).unwrap()).unwrap();
+        assert_eq!(unchanged.created_at, route.created_at);
+
+        {
+            let mut guard = state.lock().await;
+            guard.interaction_phase = InteractionPhase::WaitingUser;
+        }
+        fs::remove_file(&route_file).unwrap();
+        let missing = renew_serve_response_route(
+            State(state), Json(request()),
+        ).await;
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        assert!(!route_file.exists());
     }
 }

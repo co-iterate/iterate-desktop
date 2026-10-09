@@ -21,6 +21,7 @@ interface AppConfig {
 
 interface Props {
   appConfig: AppConfig
+  isMuted: boolean
   codexLivePhase: 'idle' | 'preparing' | 'connecting' | 'active' | 'reconnecting' | 'failed'
   codexLiveStatus: string
 }
@@ -28,6 +29,7 @@ interface Props {
 interface Emits {
   themeChange: [theme: string]
   toggleAlwaysOnTop: []
+  toggleMute: []
   toggleAudioNotification: []
   updateAudioUrl: [url: string]
   testAudio: []
@@ -46,6 +48,7 @@ defineEmits<Emits>()
 <template>
   <MainLayout
     :current-theme="appConfig.theme"
+    :is-muted="isMuted"
     :always-on-top="appConfig.window.alwaysOnTop"
     :audio-notification-enabled="appConfig.audio.enabled"
     :audio-url="appConfig.audio.url"
@@ -56,6 +59,7 @@ defineEmits<Emits>()
     :codex-live-status="codexLiveStatus"
     @theme-change="$emit('themeChange', $event)"
     @toggle-always-on-top="$emit('toggleAlwaysOnTop')"
+    @toggle-mute="$emit('toggleMute')"
     @toggle-audio-notification="$emit('toggleAudioNotification')"
     @update-audio-url="$emit('updateAudioUrl', $event)"
     @test-audio="$emit('testAudio')"

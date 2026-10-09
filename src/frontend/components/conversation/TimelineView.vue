@@ -21,6 +21,7 @@ interface ConversationNode {
 const props = defineProps<{
   treeId: string
   currentNodeId: string
+  readOnly?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -29,6 +30,8 @@ const emit = defineEmits<{
 
 const nodes = ref<ConversationNode[]>([])
 const loading = ref(false)
+const selectedReadOnlyNodeId = ref<string | null>(null)
+const selectedReadOnlyNode = computed(() => nodes.value.find(node => node.id === selectedReadOnlyNodeId.value))
 
 const nodeCountText = computed(() => `共 ${nodes.value.length} 个节点`)
 
@@ -55,7 +58,7 @@ function formatTime(timestamp: string) {
 
 function buildPreview(node: ConversationNode) {
   const selectedOption = node.metadata?.selected_option?.trim()
-  const normalized = (selectedOption || node.content).replace(/\s+/g, ' ').trim()
+  const normalized = (node.content.trim() || selectedOption || '').replace(/\s+/g, ' ').trim()
   if (!normalized)
     return '(空内容)'
   if (normalized.length <= 72)
@@ -93,6 +96,7 @@ async function loadPath() {
       nodeId: props.currentNodeId,
     })
     nodes.value = path
+    selectedReadOnlyNodeId.value = props.readOnly ? path.at(-1)?.id ?? null : null
     console.info('[Timeline] 对话路径加载成功', {
       treeId: props.treeId,
       currentNodeId: props.currentNodeId,
@@ -113,6 +117,14 @@ async function loadPath() {
   finally {
     loading.value = false
   }
+}
+
+function handleNodeClick(nodeId: string) {
+  if (props.readOnly) {
+    selectedReadOnlyNodeId.value = nodeId
+    return
+  }
+  emit('nodeClick', nodeId)
 }
 
 watch(
@@ -156,7 +168,7 @@ watch(
           type="button"
           class="timeline-node"
           :class="{ 'timeline-node-current': item.id === props.currentNodeId }"
-          @click="emit('nodeClick', item.id)"
+          @click="handleNodeClick(item.id)"
         >
           <div class="timeline-marker">
             <div
@@ -194,6 +206,9 @@ watch(
         </button>
       </template>
     </n-virtual-list>
+    <div v-if="props.readOnly && selectedReadOnlyNode" class="max-h-48 overflow-y-auto whitespace-pre-wrap break-words border-t border-white/10 p-3 text-sm text-gray-100">
+      {{ selectedReadOnlyNode.content || selectedReadOnlyNode.metadata?.selected_option || '(空内容)' }}
+    </div>
   </div>
 </template>
 

@@ -31,7 +31,7 @@ use super::apns_notification::{
 };
 use super::apns_token_store::{
     apns_device_token_count, apns_device_tokens_snapshot, apns_live_activity_tokens_snapshot,
-    init_apns_tokens, register_apns_device_token, register_apns_live_activity_token,
+    register_apns_device_token, register_apns_live_activity_token,
     remove_apns_device_tokens, remove_apns_live_activity_tokens,
     update_apns_device_notification_preference, ApnsNotificationPreferenceUpdate,
 };
@@ -52,6 +52,7 @@ use super::json_fields::{json_string_field, nested_metadata_string_field};
 use super::markdown_images::{
     register_markdown_images_for_mcp_state_payload, registered_markdown_image_path,
 };
+use super::mcp_action_delivery::{preflight_android_serve_response_route, preflight_mcp_action_delivery};
 #[cfg(test)]
 use super::mcp_action_delivery::try_write_serve_response_file;
 use super::mcp_action_handler::{try_handle_mcp_action_directly, try_handle_mcp_action_headless};
@@ -188,6 +189,174 @@ mod pairing_session_state_tests {
         WS_CLIENT_REGISTRY.write().await.clear();
     }
 
+    #[test]
+    fn android_qr_issue_requires_verified_desktop_audience_and_local_request() {
+        use crate::bridge::auth::BridgeTokenAudience;
+        let local = SocketAddr::from(([127, 0, 0, 1], 41321));
+        let remote = SocketAddr::from(([192, 0, 2, 10], 41321));
+        let headers = HeaderMap::new();
+        assert_eq!(
+            android_pairing_issue_denial(local, &headers, None),
+            Some((StatusCode::UNAUTHORIZED, "pairing_desktop_auth_required"))
+        );
+        assert_eq!(
+            android_pairing_issue_denial(local, &headers, Some(BridgeTokenAudience::InternalProcess)),
+            Some((StatusCode::UNAUTHORIZED, "pairing_desktop_auth_required"))
+        );
+        assert_eq!(
+            android_pairing_issue_denial(remote, &headers, Some(BridgeTokenAudience::DesktopRenderer)),
+            Some((StatusCode::FORBIDDEN, "pairing_local_desktop_only"))
+        );
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "192.0.2.10".parse().unwrap());
+        assert_eq!(
+            android_pairing_issue_denial(local, &forwarded, Some(BridgeTokenAudience::DesktopRenderer)),
+            Some((StatusCode::FORBIDDEN, "pairing_local_desktop_only"))
+        );
+        assert_eq!(
+            android_pairing_issue_denial(local, &headers, Some(BridgeTokenAudience::DesktopRenderer)),
+            None
+        );
+    }
+
+    #[test]
+    fn one_time_desktop_bearer_is_verified_only_in_middleware() {
+        use crate::bridge::auth::{
+            authenticate_internal_bridge_bearer, issue_desktop_bridge_token,
+            BridgeTokenAudience,
+        };
+        let token = issue_desktop_bridge_token("GET", "/api/android/pairing").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let audience = authenticate_internal_bridge_bearer(
+            &headers,
+            "GET",
+            "/api/android/pairing",
+        )
+        .unwrap();
+        assert_eq!(audience, Some(BridgeTokenAudience::DesktopRenderer));
+        assert_eq!(
+            android_pairing_issue_denial(
+                SocketAddr::from(([127, 0, 0, 1], 41321)),
+                &headers,
+                audience,
+            ),
+            None
+        );
+        assert!(authenticate_internal_bridge_bearer(
+            &headers,
+            "GET",
+            "/api/android/pairing",
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_ios_claim_cannot_consume_android_qr() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_state().await;
+        let payload = build_mobile_pairing_payload(8080, false).await.unwrap();
+        let mut store = PairedDeviceStore::default();
+        let result = claim_mobile_pairing_core(
+            &payload.pairing_token,
+            "old-iphone",
+            Some("iPhone"),
+            Some("ios"),
+            false,
+            Some(&mut store),
+            None,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "invalid_client_kind");
+        assert!(store.devices.is_empty());
+        assert!(MOBILE_PAIRING_TOKENS.read().await.contains_key(&payload.pairing_token));
+    }
+
+    #[tokio::test]
+    async fn android_claim_cannot_replace_retired_ios_audit_record_or_consume_qr() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_state().await;
+        let payload = build_mobile_pairing_payload(8080, false).await.unwrap();
+        let retired_at = "2026-09-25T00:00:00Z".to_string();
+        let ios_record = PairedDeviceRecord {
+            device_id: "shared-id".to_string(),
+            device_name: "Retired iPhone".to_string(),
+            client_kind: "ios".to_string(),
+            token_hash: "sha256:historical".to_string(),
+            scopes: vec![SCOPE_SESSION_READ.to_string()],
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-09-24T00:00:00Z".to_string(),
+            file_browser_roots: Vec::new(),
+            revoked_at: Some(retired_at.clone()),
+        };
+        let mut store = PairedDeviceStore {
+            devices: vec![ios_record],
+        };
+
+        let collision = claim_mobile_pairing_core(
+            &payload.pairing_token,
+            "shared-id",
+            Some("Android"),
+            Some("android"),
+            false,
+            Some(&mut store),
+            None,
+        )
+        .await;
+        assert_eq!(collision.unwrap_err(), "device_id_retired_ios");
+        assert_eq!(store.devices.len(), 1);
+        assert_eq!(store.devices[0].token_hash, "sha256:historical");
+        assert_eq!(store.devices[0].revoked_at.as_deref(), Some(retired_at.as_str()));
+        assert!(MOBILE_PAIRING_TOKENS.read().await.contains_key(&payload.pairing_token));
+        assert_eq!(
+            mobile_pairing_session_snapshot(&payload.pairing_session_id)
+                .await
+                .unwrap()
+                .state,
+            "pending"
+        );
+
+        claim_mobile_pairing_core(
+            &payload.pairing_token,
+            "new-android-id",
+            Some("Android"),
+            Some("android"),
+            false,
+            Some(&mut store),
+            None,
+        )
+        .await
+        .expect("same QR remains claimable by a fresh Android ID");
+        assert_eq!(store.devices.len(), 2);
+        assert_eq!(store.devices[0].token_hash, "sha256:historical");
+        assert!(store.devices[0].revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn retired_ios_websocket_credential_is_rejected() {
+        let principal = AuthPrincipal {
+            principal_id: "device:old-iphone".to_string(),
+            device_id: "old-iphone".to_string(),
+            client_kind: "ios".to_string(),
+            scopes: vec![SCOPE_SESSION_RESPOND.to_string()],
+        };
+        assert!(!active_mobile_websocket_credential(&Some(principal), Some("old-token")).await);
+    }
+
+    #[tokio::test]
+    async fn retired_live_activity_never_reports_a_push_attempt() {
+        let request: ApnsLiveActivityUpdateRequest =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let stats = send_apns_live_activity_update_inner(request).await;
+        assert!(!stats.success);
+        assert_eq!(stats.sent, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.message, "APNs retired");
+    }
+
     #[tokio::test]
     async fn stopping_quick_tunnel_expires_only_bound_unclaimed_grants() {
         let _guard = TEST_LOCK.lock().await;
@@ -295,9 +464,9 @@ mod pairing_session_state_tests {
         let mut store = PairedDeviceStore::default();
         let response = claim_mobile_pairing_core(
             &payload.pairing_token,
-            "ios-device-1",
-            Some("Kexin iPhone"),
-            Some("ios"),
+            "android-device-1",
+            Some("Android"),
+            Some("android"),
             false,
             Some(&mut store),
             None,
@@ -310,7 +479,7 @@ mod pairing_session_state_tests {
             .await
             .expect("claimed session");
         assert_eq!(claimed.state, "claimed");
-        assert_eq!(claimed.device_id.as_deref(), Some("ios-device-1"));
+        assert_eq!(claimed.device_id.as_deref(), Some("android-device-1"));
     }
 
     #[tokio::test]
@@ -347,7 +516,7 @@ mod pairing_session_state_tests {
     }
 
     #[tokio::test]
-    async fn claimed_pairing_token_is_idempotent_only_for_same_device() {
+    async fn claimed_pairing_token_cannot_be_replayed_even_by_same_device() {
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
 
@@ -357,9 +526,9 @@ mod pairing_session_state_tests {
         let mut store = PairedDeviceStore::default();
         claim_mobile_pairing_core(
             &payload.pairing_token,
-            "ios-device-1",
-            Some("iPhone"),
-            Some("ios"),
+            "android-device-1",
+            Some("Android"),
+            Some("android"),
             false,
             Some(&mut store),
             None,
@@ -369,22 +538,22 @@ mod pairing_session_state_tests {
 
         let retry = claim_mobile_pairing_core(
             &payload.pairing_token,
-            "ios-device-1",
-            Some("iPhone"),
-            Some("ios"),
+            "android-device-1",
+            Some("Android"),
+            Some("android"),
             false,
             Some(&mut store),
             None,
         )
         .await
-        .expect("same-device retry succeeds");
-        assert_eq!(retry.pairing_session_id, payload.pairing_session_id);
+        .expect_err("same-device replay is rejected");
+        assert_eq!(retry, "pairing_token_already_claimed");
 
         let replay = claim_mobile_pairing_core(
             &payload.pairing_token,
-            "ios-device-2",
-            Some("Other iPhone"),
-            Some("ios"),
+            "android-device-2",
+            Some("Other Android"),
+            Some("android"),
             false,
             Some(&mut store),
             None,
@@ -395,7 +564,7 @@ mod pairing_session_state_tests {
     }
 
     #[tokio::test]
-    async fn only_authenticated_matching_ios_socket_completes_pairing() {
+    async fn only_authenticated_matching_android_socket_completes_pairing() {
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
 
@@ -405,9 +574,9 @@ mod pairing_session_state_tests {
         let mut store = PairedDeviceStore::default();
         claim_mobile_pairing_core(
             &payload.pairing_token,
-            "ios-device-1",
-            Some("iPhone"),
-            Some("ios"),
+            "android-device-1",
+            Some("Android"),
+            Some("android"),
             false,
             Some(&mut store),
             None,
@@ -430,8 +599,8 @@ mod pairing_session_state_tests {
             authenticated: false,
             authenticated_device_id: None,
             authenticated_client_kind: None,
-            client_kind: "ios".to_string(),
-            device_id: Some("ios-device-1".to_string()),
+            client_kind: "android".to_string(),
+            device_id: Some("android-device-1".to_string()),
             selected_transport_mode: Some("public_tunnel".to_string()),
             selected_ws_url: None,
             project_path: None,
@@ -445,8 +614,8 @@ mod pairing_session_state_tests {
 
         spoofed.client_id = "authenticated".to_string();
         spoofed.authenticated = true;
-        spoofed.authenticated_device_id = Some("ios-device-1".to_string());
-        spoofed.authenticated_client_kind = Some("ios".to_string());
+        spoofed.authenticated_device_id = Some("android-device-1".to_string());
+        spoofed.authenticated_client_kind = Some("android".to_string());
         register_ws_client_after_upgrade(spoofed).await;
 
         let connected = mobile_pairing_session_snapshot(&payload.pairing_session_id)
@@ -512,6 +681,17 @@ fn ensure_custom_prompts_in_mcp_state(
     ensure_custom_prompts_value_in_mcp_state(payload, custom_prompts);
 }
 
+// request_sync must reflect the current desktop setting, even when the
+// request payload was cached before the user edited quick templates.
+fn refresh_custom_prompts_in_mcp_state(
+    app_handle: Option<&AppHandle>,
+    payload: &mut serde_json::Value,
+) {
+    if let Some(custom_prompts) = custom_prompts_value_for_mcp_state(app_handle) {
+        ensure_custom_prompts_value_in_mcp_state(payload, custom_prompts);
+    }
+}
+
 fn ensure_ghost_suggestions_in_mcp_state(payload: &mut serde_json::Value) {
     let needs_ghost_suggestions = payload
         .get("ghostSuggestions")
@@ -536,6 +716,7 @@ pub(super) const MCP_ACTION_CACHE_TTL_SECS: i64 = 30 * 60;
 const MCP_STATE_CACHE_TTL_SECS: i64 = 6 * 60 * 60;
 const MCP_ACTION_CACHE_MAX_ENTRIES: usize = 256;
 const MCP_STATE_CACHE_MAX_ENTRIES: usize = 512;
+const CLOSED_MCP_STATE_ROUTE_MAX_ENTRIES: usize = 2048;
 const ROOT_TUNNEL_STATUS_FILE: &str = "/tmp/iterate-root-tunnel-status.json";
 const ROOT_TUNNEL_METRICS_URL: &str = "http://127.0.0.1:60123/metrics";
 const ROOT_TUNNEL_EXPECTED_HA_CONNECTIONS: f64 = 4.0;
@@ -648,6 +829,21 @@ impl TimelineSyncService {
             .map(str::trim)
             .filter(|part| !part.is_empty())
             .map(ToOwned::to_owned)
+    }
+
+    fn is_native_route(value: Option<&str>) -> bool {
+        Self::normalize_route_key(value).is_some_and(|route| route.starts_with("native-cli:"))
+    }
+
+    fn is_native_node(node: &ConversationNode) -> bool {
+        node.metadata.source.as_deref() == Some("codex_native")
+            || Self::is_native_route(node.metadata.request_id.as_deref())
+    }
+
+    fn is_native_node_value(node: &serde_json::Value) -> bool {
+        node.pointer("/metadata/source").and_then(|value| value.as_str()) == Some("codex_native")
+            || Self::is_native_route(node.pointer("/metadata/request_id").and_then(|value| value.as_str()))
+            || Self::is_native_route(node.pointer("/metadata/requestId").and_then(|value| value.as_str()))
     }
 
     pub(super) fn node_matches_route(
@@ -793,7 +989,7 @@ impl TimelineSyncService {
         nodes
             .iter()
             .filter(|node| {
-                Self::timeline_value_matches_route(
+                !Self::is_native_node_value(node) && Self::timeline_value_matches_route(
                     node,
                     request_key.as_deref(),
                     project_key.as_deref(),
@@ -816,7 +1012,7 @@ impl TimelineSyncService {
         nodes
             .iter()
             .filter(|node| {
-                Self::node_matches_route(
+                !Self::is_native_node(node) && Self::node_matches_route(
                     node,
                     tree_id,
                     request_key.as_deref(),
@@ -866,12 +1062,15 @@ impl TimelineSyncService {
     }
 
     async fn build_snapshot_message(
-        app_handle: &AppHandle,
+        app_handle: Option<&AppHandle>,
         request_id: Option<&str>,
         project_path: Option<&str>,
     ) -> Option<BridgeMessage> {
         let request_key = Self::normalize_route_key(request_id);
         let project_key = Self::normalize_route_key(project_path);
+        if Self::is_native_route(request_key.as_deref()) {
+            return Some(Self::empty_snapshot_message(request_key, project_key));
+        }
         let fallback_route = if request_key.is_none() && project_key.is_none() {
             last_active_route().await
         } else {
@@ -880,9 +1079,12 @@ impl TimelineSyncService {
         let lookup_request_key = request_key.clone().or_else(|| fallback_route.clone());
         let lookup_project_key = project_key.clone().or_else(|| fallback_route);
 
-        let Some(manager) = app_handle.try_state::<Arc<ConversationManager>>() else {
-            log::warn!("[TimelineSync] ConversationManager 不可用，返回空快照");
-            return Some(Self::empty_snapshot_message(request_key, project_key));
+        let persistent_manager = ConversationManager::new_with_forced_persistence();
+        let state_manager = app_handle.and_then(|app| app.try_state::<Arc<ConversationManager>>());
+        let manager: &ConversationManager = if let Some(ref state) = state_manager {
+            state.as_ref()
+        } else {
+            &persistent_manager
         };
 
         let Some(tree_id) = manager
@@ -891,6 +1093,9 @@ impl TimelineSyncService {
         else {
             return Some(Self::empty_snapshot_message(request_key, project_key));
         };
+        if manager.tree_contains_native_source(&tree_id).await {
+            return Some(Self::empty_snapshot_message(request_key, project_key));
+        }
         let nodes = if let Some(current_node_id) = manager.get_current_node_id(&tree_id).await {
             match manager.get_node_path(&tree_id, &current_node_id).await {
                 Ok(path) => path,
@@ -929,10 +1134,13 @@ impl TimelineSyncService {
         request_id: Option<&str>,
         project_path: Option<&str>,
         node: &ConversationNode,
-    ) -> BridgeMessage {
+    ) -> Option<BridgeMessage> {
         let request_key = Self::normalize_route_key(request_id);
         let project_key = Self::normalize_route_key(project_path);
-        BridgeMessage {
+        if Self::is_native_route(request_key.as_deref()) || Self::is_native_node(node) {
+            return None;
+        }
+        Some(BridgeMessage {
             message_type: TIMELINE_SYNC_DELTA_MESSAGE_TYPE.to_string(),
             payload: serde_json::json!({
                 "request_id": request_key,
@@ -941,7 +1149,7 @@ impl TimelineSyncService {
                 "conversation_id": node.metadata.conversation_id.clone(),
                 "timelineNode": Self::strip_heavy_metadata(node),
             }),
-        }
+        })
     }
 }
 
@@ -1035,6 +1243,11 @@ pub static MCP_STATE_CACHE: Lazy<Arc<RwLock<HashMap<String, serde_json::Value>>>
 static MCP_STATE_CACHE_TOUCHED_AT: Lazy<
     Arc<RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 > = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+// A closed serve request may still have a live response-route file briefly.
+// Keep its exact ID closed across request_sync and late state publications.
+static CLOSED_MCP_STATE_ROUTES: Lazy<Arc<RwLock<HashMap<String, (String, i64)>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 static ACTIVE_SESSION_REGISTRY: Lazy<Arc<RwLock<HashMap<String, ActiveSessionEntry>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
@@ -1193,7 +1406,6 @@ struct MobilePairingClaimReceipt {
     device_id: String,
     device_name: String,
     client_kind: String,
-    device_token: String,
     scopes: Vec<String>,
     claimed_at: String,
     expires_at: String,
@@ -1389,6 +1601,8 @@ struct WsClientInfo {
 
 static VAPID_CONFIG: Lazy<VapidConfig> = Lazy::new(load_vapid_config);
 static APNS_CONFIG: Lazy<Option<ApnsConfig>> = Lazy::new(load_apns_config);
+// Retain historical token/audit files; no Apple push leaves this build.
+const APNS_RETIRED: bool = true;
 
 fn bridge_apns_default_environment() -> ApnsEnvironment {
     APNS_CONFIG
@@ -1581,57 +1795,35 @@ fn browser_http_origin_is_allowed(headers: &HeaderMap, allowed_origins: &[String
 const WS_DEVICE_TOKEN_PROTOCOL_PREFIX: &str = "iterate.device-token.";
 const WS_DESKTOP_TOKEN_PROTOCOL_PREFIX: &str = "iterate.desktop-token.";
 
-fn mobile_device_scopes(allow_ghost_suggestions_write: bool) -> Vec<String> {
-    let mut scopes = vec![
+fn mobile_device_scopes(_allow_ghost_suggestions_write: bool) -> Vec<String> {
+    vec![
         SCOPE_STATUS_READ.to_string(),
         SCOPE_SESSION_READ.to_string(),
         SCOPE_SESSION_RESPOND.to_string(),
         SCOPE_WINDOW_SHOW.to_string(),
-        SCOPE_CONFIG_READ.to_string(),
-        SCOPE_CONFIG_WRITE.to_string(),
-        SCOPE_PROMPT_LIBRARY_READ.to_string(),
-        SCOPE_PROMPT_LIBRARY_WRITE.to_string(),
-        SCOPE_NOTIFICATION_SUBSCRIBE.to_string(),
-        SCOPE_SPEECH_MEMORY_READ.to_string(),
-        SCOPE_SPEECH_MEMORY_WRITE.to_string(),
-        SCOPE_GHOST_SUGGESTIONS_READ.to_string(),
-        SCOPE_PHONE_ACTION_JOB_READ.to_string(),
-        SCOPE_TUNNEL_RECOVER.to_string(),
-        SCOPE_FILE_LIST.to_string(),
-        SCOPE_PAIRING_ISSUE.to_string(),
-    ];
-    if allow_ghost_suggestions_write {
-        scopes.push(SCOPE_GHOST_SUGGESTIONS_WRITE.to_string());
-    }
-    scopes
+    ]
 }
 
 fn normalize_mobile_device_scopes(device: &mut PairedDeviceRecord) -> bool {
-    if !device.client_kind.eq_ignore_ascii_case("ios") {
+    if !device.client_kind.eq_ignore_ascii_case("android") {
         return false;
     }
-
-    let allow_ghost_suggestions_write = device
-        .scopes
-        .iter()
-        .any(|scope| scope == SCOPE_GHOST_SUGGESTIONS_WRITE);
-    let expected_scopes = mobile_device_scopes(allow_ghost_suggestions_write);
-    let mut changed = false;
-
-    for scope in expected_scopes {
-        if !device.scopes.iter().any(|existing| existing == &scope) {
-            device.scopes.push(scope);
-            changed = true;
-        }
+    let expected_scopes = mobile_device_scopes(false);
+    if device.scopes == expected_scopes {
+        return false;
     }
-
-    changed
+    device.scopes = expected_scopes;
+    true
 }
 
 fn normalize_paired_device_store(store: &mut PairedDeviceStore) -> bool {
     let mut changed = false;
 
     for device in &mut store.devices {
+        if device.client_kind.eq_ignore_ascii_case("ios") && device.revoked_at.is_none() {
+            device.revoked_at = Some(chrono::Utc::now().to_rfc3339());
+            changed = true;
+        }
         if device.revoked_at.is_none() && normalize_mobile_device_scopes(device) {
             changed = true;
         }
@@ -1898,6 +2090,19 @@ fn replace_paired_device_record(store: &mut PairedDeviceStore, mut record: Paire
     store.devices.push(record);
 }
 
+fn replace_android_paired_device_record(
+    store: &mut PairedDeviceStore,
+    record: PairedDeviceRecord,
+) -> Result<(), &'static str> {
+    if store.devices.iter().any(|device| {
+        device.device_id == record.device_id && device.client_kind.eq_ignore_ascii_case("ios")
+    }) {
+        return Err("device_id_retired_ios");
+    }
+    replace_paired_device_record(store, record);
+    Ok(())
+}
+
 fn authenticate_paired_device_at(
     path: &FilePath,
     token: &str,
@@ -1915,7 +2120,7 @@ fn authenticate_paired_device_at(
                 continue;
             }
 
-            if device.revoked_at.is_some() {
+            if device.revoked_at.is_some() || device.client_kind.eq_ignore_ascii_case("ios") {
                 explicitly_revoked = true;
                 break;
             }
@@ -2202,7 +2407,7 @@ fn public_anonymous_path_allowed(method: &axum::http::Method, path: &str) -> boo
             | (&axum::http::Method::GET, "/api/version")
             | (&axum::http::Method::GET, "/ws")
             | (&axum::http::Method::GET, "/ws/codex-live")
-            | (&axum::http::Method::POST, "/api/mobile/pairing/claim")
+            | (&axum::http::Method::POST, "/api/android/pairing/claim")
     )
 }
 
@@ -2361,6 +2566,185 @@ pub(crate) async fn cleanup_completed_session_by_request_id(
     (removed_cache, removed_active)
 }
 
+fn is_explicit_closed_mcp_state(payload: &serde_json::Value) -> bool {
+    payload.get("request") == Some(&serde_json::Value::Null)
+        && payload.get("showMcpPopup").and_then(|value| value.as_bool()) == Some(false)
+}
+
+fn closed_mcp_state_route(payload: &serde_json::Value) -> Result<(String, String), &'static str> {
+    let request_id = normalize_route_part(payload.get("request_id").and_then(|value| value.as_str()))
+        .ok_or("closed_request_id_missing")?;
+    let raw_path = normalize_route_part(payload.get("project_path").and_then(|value| value.as_str()))
+        .ok_or("closed_project_path_missing")?;
+    if raw_path == "." || !std::path::Path::new(&raw_path).is_absolute() {
+        return Err("closed_project_path_invalid");
+    }
+    Ok((request_id, normalize_bridge_project_path(&raw_path)))
+}
+
+fn mcp_state_matches_exact_route(payload: &serde_json::Value, request_id: &str, project_path: &str) -> bool {
+    extract_request_id_from_mcp_state(payload).as_deref() == Some(request_id)
+        && extract_project_path_from_mcp_state(payload)
+            .map(|path| normalize_bridge_project_path(&path))
+            .as_deref() == Some(project_path)
+}
+
+fn mcp_state_matches_initial_sync_route(payload: &serde_json::Value, request_id: &str, project_path: &str) -> bool {
+    extract_request_id_from_mcp_state(payload).as_deref() == Some(request_id)
+        && extract_project_path_from_mcp_state(payload)
+            .is_some_and(|path| local_project_paths_match(&normalize_bridge_project_path(&path), project_path))
+}
+
+pub(crate) fn local_project_paths_match(left: &str, right: &str) -> bool {
+    super::serve_request_fallback::local_project_paths_match(left, right)
+}
+
+// A reconnecting Android client starts without a route. Only live window bindings
+// may populate its request list; project-key cache entries can point at another
+// request in the same project, and the last-active route can already be closed.
+fn android_initial_sync_routes(
+    instances: Vec<crate::ui::window_registry::WindowInstance>,
+) -> Vec<(String, String)> {
+    let mut instances = instances;
+    instances.sort_by(|a, b| b.registered_at.cmp(&a.registered_at));
+    let mut seen = HashSet::new();
+    instances
+        .into_iter()
+        .filter_map(|instance| {
+            let request_id = normalize_route_part(instance.request_id.as_deref())?;
+            let project_path = normalize_route_part(Some(&instance.project_path))?;
+            let project_path = normalize_bridge_project_path(&project_path);
+            seen.insert((request_id.clone(), project_path.clone()))
+                .then_some((request_id, project_path))
+        })
+        .collect()
+}
+
+async fn android_initial_sync_states() -> Vec<serde_json::Value> {
+    let mut window_registry = crate::ui::window_registry::WindowRegistry::load();
+    let instances = window_registry.get_all_instances();
+    let routes = android_initial_sync_routes(instances.clone());
+    let mut states = Vec::with_capacity(routes.len());
+    for (request_id, project_path) in routes {
+        if closed_mcp_state_project_for_request(&request_id).await.is_some() {
+            continue;
+        }
+        let cached = {
+            let cache = MCP_STATE_CACHE.read().await;
+            cache.get(&request_id).cloned()
+        };
+        let registry_entry = {
+            let registry = ACTIVE_SESSION_REGISTRY.read().await;
+            registry.get(&request_id).cloned()
+        };
+        let payload = cached
+            .filter(|payload| mcp_state_matches_initial_sync_route(payload, &request_id, &project_path))
+            .inspect(|_| bridge_debug_log(&format!("[Bridge Home] request_id={} source=cache hit=true", request_id)))
+            .or_else(|| {
+                registry_entry
+                    .filter(|entry| {
+                        local_project_paths_match(&normalize_bridge_project_path(&entry.project_path), &project_path)
+                            && mcp_state_matches_initial_sync_route(&entry.payload, &request_id, &project_path)
+                    })
+                    .map(|entry| entry.payload)
+                    .inspect(|_| bridge_debug_log(&format!("[Bridge Home] request_id={} source=active_session_registry hit=true", request_id)))
+            });
+        let payload = if let Some(payload) = payload {
+            Some(payload)
+        } else {
+            let fallback_request_id = request_id.clone();
+            let fallback_project_path = project_path.clone();
+            let live_instances = instances.clone();
+            tokio::task::spawn_blocking(move || {
+                match crate::cross_device::load_ready_local_registration_for_mobile(
+                    &fallback_request_id, &fallback_project_path, &live_instances,
+                ) {
+                    Ok(payload) => {
+                        bridge_debug_log(&format!("[Bridge Home] request_id={} source=registered_local_source hit=true", fallback_request_id));
+                        return Ok(payload);
+                    }
+                    Err(reason) => bridge_debug_log(&format!(
+                        "[Bridge Home] request_id={} source=registered_local_source hit=false reason={}", fallback_request_id, reason,
+                    )),
+                }
+                let fallback = load_live_serve_request_fallback(&fallback_request_id, &fallback_project_path);
+                bridge_debug_log(&format!("[Bridge Home] request_id={} source=live_serve_request hit={} reason={}",
+                    fallback_request_id, fallback.is_ok(), fallback.as_ref().err().map(|miss| miss.as_str()).unwrap_or("ok")));
+                fallback.map(|fallback| fallback.payload)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+        };
+        // An authoritative close can arrive while the read-only recovery runs.
+        if closed_mcp_state_project_for_request(&request_id).await.is_some() {
+            continue;
+        }
+        if let Some(payload) = payload.and_then(|payload|
+            prepare_android_initial_sync_state(payload, &request_id, &project_path)) {
+            states.push(payload);
+        }
+    }
+    states
+}
+
+fn prepare_android_initial_sync_state(
+    mut payload: serde_json::Value, request_id: &str, project_path: &str,
+) -> Option<serde_json::Value> {
+    if is_explicit_closed_mcp_state(&payload)
+        || !mcp_state_matches_initial_sync_route(&payload, request_id, project_path) { return None; }
+    // Common final step for cache, registry and live-serve fallback sources.
+    stamp_local_mobile_computer_source(&mut payload);
+    Some(payload)
+}
+
+async fn cleanup_closed_mcp_state_route(request_id: &str, project_path: &str) -> Result<(usize, bool), &'static str> {
+    let mut closed_routes = CLOSED_MCP_STATE_ROUTES.write().await;
+    let now = chrono::Utc::now().timestamp();
+    closed_routes.retain(|_, (_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS);
+    if closed_routes.get(request_id).is_some_and(|(path, _)| path != project_path) {
+        return Err("closed_route_mismatch");
+    }
+    let mut cache = MCP_STATE_CACHE.write().await;
+    let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
+    let mut registry = ACTIVE_SESSION_REGISTRY.write().await;
+
+    if cache.get(request_id).is_some_and(|payload| !mcp_state_matches_exact_route(payload, request_id, project_path))
+        || registry.get(request_id).is_some_and(|entry| normalize_bridge_project_path(&entry.project_path) != project_path)
+    {
+        return Err("closed_route_mismatch");
+    }
+
+    if !closed_routes.contains_key(request_id) && closed_routes.len() >= CLOSED_MCP_STATE_ROUTE_MAX_ENTRIES {
+        if let Some(oldest_id) = closed_routes.iter()
+            .min_by_key(|(_, (_, closed_at))| *closed_at)
+            .map(|(id, _)| id.clone()) {
+            closed_routes.remove(&oldest_id);
+        }
+    }
+    closed_routes.insert(request_id.to_string(), (project_path.to_string(), now));
+
+    let mut removed = 0;
+    if cache.remove(request_id).is_some() {
+        touched_at.remove(request_id);
+        removed += 1;
+    }
+    if cache.get(project_path).is_some_and(|payload| mcp_state_matches_exact_route(payload, request_id, project_path)) {
+        cache.remove(project_path);
+        touched_at.remove(project_path);
+        removed += 1;
+    }
+    let removed_active = registry.remove(request_id).is_some();
+    Ok((removed, removed_active))
+}
+
+async fn closed_mcp_state_project_for_request(request_id: &str) -> Option<String> {
+    let routes = CLOSED_MCP_STATE_ROUTES.read().await;
+    let (path, closed_at) = routes.get(request_id)?;
+    (chrono::Utc::now().timestamp().saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+        .then(|| path.clone())
+}
+
 fn remove_stale_mcp_state_cache_entries(
     cache: &mut HashMap<String, serde_json::Value>,
     request_id: &str,
@@ -2450,6 +2834,73 @@ fn resolve_host_label() -> String {
 
 fn resolve_mobile_device_id() -> String {
     format!("mac-{}", resolve_host_label())
+}
+
+fn set_mobile_computer_source(payload: &mut serde_json::Value, id: Option<String>, name: Option<String>) {
+    let Some(object) = payload.as_object_mut() else { return; };
+    object.insert("origin_device_id".into(), serde_json::json!(id));
+    object.insert("origin_name".into(), serde_json::json!(name));
+    object.insert("origin_platform".into(), serde_json::json!(crate::cross_device::local_computer_platform()));
+}
+
+#[cfg(test)]
+mod mobile_computer_source_tests {
+    #[test]
+    fn initial_sync_cache_registry_and_live_fallback_refresh_only_exact_open_route() {
+        let prior = std::env::var_os("ITERATE_CROSS_DEVICE_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR", dir.path());
+        std::fs::write(dir.path().join("settings.json"), r#"{"device_id":"local-computer", "enabled":false}"#).unwrap();
+        std::fs::write(dir.path().join("direct-connection.json"), r#"{"device_name":"current-computer-name"}"#).unwrap();
+        let project = super::normalize_bridge_project_path("C:/source-label-initial");
+        for source in ["cache", "active_session_registry", "live_serve_request"] {
+            let payload = serde_json::json!({"cache_source":source, "origin_device_id":"old-id",
+                "origin_name":"old-cache-name", "origin_platform":"forged-platform", "request":{"id":"initial-rid",
+                    "project_path":project, "message":"original content"}, "showMcpPopup":true});
+            let original_request = payload["request"].clone();
+            let prepared = super::prepare_android_initial_sync_state(payload.clone(), "initial-rid", &project).unwrap();
+            assert_eq!(prepared["origin_device_id"], "local-computer");
+            assert_eq!(prepared["origin_name"], "current-computer-name");
+            assert_eq!(prepared["origin_platform"], serde_json::json!(crate::cross_device::local_computer_platform()));
+            assert_eq!(prepared["request"], original_request);
+            assert_eq!(prepared["cache_source"], source);
+            assert!(super::prepare_android_initial_sync_state(payload, "other-rid", &project).is_none());
+        }
+        assert!(super::prepare_android_initial_sync_state(serde_json::json!({
+            "request":null,"showMcpPopup":false,"request_id":"initial-rid","project_path":project}), "initial-rid", &project).is_none());
+        match prior { Some(value) => std::env::set_var("ITERATE_CROSS_DEVICE_DIR", value), None => std::env::remove_var("ITERATE_CROSS_DEVICE_DIR") }
+    }
+
+    #[test]
+    fn service_computer_source_overrides_untrusted_metadata_without_changing_route() {
+        let mut payload = serde_json::json!({"origin_device_id":"phone-forged", "origin_name":"forged", "origin_platform":"forged-platform",
+            "request":{"id":"request-a", "project_path":"C:/A", "source":"codex_native",
+                "origin_name":"editable-request"}, "timeline_route_id":"native-cli:launch:thread"});
+        let before_request = payload["request"].clone();
+        super::set_mobile_computer_source(&mut payload, Some("computer-real".into()), Some("电脑 A".into()));
+        assert_eq!(payload["origin_device_id"], "computer-real");
+        assert_eq!(payload["origin_name"], "电脑 A");
+        assert_eq!(payload["origin_platform"], serde_json::json!(crate::cross_device::local_computer_platform()));
+        assert_eq!(payload["request"], before_request);
+        assert_eq!(payload["timeline_route_id"], "native-cli:launch:thread");
+        super::set_mobile_computer_source(&mut payload, None, None);
+        assert!(payload["origin_device_id"].is_null());
+        assert!(payload["origin_name"].is_null());
+    }
+}
+
+fn stamp_local_mobile_computer_source(payload: &mut serde_json::Value) {
+    // Only service-owned display metadata. Do not trust request fields, phone IDs,
+    // or serialize the pairing Identity (which contains credentials).
+    let (id, name) = crate::cross_device::local_computer_identity();
+    set_mobile_computer_source(payload, id, name);
+}
+
+async fn attach_mobile_native_history_to_state(event: &mut serde_json::Value) {
+    crate::codex_questions::attach_history_to_state(event).await;
+    if event["message_type"] == "mcp_state" {
+        stamp_local_mobile_computer_source(&mut event["payload"]);
+    }
 }
 
 async fn mobile_pairing_command_output(
@@ -3335,6 +3786,10 @@ async fn build_mobile_pairing_payload(
     bridge_port: u16,
     require_secure_route: bool,
 ) -> Result<MobilePairingPayload, String> {
+    if crate::tunnel::commands::configured_formal_mobile_route().is_some_and(|r|r.transport=="cloud_hub") {
+        return serde_json::from_value(crate::cross_device::hub_transport::issue_mobile_pairing().await?)
+            .map_err(|_|"invalid_cloud_pairing_payload".into());
+    }
     let device_name = resolve_host_label();
     let device_id = resolve_mobile_device_id();
     let issued_at = chrono::Utc::now();
@@ -4068,6 +4523,9 @@ async fn send_apns_notification(
     project_path: Option<String>,
     request_id: Option<String>,
 ) {
+    if APNS_RETIRED {
+        return;
+    }
     let apns_started_at = std::time::Instant::now();
     let Some(config) = APNS_CONFIG.as_ref() else {
         bridge_debug_log("APNs 跳过: APNS_CONFIG 为 None（未配置）");
@@ -4374,6 +4832,17 @@ async fn send_apns_live_activity_update_inner(
     request: ApnsLiveActivityUpdateRequest,
 ) -> ApnsLiveActivitySendStats {
     let event = normalized_live_activity_event(request.event.as_deref());
+    if APNS_RETIRED {
+        return ApnsLiveActivitySendStats {
+            success: false,
+            event,
+            matched: 0,
+            sent: 0,
+            failed: 0,
+            invalidated: 0,
+            message: "APNs retired".to_string(),
+        };
+    }
     let requested_activity_kind = normalized_live_activity_kind(request.activity_kind.as_deref());
     let Some(config) = APNS_CONFIG.as_ref() else {
         return ApnsLiveActivitySendStats {
@@ -5055,8 +5524,11 @@ async fn start_bridge_server_inner(
         }
     });
 
-    // 加载已保存的 APNs Token
-    init_apns_tokens(bridge_apns_default_environment().as_str()).await;
+    // Retire old iOS credentials durably while keeping their audit records.
+    if let Err(error) = mutate_paired_device_store_at(&paired_devices_path(), |_| ((), false)) {
+        log::error!("[Bridge][MobileAuth] failed to retire iOS credentials: {}", error);
+    }
+    // Historical APNs tokens remain on disk for audit, but are not registered or sent.
 
     // 启动公网探针后台刷新循环：connection-status 读缓存秒回，不再每请求阻塞探针。
     spawn_public_probe_cache_refresher();
@@ -5124,16 +5596,7 @@ async fn start_bridge_server_inner(
         .route("/push/vapid_public_key", get(handle_push_vapid_public_key))
         .route("/push/subscribe", post(handle_push_subscribe))
         .route("/push/unsubscribe", post(handle_push_unsubscribe))
-        .route("/api/apns/register", post(handle_apns_register))
         .route("/api/apns/notify", post(handle_apns_notify))
-        .route(
-            "/api/apns/live-activity/register",
-            post(handle_apns_live_activity_register),
-        )
-        .route(
-            "/api/apns/live-activity/update",
-            post(handle_apns_live_activity_update),
-        )
         .route("/api/phone-action", post(handle_api_phone_action))
         .route(
             "/api/phone-action-result",
@@ -5143,17 +5606,17 @@ async fn start_bridge_server_inner(
             "/api/phone-action-jobs/:id",
             get(handle_api_phone_action_job),
         )
-        .route("/api/mobile/pairing", get(handle_api_mobile_pairing))
+        .route("/api/android/pairing", get(handle_api_mobile_pairing))
         .route(
-            "/api/mobile/pairing/claim",
+            "/api/android/pairing/claim",
             post(handle_api_mobile_pairing_claim),
         )
         .route(
-            "/api/mobile/pairing/sessions/:session_id",
+            "/api/android/pairing/sessions/:session_id",
             get(handle_api_mobile_pairing_session),
         )
         .route(
-            "/api/mobile/pairing/status",
+            "/api/android/pairing/status",
             get(handle_api_mobile_pairing_status),
         )
         .route(
@@ -5320,6 +5783,13 @@ async fn start_bridge_server_inner(
     let auth_broker = crate::bridge::auth::start_internal_auth_broker()
         .await
         .map_err(|error| std::io::Error::other(format!("Bridge auth broker failed: {error}")))?;
+    // The guard cancels all native actors and drops the ownership mutex on exit/abort.
+    let _native_owner = if port == 8080 {
+        crate::codex_questions::start_bridge_owner()
+    } else {
+        None
+    };
+    let _hub_source = if _native_owner.is_some() { crate::cross_device::hub_transport::start_in_bridge_owner() } else { None };
     tokio::spawn(async move {
         // Release builds must reconcile legacy Quick Tunnel state even when a
         // healthy formal route is already configured. Otherwise an old saved
@@ -5371,6 +5841,125 @@ fn authenticate_internal_websocket_once(
         .ok_or_else(|| "invalid_internal_bridge_auth".to_string())
 }
 
+pub(crate) async fn authorize_hub_principal(principal: &serde_json::Value, scope: &str, project: &str, mirror: bool) -> Result<(), String> {
+    if principal["client_kind"] != "android" || principal["revoked_at"].is_string()
+        || !principal["scopes"].as_array().is_some_and(|scopes| scopes.iter().any(|s| s==scope)) {
+        return Err("hub_principal_scope_denied".into());
+    }
+    let id=principal["device_id"].as_str().ok_or("hub_principal_missing")?;
+    if mirror {
+        if !project.is_empty() || std::env::consts::OS!="macos" {return Err("hub_mirror_scope_denied".into());}
+        // Only explicit migrated mirror grants, never a Windows file grant.
+        let path=crate::cross_device::hub_transport::data_directory()?.join("hub-phone-grants.json");
+        let grants:serde_json::Value=serde_json::from_slice(&std::fs::read(path).map_err(|_|"hub_mirror_grant_missing")?).map_err(|_|"hub_mirror_grant_invalid")?;
+        if !grants.as_array().is_some_and(|grants|grants.iter().any(|g|g["device_id"]==id&&g["client_kind"]=="android"&&g["revoked_at"].is_null()&&g["scopes"].as_array().is_some_and(|s|s.iter().any(|s|s==scope)))) {return Err("hub_mirror_grant_denied".into());}
+        return Ok(());
+    }
+    if std::env::consts::OS!="windows" {return Err("hub_windows_only".into());}
+    let store=load_paired_device_store_at(&paired_devices_path())?;
+    let device=store.devices.iter().find(|d|d.device_id==id&&d.client_kind=="android"&&d.revoked_at.is_none()).ok_or("hub_device_revoked_or_unknown")?;
+    if !device.scopes.iter().any(|s|s==scope) {return Err("hub_local_scope_denied".into());}
+    let roots=principal["file_browser_roots"].as_array().cloned().unwrap_or_default();
+    if roots.iter().any(|r|!r.as_str().is_some_and(|r|device.file_browser_roots.iter().any(|existing|existing==r))) {return Err("hub_file_roots_expanded".into());}
+    Ok(())
+}
+
+pub(crate) fn hub_pairing_intent()->Result<serde_json::Value,String> {
+    let store=load_paired_device_store_at(&paired_devices_path())?;
+    Ok(serde_json::json!({"devices":store.devices,"issued_at":chrono::Utc::now().to_rfc3339(),"default_scopes":mobile_device_scopes(false)}))
+}
+
+pub(crate) fn apply_hub_pairing(intent:&serde_json::Value,result:&serde_json::Value)->Result<(),String> {
+    apply_hub_pairing_at(&paired_devices_path(),intent,result)
+}
+
+fn apply_hub_pairing_at(path:&std::path::Path,intent:&serde_json::Value,result:&serde_json::Value)->Result<(),String> {
+    let c=&result["credential"];let id=c["device_id"].as_str().ok_or("hub_pairing_device_missing")?;
+    let scopes:Vec<String>=serde_json::from_value(c["scopes"].clone()).map_err(|_|"invalid_hub_pairing_scopes")?;
+    let roots:Vec<String>=serde_json::from_value(c["file_browser_roots"].clone()).map_err(|_|"invalid_hub_pairing_roots")?;
+    let hash=c["token_hash"].as_str().ok_or("invalid_hub_pairing_hash")?;
+    if c["client_kind"]!="android" || !c["revoked_at"].is_null() || c["windows_source"]!=intent["source_id"]
+        || !hash.strip_prefix("sha256:").is_some_and(|s|s.len()==64 && s.bytes().all(|b|b.is_ascii_hexdigit())) {
+        return Err("invalid_hub_pairing_credential".into());
+    }
+    let original=intent["devices"].as_array().ok_or("invalid_hub_pairing_intent")?.iter().find(|d|d["device_id"]==id);
+    if original.is_some_and(|d|d["client_kind"]!="android") {return Err("device_id_retired_ios".into());}
+    let active=original.filter(|d|d["revoked_at"].is_null());
+    let expected_scopes=active.map(|d|d["scopes"].clone()).unwrap_or_else(||intent["default_scopes"].clone());
+    let expected_roots=active.map(|d|d["file_browser_roots"].clone()).unwrap_or_else(||serde_json::json!([]));
+    if c["scopes"]!=expected_scopes || c["file_browser_roots"]!=expected_roots
+        || (active.is_none() && c["mirror_sources"].as_array().is_none_or(|s|!s.is_empty())) {
+        return Err("hub_pairing_grant_expanded".into());
+    }
+    mutate_paired_device_store_at(path,|store| {
+        let current=store.devices.iter().find(|d|d.device_id==id);
+        if let Some(current)=current {
+            if current.client_kind!="android" {return (Err("device_id_retired_ios".into()),false);}
+            if current.token_hash==hash && current.revoked_at.is_none() && current.scopes==scopes && current.file_browser_roots==roots {
+                return (Ok(()),false);
+            }
+            if original.is_none_or(|old|old["token_hash"]!=current.token_hash || old["revoked_at"]!=serde_json::json!(current.revoked_at)
+                || old["scopes"]!=serde_json::json!(current.scopes) || old["file_browser_roots"]!=serde_json::json!(current.file_browser_roots)) {
+                return (Err("hub_pairing_local_authority_changed".into()),false);
+            }
+        } else if original.is_some() {return (Err("hub_pairing_local_authority_changed".into()),false);}
+        let now=chrono::Utc::now().to_rfc3339();
+        let record=PairedDeviceRecord{device_id:id.into(),device_name:result["session"]["device_name"].as_str().unwrap_or("Android").into(),client_kind:"android".into(),token_hash:hash.into(),scopes,
+            created_at:current.map(|d|d.created_at.clone()).unwrap_or_else(||now.clone()),last_seen_at:now,file_browser_roots:roots,revoked_at:None};
+        (replace_android_paired_device_record(store,record).map_err(str::to_owned),true)
+    })?
+}
+
+pub(crate) async fn hub_rpc(payload:&serde_json::Value)->Result<serde_json::Value,String>{
+    let operation=payload["operation"].as_str().ok_or("hub_operation_missing")?;
+    let wire=&payload["wire"];
+    let body=wire.get("payload").unwrap_or(wire);
+    let project=body["project_path"].as_str().unwrap_or_default();
+    authorize_hub_principal(&payload["principal"],if operation=="open_codex"{SCOPE_WINDOW_SHOW}else{SCOPE_SESSION_READ},project,false).await?;
+    match operation {
+        "sync"=>{
+            let mut state=serde_json::json!({"sync_response":true,"sync_reason":body["sync_reason"]});
+            ensure_custom_prompts_in_mcp_state(None,&mut state);
+            Ok(serde_json::json!({"events":[{"message_type":"mcp_state","payload":state},crate::codex_questions::history_sessions().await]}))
+        },
+        "timeline"=>{
+            let route=body["request_id"].as_str().ok_or("hub_timeline_missing")?;
+            let mut event=if route.starts_with("native-cli:"){crate::codex_questions::history_snapshot(route,project).await}
+                else{TimelineSyncService::build_snapshot_message(None,Some(route),Some(project)).await.and_then(|v|serde_json::to_value(v).ok())};
+            if let Some(event)=event.as_mut() {
+                let p=&mut event["payload"];
+                if p["request_id"]!=route || p["project_path"]!=project { return Err("hub_timeline_identity_mismatch".into()); }
+                p["timeline_route_id"]=serde_json::json!(route);
+            }
+            Ok(serde_json::json!({"events":event.into_iter().collect::<Vec<_>>()}))
+        },
+        "page"=>Ok(serde_json::json!({"status":200,"body":include_str!("../../../mobile.html")})),
+        "open_codex"=>{
+            let _guard=crate::cross_device::hub_transport::submission_guard(true)?;
+            let result=crate::ui::commands::open_new_codex_chat_with_text("zhi".into(),(!project.is_empty()).then(||project.to_owned())).await?;
+            Ok(serde_json::json!({"ok":result.ok,"sent":result.sent,"mode":result.mode,"message":result.message}))
+        },
+        _=>Err("hub_operation_forbidden".into())
+    }
+}
+
+pub(crate) fn hub_display_images(wire:&mut serde_json::Value)->Result<Vec<serde_json::Value>,String>{
+    register_markdown_images_for_mcp_state_payload(&mut wire["payload"]);
+    let encoded=wire.to_string();
+    let matcher=regex::Regex::new(r"/image\?id=(img_[0-9a-fA-F]{32})").map_err(|e|e.to_string())?;
+    let mut assets=Vec::new();let mut ids=std::collections::HashSet::new();
+    for cap in matcher.captures_iter(&encoded){
+        let id=&cap[1];if !ids.insert(id.to_owned()){continue;}
+        let path=registered_markdown_image_path(id).ok_or("hub_image_not_registered")?;
+        let size=std::fs::metadata(&path).map_err(|_|"hub_image_missing")?.len();
+        if size>8*1024*1024{return Err("hub_image_too_large".into());}
+        let bytes=std::fs::read(&path).map_err(|_|"hub_image_unreadable")?;
+        use base64::Engine;
+        assets.push(serde_json::json!({"original_asset_id":id,"mime":image_content_type_for_path(&path),"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes)}));
+    }
+    Ok(assets)
+}
+
 async fn handle_ws_upgrade(
     State(state): State<BridgeHttpState>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -5420,6 +6009,9 @@ async fn handle_ws_upgrade(
         return json_error_response(StatusCode::FORBIDDEN, "invalid_websocket_origin");
     }
     let auth_principal = websocket_authentication.map(|authentication| authentication.principal);
+    let auth_token = bearer_token_from_headers(&headers)
+        .or_else(|| websocket_device_token_from_protocols(&headers))
+        .or_else(|| websocket_device_token_from_uri(&uri));
     if !internal_authenticated {
         if let Some((status, error)) = websocket_auth_denial(auth_enforced, auth_principal.as_ref())
         {
@@ -5499,6 +6091,7 @@ async fn handle_ws_upgrade(
                 tx,
                 client_id,
                 auth_principal,
+                auth_token,
                 scope_enforced,
             )
             .await
@@ -5602,11 +6195,12 @@ async fn enforce_bridge_control_auth(
             &method,
             &path,
         ) {
-            Ok(Some(_)) => {
+            Ok(Some(audience)) => {
                 req.headers_mut().insert(
                     HeaderName::from_static(TRUSTED_INTERNAL_CAPABILITY_HEADER),
                     HeaderValue::from_static("1"),
                 );
+                req.extensions_mut().insert(VerifiedBridgeAudience(audience));
                 next.run(req).await
             }
             Ok(None) => {
@@ -6027,12 +6621,576 @@ fn remote_action_denial_reason(
     }
 }
 
+async fn active_mobile_websocket_credential(
+    principal: &Option<AuthPrincipal>,
+    token: Option<&str>,
+) -> bool {
+    let Some(principal) = principal else {
+        return true;
+    };
+    if principal.client_kind.eq_ignore_ascii_case("ios") {
+        return false;
+    }
+    if !principal.client_kind.eq_ignore_ascii_case("android") {
+        return true;
+    }
+    let Some(token) = token else {
+        return false;
+    };
+    authenticate_bridge_token_result(token.to_string(), Some(principal.device_id.clone()))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|current| {
+            current.client_kind.eq_ignore_ascii_case("android")
+                && current.principal_id == principal.principal_id
+        })
+}
+
+fn android_mcp_action_target_reason(
+    request_id: &str,
+    project_path: &str,
+    registry: &HashMap<String, ActiveSessionEntry>,
+    instances: &[crate::ui::window_registry::WindowInstance],
+    matching_serve_route: bool,
+) -> Option<&'static str> {
+    let mut bound = matching_serve_route;
+    if let Some(entry) = registry.get(request_id) {
+        if !local_project_paths_match(&normalize_bridge_project_path(&entry.project_path), project_path) {
+            return Some("target_project_mismatch");
+        }
+        bound = true;
+    }
+    let mut same_project_has_other_request = false;
+    for instance in instances {
+        let Some(instance_request_id) = normalize_route_part(instance.request_id.as_deref()) else {
+            continue;
+        };
+        let instance_project_path = normalize_bridge_project_path(&instance.project_path);
+        if instance_request_id == request_id {
+            if !local_project_paths_match(&instance_project_path, project_path) {
+                return Some("target_project_mismatch");
+            }
+            bound = true;
+        } else if local_project_paths_match(&instance_project_path, project_path) {
+            same_project_has_other_request = true;
+        }
+    }
+    if same_project_has_other_request && !bound {
+        return Some("stale_request");
+    }
+    if !bound {
+        return Some("target_not_active");
+    }
+    None
+}
+
+fn android_mcp_action_target(
+    payload: &serde_json::Value,
+) -> Result<(String, String), &'static str> {
+    let request_id = normalize_route_part(payload.get("request_id").and_then(|v| v.as_str()))
+        .ok_or("missing_request_id")?;
+    let raw_project_path = normalize_route_part(payload.get("project_path").and_then(|v| v.as_str()))
+        .ok_or("missing_project_path")?;
+    let project_path = normalize_bridge_project_path(&raw_project_path);
+    for alias in [payload.get("requestId"), payload.get("metadata").and_then(|m| m.get("request_id")), payload.get("metadata").and_then(|m| m.get("requestId"))] {
+        if alias.is_some() && alias.and_then(|v| v.as_str()).and_then(|v| normalize_route_part(Some(v))).as_deref() != Some(request_id.as_str()) {
+            return Err("conflicting_request_id");
+        }
+    }
+    if let Some(alias) = payload.get("projectPath") {
+        if alias.as_str().map(normalize_bridge_project_path).as_deref() != Some(project_path.as_str()) {
+            return Err("conflicting_project_path");
+        }
+    }
+    Ok((request_id, project_path))
+}
+
+fn android_mcp_action_result(
+    payload: &serde_json::Value,
+    request_id: Option<&str>,
+    project_path: Option<&str>,
+    delivered: bool,
+    reason: Option<&str>,
+    method: Option<&str>,
+) -> BridgeMessage {
+    BridgeMessage {
+        message_type: "mcp_action_result".to_string(),
+        payload: serde_json::json!({
+            "request_id": request_id,
+            "project_path": project_path,
+            "client_action_id": payload.get("client_action_id"),
+            "action": payload.get("action"),
+            "status": if delivered { "delivered" } else { "rejected" },
+            "delivered": delivered,
+            "reason": reason,
+            "method": method,
+        }),
+    }
+}
+
+fn android_mcp_action_pending_result(payload: &serde_json::Value, request_id: &str, project_path: &str) -> BridgeMessage {
+    let mut result = android_mcp_action_result(payload, Some(request_id), Some(project_path), false,
+        Some("source_confirmation_pending"), None);
+    result.payload["status"] = serde_json::json!("pending");
+    result
+}
+
+fn reserved_mobile_mirror_state(message: &BridgeMessage) -> bool {
+    message.message_type == "cross_device_mirror_state"
+        || message.payload.get("source").and_then(serde_json::Value::as_str) == Some("cross_device_mirror")
+        || extract_request_id_from_mcp_state(&message.payload).is_some_and(|id| id.starts_with("cross-mirror:"))
+}
+
+async fn handle_mobile_mirror_action(message: &BridgeMessage, authorized: bool) -> BridgeMessage {
+    let result = if authorized { crate::cross_device::submit_mobile_mirror_action(&message.payload).await }
+        else { Err("mirror_android_auth_scope_required".into()) };
+    let (status, result_kind, reason) = match result {
+        Ok(kind) => ("accepted", Some(kind), None),
+        Err(reason) if reason.starts_with("mirror_confirmation_unknown:") => ("pending", None, Some(reason)),
+        Err(reason) => ("rejected", None, Some(reason)),
+    };
+    BridgeMessage { message_type: "cross_device_mirror_action_result".into(), payload: serde_json::json!({
+        "mirror_id":message.payload.get("mirror_id"),"request_id":message.payload.get("request_id"),
+        "client_action_id":message.payload.get("client_action_id"),"action":message.payload.get("action"),
+        "source":"cross_device_mirror","status":status,"result_kind":result_kind,"reason":reason,
+        "source_consumed":false
+    }) }
+}
+
+fn android_delivered_close_state(ack: &BridgeMessage) -> Option<BridgeMessage> {
+    if ack.message_type != "mcp_action_result"
+        || ack.payload.get("delivered").and_then(|value| value.as_bool()) != Some(true)
+        || !matches!(ack.payload.get("method").and_then(|value| value.as_str()),
+            Some("response_channel" | "serve_response_file" | "cross_device_source"))
+    {
+        return None;
+    }
+    let request_id = normalize_route_part(ack.payload.get("request_id").and_then(|value| value.as_str()))?;
+    let project_path = normalize_route_part(ack.payload.get("project_path").and_then(|value| value.as_str()))?;
+    Some(BridgeMessage {
+        message_type: "mcp_state".to_string(),
+        payload: serde_json::json!({
+            "request": null,
+            "showMcpPopup": false,
+            "request_id": request_id,
+            "project_path": project_path,
+        }),
+    })
+}
+
+async fn broadcast_android_delivered_close_state(
+    tx: &broadcast::Sender<BridgeMessage>,
+    ack: &BridgeMessage,
+) -> bool {
+    let Some(close_state) = android_delivered_close_state(ack) else {
+        return false;
+    };
+    let request_id = close_state.payload["request_id"].as_str().unwrap_or_default();
+    let project_path = close_state.payload["project_path"].as_str().unwrap_or_default();
+    if let Err(reason) = cleanup_closed_mcp_state_route(request_id, project_path).await {
+        log::warn!("[Bridge] Android delivered close route rejected: {}", reason);
+        return false;
+    }
+    let _ = tx.send(close_state);
+    true
+}
+
+async fn renew_expired_android_serve_route(
+    request_id: &str,
+    project_path: &str,
+    instances: &[crate::ui::window_registry::WindowInstance],
+) -> Result<(), &'static str> {
+    let port = instances
+        .iter()
+        .find(|instance| {
+            instance.request_id.as_deref() == Some(request_id)
+                && normalize_bridge_project_path(&instance.project_path) == project_path
+        })
+        .and_then(|instance| instance.port)
+        .filter(|port| *port != 0)
+        .ok_or("response_route_renew_target_missing")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .map_err(|_| "response_route_renew_unavailable")?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/serve-response-route/renew"))
+        .json(&serde_json::json!({
+            "request_id": request_id,
+            "project_path": project_path,
+        }))
+        .send()
+        .await
+        .map_err(|_| "response_route_renew_unavailable")?;
+    if !response.status().is_success() {
+        return Err("response_route_renew_rejected");
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "response_route_renew_invalid_response")?;
+    if body.get("ok").and_then(|value| value.as_bool()) == Some(true)
+        && body.get("renewed").and_then(|value| value.as_bool()) == Some(true)
+        && body.get("request_id").and_then(|value| value.as_str()) == Some(request_id)
+        && body.get("project_path").and_then(|value| value.as_str())
+            .map(normalize_bridge_project_path)
+            .as_deref() == Some(project_path)
+    {
+        Ok(())
+    } else {
+        Err("response_route_renew_invalid_response")
+    }
+}
+
+async fn handle_android_mcp_action(
+    app_handle: Option<&AppHandle>,
+    message: &BridgeMessage,
+) -> BridgeMessage {
+    let payload = &message.payload;
+    let target = android_mcp_action_target(payload);
+    let (request_id, project_path) = match target {
+        Ok(target) => target,
+        Err(reason) => return android_mcp_action_result(payload, payload.get("request_id").and_then(|v| v.as_str()), payload.get("project_path").and_then(|v| v.as_str()), false, Some(reason), None),
+    };
+    if let Some(result) = crate::cross_device::submit_android_action(payload, &request_id, &project_path).await {
+        return match result {
+            Ok(true) => android_mcp_action_result(payload, Some(&request_id), Some(&project_path), true, None, Some("cross_device_source")),
+            Ok(false) => android_mcp_action_pending_result(payload, &request_id, &project_path),
+            Err(reason) => android_mcp_action_result(payload, Some(&request_id), Some(&project_path), false, Some(&reason), None),
+        };
+    }
+    let mut window_registry = crate::ui::window_registry::WindowRegistry::load();
+    let instances = window_registry.get_all_instances();
+    // A channel is keyed only by request ID. Verify its project binding separately.
+    let mut serve_preflight = preflight_android_serve_response_route(
+        &request_id, &project_path, MCP_ACTION_CACHE_TTL_SECS, &bridge_debug_log,
+    );
+    if serve_preflight.rejection_reason() == Some("response_route_expired") {
+        if let Err(reason) = renew_expired_android_serve_route(
+            &request_id, &project_path, &instances,
+        ).await {
+            return android_mcp_action_result(
+                payload, Some(&request_id), Some(&project_path), false, Some(reason), None,
+            );
+        }
+        serve_preflight = preflight_android_serve_response_route(
+            &request_id, &project_path, MCP_ACTION_CACHE_TTL_SECS, &bridge_debug_log,
+        );
+        if !serve_preflight.delivered {
+            return android_mcp_action_result(
+                payload, Some(&request_id), Some(&project_path), false,
+                serve_preflight.rejection_reason().or(Some("response_route_renew_invalid")), None,
+            );
+        }
+    }
+    let registry = ACTIVE_SESSION_REGISTRY.read().await;
+    let matching_serve_route = serve_preflight.delivered;
+    let denial = android_mcp_action_target_reason(
+        &request_id, &project_path, &registry, &instances, matching_serve_route,
+    );
+    drop(registry);
+    if let Some(reason) = denial {
+        return android_mcp_action_result(payload, Some(&request_id), Some(&project_path), false, Some(reason), None);
+    }
+    let channel_preflight = preflight_mcp_action_delivery(
+        app_handle, &project_path, Some(&request_id), MCP_ACTION_CACHE_TTL_SECS, &bridge_debug_log,
+    );
+    let matching_response_channel = channel_preflight.attempts.iter().any(|attempt| {
+        attempt.method == "response_channel_preflight" && attempt.delivered
+    });
+    if !matching_response_channel && !matching_serve_route {
+        return android_mcp_action_result(payload, Some(&request_id), Some(&project_path), false,
+            serve_preflight.rejection_reason().or(Some("route_miss")), None);
+    }
+
+    let timeline_route_id = {
+        let registry = ACTIVE_SESSION_REGISTRY.read().await;
+        registry.get(&request_id).and_then(|entry| {
+            resolve_mcp_action_timeline_route_id(payload, Some(&request_id), Some(&project_path), None, &registry)
+                .filter(|_| normalize_bridge_project_path(&entry.project_path) == project_path)
+                .map(|route| route.route_id)
+        })
+    };
+    let (delivered, reason, method) = if has_room_submit_metadata(payload) {
+        let outcome = handle_room_submit_action(
+            app_handle, &project_path, Some(&request_id), timeline_route_id.as_deref(), payload,
+        ).await;
+        (outcome.delivered, outcome.reason, outcome.delivery_attempts.into_iter().find(|attempt| attempt.delivered && !attempt.method.ends_with("preflight")).map(|attempt| attempt.method))
+    } else {
+        let delivery = if let Some(app_handle) = app_handle {
+            try_handle_mcp_action_directly(app_handle, &project_path, Some(&request_id), timeline_route_id.as_deref(), payload).await
+        } else {
+            try_handle_mcp_action_headless(&project_path, Some(&request_id), timeline_route_id.as_deref(), payload).await
+        };
+        let reason = delivery.rejection_reason().map(str::to_string);
+        let method = delivery.attempts.iter().find(|attempt| attempt.delivered).map(|attempt| attempt.method.clone());
+        (delivery.delivered, reason, method)
+    };
+    android_mcp_action_result(payload, Some(&request_id), Some(&project_path), delivered, reason.as_deref(), method.as_deref())
+}
+
+#[cfg(test)]
+mod android_mcp_action_route_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mobile_mirror_actions_require_authority_and_do_not_claim_mcp_consumption() {
+        let message = BridgeMessage { message_type: "cross_device_mirror_action".into(),
+            payload: serde_json::json!({"request_id":"cross-mirror:test","mirror_id":"cross-mirror:test",
+                "action":"submit","client_action_id":"action-1","user_input":"reply"}) };
+        let ack = handle_mobile_mirror_action(&message, false).await;
+        assert_eq!(ack.message_type, "cross_device_mirror_action_result");
+        assert_eq!(ack.payload["status"], "rejected");
+        assert_eq!(ack.payload["reason"], "mirror_android_auth_scope_required");
+        assert_eq!(ack.payload["source_consumed"], false);
+        assert!(ack.payload.get("delivered").is_none());
+        assert_eq!(android_mcp_action_target(&serde_json::json!({"request_id":"ordinary"})), Err("missing_project_path"));
+        assert!(reserved_mobile_mirror_state(&BridgeMessage { message_type:"mcp_state".into(),
+            payload:serde_json::json!({"request":{"id":"cross-mirror:forged","project_path":"C:/unrelated"}}) }));
+    }
+
+    fn window(request_id: &str, project_path: &str) -> crate::ui::window_registry::WindowInstance {
+        crate::ui::window_registry::WindowInstance {
+            pid: std::process::id(),
+            project_path: project_path.to_string(),
+            window_title: "test".to_string(),
+            registered_at: chrono::Utc::now().to_rfc3339(),
+            port: None,
+            request_id: Some(request_id.to_string()),
+            request_title: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_route_renewal_targets_only_the_exact_live_serve_window() {
+        let request_id = "serve-1790436233047";
+        let project_path = "C:/iterate-desktop";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/api/serve-response-route/renew",
+            axum::routing::post(|Json(request): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "ok": true,
+                    "renewed": true,
+                    "request_id": request["request_id"],
+                    "project_path": request["project_path"],
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut exact = window(request_id, project_path);
+        exact.port = Some(port);
+        assert_eq!(
+            renew_expired_android_serve_route(request_id, project_path, &[exact.clone()]).await,
+            Ok(()),
+        );
+        assert_eq!(
+            renew_expired_android_serve_route(
+                request_id, "C:/other-project", &[exact.clone()],
+            ).await,
+            Err("response_route_renew_target_missing"),
+        );
+        assert_eq!(
+            renew_expired_android_serve_route(
+                "serve-another-request", project_path, &[exact],
+            ).await,
+            Err("response_route_renew_target_missing"),
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn android_target_requires_both_explicit_fields_and_rejects_conflicting_aliases() {
+        assert_eq!(android_mcp_action_target(&serde_json::json!({"action":"submit","project_path":"C:/a"})), Err("missing_request_id"));
+        assert_eq!(android_mcp_action_target(&serde_json::json!({"action":"submit","request_id":"one"})), Err("missing_project_path"));
+        assert_eq!(android_mcp_action_target(&serde_json::json!({"request_id":"one","requestId":"two","project_path":"C:/a"})), Err("conflicting_request_id"));
+        assert_eq!(android_mcp_action_target(&serde_json::json!({"request_id":"one","project_path":"C:/a","projectPath":"C:/b"})), Err("conflicting_project_path"));
+    }
+
+    #[test]
+    fn android_target_keeps_two_windows_in_one_project_separate() {
+        let project = "C:/same-project";
+        let windows = vec![window("request-a", project), window("request-b", project)];
+        let registry = HashMap::new();
+        assert_eq!(android_mcp_action_target_reason("request-a", project, &registry, &windows, false), None);
+        assert_eq!(android_mcp_action_target_reason("request-b", project, &registry, &windows, false), None);
+        assert_eq!(android_mcp_action_target_reason("old-request", project, &registry, &windows, false), Some("stale_request"));
+        assert_eq!(android_mcp_action_target_reason("request-a", "C:/other-project", &registry, &windows, false), Some("target_project_mismatch"));
+        assert_eq!(android_mcp_action_target_reason("missing", "C:/empty", &registry, &windows, false), Some("target_not_active"));
+        assert_eq!(android_mcp_action_target_reason("headless-request", project, &registry, &windows, true), None);
+        let mut registry_with_headless = HashMap::new();
+        registry_with_headless.insert("headless-request".to_string(), ActiveSessionEntry {
+            request_id: "headless-request".to_string(),
+            project_path: project.to_string(),
+            project_name: "same-project".to_string(),
+            title: "test".to_string(),
+            payload: serde_json::Value::Null,
+            last_active_at: chrono::Utc::now().to_rfc3339(),
+        });
+        assert_eq!(android_mcp_action_target_reason("headless-request", project, &registry_with_headless, &windows, false), None);
+        assert_eq!(android_mcp_action_target_reason("headless-request", "C:/other-project", &registry_with_headless, &windows, false), Some("target_project_mismatch"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn android_target_accepts_windows_separator_identity_without_merging_requests() {
+        let request_id = "serve-1790913331998-e8e52f66-620c-4589-a59f-4bc6fd6820f3";
+        let project = "E:/Github/iterate-desktop";
+        let registered_project = r"E:\Github\iterate-desktop";
+        let windows = vec![window(request_id, registered_project)];
+        let mut registry = HashMap::new();
+        assert_eq!(android_mcp_action_target_reason(request_id, project, &registry, &windows, false), None);
+        assert_eq!(android_mcp_action_target_reason("other-request", project, &registry, &windows, false), Some("stale_request"));
+        assert_eq!(android_mcp_action_target_reason(request_id, "E:/Github/other", &registry, &windows, false), Some("target_project_mismatch"));
+        assert_eq!(android_mcp_action_target_reason(request_id, "E:/github/iterate-desktop", &registry, &windows, false), Some("target_project_mismatch"));
+        registry.insert(request_id.to_string(), ActiveSessionEntry {
+            request_id: request_id.to_string(), project_path: registered_project.to_string(),
+            project_name: "iterate-desktop".to_string(), title: "separator regression".to_string(),
+            payload: serde_json::Value::Null, last_active_at: chrono::Utc::now().to_rfc3339(),
+        });
+        assert_eq!(android_mcp_action_target_reason(request_id, project, &registry, &windows, false), None);
+        assert_eq!(android_mcp_action_target_reason(request_id, "E:/Github/other", &registry, &[], false), Some("target_project_mismatch"));
+        assert_eq!(android_mcp_action_target_reason("other-request", project, &registry, &[], false), Some("target_not_active"));
+        registry.get_mut(request_id).unwrap().project_path = "E:/Github/other".to_string();
+        assert_eq!(android_mcp_action_target_reason(request_id, project, &registry, &windows, true), Some("target_project_mismatch"));
+    }
+
+    #[test]
+    fn android_ack_is_correlated_and_only_reports_actual_delivery() {
+        let payload = serde_json::json!({"action":"submit","client_action_id":"phone-1"});
+        let rejected = android_mcp_action_result(&payload, Some("request-a"), Some("C:/project"), false, Some("route_miss"), None);
+        assert_eq!(rejected.message_type, "mcp_action_result");
+        assert_eq!(rejected.payload["request_id"], "request-a");
+        assert_eq!(rejected.payload["client_action_id"], "phone-1");
+        assert_eq!(rejected.payload["status"], "rejected");
+        assert_eq!(rejected.payload["delivered"], false);
+        assert!(android_delivered_close_state(&rejected).is_none());
+        let accepted = android_mcp_action_result(&payload, Some("request-a"), Some("C:/project"), true, None, Some("serve_response_file"));
+        assert_eq!(accepted.payload["status"], "delivered");
+        assert_eq!(accepted.payload["method"], "serve_response_file");
+        let close = android_delivered_close_state(&accepted).unwrap();
+        assert_eq!(close.message_type, "mcp_state");
+        assert_eq!(close.payload["request_id"], "request-a");
+        assert_eq!(close.payload["project_path"], "C:/project");
+        assert_eq!(close.payload["showMcpPopup"], false);
+        assert!(close.payload.get("action").is_none());
+        let internal = android_mcp_action_result(&payload, Some("request-a"), Some("C:/project"), true, None, Some("rust_direct_internal"));
+        assert!(android_delivered_close_state(&internal).is_none());
+        let source = android_mcp_action_result(&payload, Some("request-a"), Some("C:/project"), true, None, Some("cross_device_source"));
+        assert_eq!(android_delivered_close_state(&source).unwrap().payload["request_id"], "request-a");
+        let pending = android_mcp_action_pending_result(&payload, "request-a", "C:/project");
+        assert_eq!(pending.payload["status"], "pending");
+        assert!(android_delivered_close_state(&pending).is_none());
+    }
+
+    #[tokio::test]
+    async fn android_headless_ack_reflects_real_serve_file_delivery_and_route_miss() {
+        let request_id = format!("android-route-test-{}", uuid::Uuid::new_v4());
+        let project_path = std::env::temp_dir().join(format!("iterate-android-route-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project = project_path.to_string_lossy().to_string();
+        let response_file = std::env::temp_dir().join(format!("iterate-android-response-test-{}.json", uuid::Uuid::new_v4()));
+        let route_file = super::super::mcp_action_delivery::serve_response_route_file(&request_id);
+        std::fs::write(&route_file, serde_json::json!({
+            "request_id": request_id,
+            "project_path": project,
+            "response_file": response_file,
+            "created_at": chrono::Utc::now().timestamp(),
+        }).to_string()).unwrap();
+        let message = BridgeMessage {
+            message_type: "mcp_action".to_string(),
+            payload: serde_json::json!({"action":"cancel","request_id":request_id,"project_path":project,"client_action_id":"phone-1"}),
+        };
+        let accepted = handle_android_mcp_action(None, &message).await;
+        assert_eq!(accepted.payload["status"], "delivered");
+        assert_eq!(accepted.payload["method"], "serve_response_file");
+        assert_eq!(std::fs::read_to_string(&response_file).unwrap(), "\"CANCELLED\"");
+        let (tx, mut requester_receiver) = broadcast::channel(4);
+        let mut other_android_receiver = tx.subscribe();
+        let unrelated_request_id = format!("unrelated-{}", uuid::Uuid::new_v4());
+        assert!(broadcast_android_delivered_close_state(&tx, &accepted).await);
+        for receiver in [&mut requester_receiver, &mut other_android_receiver] {
+            let closed = receiver.try_recv().unwrap();
+            assert_eq!(closed.payload["request_id"], request_id);
+            assert_eq!(closed.payload["project_path"], project);
+            assert_ne!(closed.payload["request_id"], unrelated_request_id);
+        }
+
+        let rejected = handle_android_mcp_action(None, &message).await;
+        assert_eq!(rejected.payload["status"], "rejected");
+        assert_eq!(rejected.payload["reason"], "target_not_active");
+        assert_eq!(rejected.payload["request_id"], request_id);
+        assert!(!broadcast_android_delivered_close_state(&tx, &rejected).await);
+        assert!(requester_receiver.try_recv().is_err());
+        assert!(other_android_receiver.try_recv().is_err());
+        let _ = std::fs::remove_file(&response_file);
+        let _ = std::fs::remove_file(&route_file);
+        let _ = std::fs::remove_dir_all(&project_path);
+    }
+
+    #[tokio::test]
+    async fn android_rejects_colliding_route_filename_for_different_request_id() {
+        let base = format!("android-collision-{}", uuid::Uuid::new_v4());
+        let real_request_id = format!("{base}.a");
+        let spoofed_request_id = format!("{base}/a");
+        let route_file = super::super::mcp_action_delivery::serve_response_route_file(&real_request_id);
+        assert_eq!(route_file, super::super::mcp_action_delivery::serve_response_route_file(&spoofed_request_id));
+        let project_path = std::env::temp_dir().join(format!("iterate-android-collision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project = project_path.to_string_lossy().to_string();
+        let response_file = std::env::temp_dir().join(format!("iterate-android-collision-response-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&route_file, serde_json::json!({
+            "request_id": real_request_id,
+            "project_path": project,
+            "response_file": response_file,
+            "created_at": chrono::Utc::now().timestamp(),
+        }).to_string()).unwrap();
+        let message = BridgeMessage {
+            message_type: "mcp_action".to_string(),
+            payload: serde_json::json!({"action":"cancel","request_id":spoofed_request_id,"project_path":project}),
+        };
+        let ack = handle_android_mcp_action(None, &message).await;
+        assert_eq!(ack.payload["status"], "rejected");
+        assert!(!response_file.exists());
+        assert!(route_file.exists());
+        let _ = std::fs::remove_file(&route_file);
+        let _ = std::fs::remove_dir_all(&project_path);
+    }
+}
+
+fn native_principal_allows(principal: Option<&AuthPrincipal>, scope: &str) -> bool {
+    principal.is_some_and(|p| {
+        p.client_kind.eq_ignore_ascii_case("android")
+            && !p.device_id.is_empty()
+            && p.scopes.iter().any(|s| s == scope)
+    })
+}
+async fn native_credential_allows(principal:&Option<AuthPrincipal>,token:Option<&str>,scope:&str)->bool {
+    let Some(original)=principal.as_ref().filter(|p|native_principal_allows(Some(p),scope))else{return false;};
+    let Some(token)=token else{return false;};
+    authenticate_bridge_token_result(token.to_owned(),Some(original.device_id.clone())).await.ok().flatten().is_some_and(|current|current.principal_id==original.principal_id&&current.device_id==original.device_id&&native_principal_allows(Some(&current),scope))
+}
+fn reserved_native_state(payload: &serde_json::Value) -> bool {
+    payload.get("source").and_then(|v| v.as_str()) == Some("codex_native")
+        || payload.pointer("/request/source").and_then(|v| v.as_str()) == Some("codex_native")
+        || payload
+            .get("request_id")
+            .or_else(|| payload.pointer("/request/id"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id.trim().starts_with("native-codex:") || id.trim().starts_with("native-cli:"))
+        || payload.get("timeline_route_id").or_else(|| payload.pointer("/request/timeline_route_id"))
+            .and_then(|v| v.as_str()).is_some_and(|id| id.trim().starts_with("native-cli:"))
+}
 async fn handle_axum_connection(
     socket: WebSocket,
     app_handle: Option<AppHandle>,
     tx: broadcast::Sender<BridgeMessage>,
     client_id: String,
     mut auth_principal: Option<AuthPrincipal>,
+    mut auth_token: Option<String>,
     auth_enforced: bool,
 ) {
     log_important!(info, "[Bridge] Web 端已连接 (Axum WS)");
@@ -6052,18 +7210,80 @@ async fn handle_axum_connection(
     }
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut rx = tx.subscribe();
+    let mut native_rx = crate::codex_questions::subscribe();
+    if native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await
+    {
+        let sessions = crate::codex_questions::history_sessions().await;
+        if ws_sender.send(Message::Text(sessions.to_string())).await.is_err() { return; }
+        for mut event in crate::codex_questions::snapshot() {
+            if !native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{return;}
+            attach_mobile_native_history_to_state(&mut event).await;
+            if ws_sender
+                .send(Message::Text(event.to_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
     // 每 30 秒发送 ping 保持连接（防止 Cloudflare Tunnel 空闲超时断连）
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut mirror_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    mirror_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut mirror_states: HashMap<String, serde_json::Value> = HashMap::new();
+    let _hub_connection=match crate::cross_device::hub_transport::legacy_connection(){Ok(guard)=>guard,Err(_)=>{let _=ws_sender.send(Message::Close(None)).await;return;}};
 
     loop {
         tokio::select! {
+            _ = mirror_interval.tick() => {
+                if crate::cross_device::hub_transport::legacy_paused(){let _=ws_sender.send(Message::Close(None)).await;break;}
+                if !native_credential_allows(&auth_principal, auth_token.as_deref(), SCOPE_SESSION_READ).await { continue; }
+                let current: HashMap<_, _> = crate::cross_device::mobile_mirror_states().await.into_iter()
+                    .filter_map(|payload| Some((payload.get("mirror_id")?.as_str()?.to_string(), payload))).collect();
+                if !native_credential_allows(&auth_principal, auth_token.as_deref(), SCOPE_SESSION_READ).await { continue; }
+                for (id, payload) in &current {
+                    if mirror_states.get(id) == Some(payload) { continue; }
+                    let event = serde_json::json!({"message_type":"cross_device_mirror_state","payload":payload});
+                    if ws_sender.send(Message::Text(event.to_string())).await.is_err() { return; }
+                }
+                for id in mirror_states.keys().filter(|id| !current.contains_key(*id)) {
+                    let event = serde_json::json!({"message_type":"cross_device_mirror_state",
+                        "payload":{"mirror_id":id,"request_id":id,"source":"cross_device_mirror","request":null,"closed":true}});
+                    if ws_sender.send(Message::Text(event.to_string())).await.is_err() { return; }
+                }
+                mirror_states = current;
+            }
             _ = ping_interval.tick() => {
+                if !active_mobile_websocket_credential(&auth_principal, auth_token.as_deref()).await {
+                    let _ = ws_sender.send(Message::Close(None)).await;
+                    break;
+                }
                 if let Err(e) = ws_sender.send(Message::Ping(vec![b'p', b'i', b'n', b'g'])).await {
                     log::debug!("[Bridge] Ping 发送失败: {}", e);
                     break;
                 }
             }
+            result=native_rx.recv()=>{
+                if !native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{continue;}
+                if !active_mobile_websocket_credential(&auth_principal,auth_token.as_deref()).await{break;}
+                let events=match result {Ok(event)=>vec![event],Err(broadcast::error::RecvError::Lagged(_))=>crate::codex_questions::snapshot(),Err(_)=>break};
+                for mut event in events{
+                    if !native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{return;}
+                    if !crate::codex_questions::event_is_current(&event){continue;}
+                    if let Some(device)=event.get("native_device").and_then(|v|v.as_str()){
+                        if auth_principal.as_ref().is_none_or(|p|p.device_id!=device){continue;}
+                    }
+                    attach_mobile_native_history_to_state(&mut event).await;
+                    if let Some(o)=event.as_object_mut(){o.remove("native_device");o.remove("native_owner");}
+                    if ws_sender.send(Message::Text(event.to_string())).await.is_err(){return;}
+                }
+            }
             result = rx.recv() => {
+                if !active_mobile_websocket_credential(&auth_principal, auth_token.as_deref()).await {
+                    let _ = ws_sender.send(Message::Close(None)).await;
+                    break;
+                }
                 let bridge_msg = match result {
                     Ok(msg) => msg,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -6075,6 +7295,7 @@ async fn handle_axum_connection(
                         break;
                     }
                 };
+                if reserved_native_state(&bridge_msg.payload){continue;}
                 if !bridge_message_should_send_to_ws_client(&client_id, &bridge_msg).await {
                     log::debug!(
                         "[Bridge] skip targeted phone_action_request for client_id={}",
@@ -6092,6 +7313,10 @@ async fn handle_axum_connection(
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        if !active_mobile_websocket_credential(&auth_principal, auth_token.as_deref()).await {
+                            let _ = ws_sender.send(Message::Close(None)).await;
+                            break;
+                        }
                         let redacted_text = redact_bridge_message_text(&text);
                         log_important!(info, "[Bridge] 收到 Web 端消息: {}", redacted_text);
                         bridge_debug_log(&format!("WS 收到消息: {}", redacted_text.chars().take(100).collect::<String>()));
@@ -6100,12 +7325,17 @@ async fn handle_axum_connection(
                             if auth_enforced && auth_principal.is_none() {
                                 if let Some(token) = websocket_device_token_from_message(&bridge_msg) {
                                     match authenticate_bridge_token_result(
-                                        token,
+                                        token.clone(),
                                         websocket_device_id_from_message(&bridge_msg),
                                     )
                                     .await
                                     {
-                                        Ok(principal) => auth_principal = principal,
+                                        Ok(principal) => {
+                                            if principal.is_some() {
+                                                auth_token = Some(token);
+                                            }
+                                            auth_principal = principal;
+                                        },
                                         Err(_) => {
                                             let _ = ws_sender
                                                 .send(Message::Text(
@@ -6143,12 +7373,66 @@ async fn handle_axum_connection(
                                     break;
                                 }
                             }
+                            if bridge_msg.message_type == "cross_device_mirror_action" {
+                                let authorized = native_credential_allows(&auth_principal, auth_token.as_deref(), SCOPE_SESSION_RESPOND).await
+                                    && native_credential_allows(&auth_principal, auth_token.as_deref(), SCOPE_SESSION_READ).await;
+                                let ack = handle_mobile_mirror_action(&bridge_msg, authorized).await;
+                                if ws_sender.send(Message::Text(serde_json::to_string(&ack).unwrap_or_default())).await.is_err() { break; }
+                                continue;
+                            }
+                            if reserved_mobile_mirror_state(&bridge_msg) { continue; }
                             update_ws_client_from_message(
                                 &client_id,
                                 &bridge_msg,
                                 auth_principal.as_ref(),
                             )
                             .await;
+                            if bridge_msg.message_type=="mcp_action"&&crate::codex_questions::is_native_action(&bridge_msg.payload){
+                                let ack=if native_credential_allows(&auth_principal,auth_token.as_deref(),"session.respond").await&&native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{
+                                    crate::codex_questions::mobile_action(&auth_principal.as_ref().unwrap().device_id,&bridge_msg.payload).await
+                                }else{crate::codex_questions::unauthoritative_result(&bridge_msg.payload,"native_android_auth_scope_required")};
+                                if !native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{break;}
+                                if ws_sender.send(Message::Text(ack.to_string())).await.is_err(){break;}continue;
+                            }
+                            if bridge_msg.message_type=="mcp_state"&&reserved_native_state(&bridge_msg.payload){continue;}
+                            if bridge_msg.message_type=="request_sync"{
+                                if native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{
+                                    let sessions=crate::codex_questions::history_sessions().await;
+                                    if ws_sender.send(Message::Text(sessions.to_string())).await.is_err(){return;}
+                                    for mut event in crate::codex_questions::snapshot(){if !native_credential_allows(&auth_principal,auth_token.as_deref(),"session.read").await{return;}attach_mobile_native_history_to_state(&mut event).await;if ws_sender.send(Message::Text(event.to_string())).await.is_err(){return;}}
+                                }
+                                if crate::codex_questions::is_native_action(&bridge_msg.payload){continue;}
+                            }
+                            if bridge_msg.message_type == "mcp_action"
+                                && auth_principal.as_ref().is_some_and(|principal| principal.client_kind.eq_ignore_ascii_case("android"))
+                            {
+                                let ack = if let Some(reason) = auth_principal.as_ref().and_then(|principal| remote_action_denial_reason(principal, &bridge_msg)) {
+                                    android_mcp_action_result(
+                                        &bridge_msg.payload,
+                                        bridge_msg.payload.get("request_id").and_then(|value| value.as_str()),
+                                        bridge_msg.payload.get("project_path").and_then(|value| value.as_str()),
+                                        false,
+                                        Some(&reason),
+                                        None,
+                                    )
+                                } else {
+                                    handle_android_mcp_action(app_handle.as_ref(), &bridge_msg).await
+                                };
+                                // The requester sees its delivery result before other clients
+                                // receive the exact-route closed state.
+                                let ack_send_failed = match serde_json::to_string(&ack) {
+                                    Ok(text) => ws_sender.send(Message::Text(text)).await.is_err(),
+                                    Err(error) => {
+                                        log::error!("[Bridge] Android action ACK serialization failed: {}", error);
+                                        true
+                                    }
+                                };
+                                broadcast_android_delivered_close_state(&tx, &ack).await;
+                                if ack_send_failed {
+                                    break;
+                                }
+                                continue;
+                            }
                             if auth_enforced {
                                 if let Some(principal) = auth_principal.as_ref() {
                                     if let Some(reason) =
@@ -6420,12 +7704,26 @@ async fn handle_axum_connection(
                                     .payload
                                     .get("request_id")
                                     .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
+                                    .map(str::trim)
+                                    .filter(|route| !route.is_empty())
+                                    .map(str::to_owned);
                                 let target_project_path = bridge_msg
                                     .payload
                                     .get("project_path")
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.to_string());
+                                // Native history uses its own authenticated channel and an exact
+                                // launch/thread route. Never fall through to project-based MCP sync.
+                                if target_request_id.as_deref().is_some_and(|id| id.starts_with("native-cli:")) {
+                                    if native_credential_allows(&auth_principal, auth_token.as_deref(), "session.read").await {
+                                        if let (Some(route), Some(path)) = (target_request_id.as_deref(), target_project_path.as_deref()) {
+                                            if let Some(snapshot) = crate::codex_questions::history_snapshot(route, path).await {
+                                                if ws_sender.send(Message::Text(snapshot.to_string())).await.is_err() { break; }
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let sync_reason = bridge_msg
                                     .payload
                                     .get("sync_reason")
@@ -6452,6 +7750,110 @@ async fn handle_axum_connection(
                                     target_request_id.as_deref(),
                                     normalized_project_path.as_deref(),
                                 );
+                                // The Android home view has no route on a fresh connection.
+                                // Send every live request in newest-window order so its picker
+                                // can show all pending windows, including two in one project.
+                                if is_request_sync
+                                    && effective_target_request_id.is_none()
+                                    && normalized_project_path.is_none()
+                                    && auth_principal.as_ref().is_some_and(|principal| {
+                                        principal.client_kind.eq_ignore_ascii_case("android")
+                                            && principal.has_scope(SCOPE_SESSION_READ)
+                                    })
+                                {
+                                    let mut states = android_initial_sync_states().await;
+                                    let first_route = states.first().and_then(|payload| {
+                                        Some((
+                                            extract_request_id_from_mcp_state(payload)?,
+                                            extract_project_path_from_mcp_state(payload)?,
+                                        ))
+                                    });
+                                    if states.is_empty() {
+                                        states.push(serde_json::json!({
+                                            "cache_source": "quota_snapshot",
+                                        }));
+                                    }
+                                    for mut payload in states {
+                                        refresh_custom_prompts_in_mcp_state(app_handle.as_ref(), &mut payload);
+                                        ensure_ghost_suggestions_in_mcp_state(&mut payload);
+                                        let request_id = extract_request_id_from_mcp_state(&payload);
+                                        let project_path = extract_project_path_from_mcp_state(&payload);
+                                        crate::ui::live_goal::ensure_live_goal_in_mcp_state(
+                                            app_handle.as_ref(), &mut payload, project_path.as_deref(),
+                                        );
+                                        let codex_home = crate::ui::quota_snapshot::codex_home_from_mcp_state(&payload)
+                                            .or_else(|| requested_codex_home.clone());
+                                        inject_cached_quota_snapshot_and_refresh_async(
+                                            app_handle.as_ref(), &tx, &mut payload, codex_home,
+                                            "quota_request_sync",
+                                        );
+                                        let route_key = resolve_tree_route_key(
+                                            request_id.as_deref(), project_path.as_deref(),
+                                        );
+                                        if let Some(object) = payload.as_object_mut() {
+                                            object.insert("sync_response".to_string(), serde_json::json!(true));
+                                            object.insert("suppress_remote_notification".to_string(), serde_json::json!(true));
+                                            object.insert("sync_reason".to_string(), serde_json::json!(sync_reason));
+                                            if !object.contains_key("cache_source") {
+                                                object.insert("cache_source".to_string(), serde_json::json!("android_live_window"));
+                                            }
+                                            if let Some(route_key) = route_key {
+                                                object.insert("route_key".to_string(), serde_json::json!(route_key));
+                                            }
+                                        }
+                                        TimelineSyncService::sanitize_payload_timeline_nodes(&mut payload);
+                                        let state_message = BridgeMessage {
+                                            message_type: "mcp_state".to_string(), payload,
+                                        };
+                                        if let Ok(text) = serde_json::to_string(&state_message) {
+                                            if ws_sender.send(Message::Text(text)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    let prevent_sleep_status = crate::ui::commands::get_prevent_sleep_status_local();
+                                    let status_message = BridgeMessage {
+                                        message_type: "prevent_sleep_status".to_string(),
+                                        payload: serde_json::json!({"enabled": prevent_sleep_status}),
+                                    };
+                                    if let Ok(text) = serde_json::to_string(&status_message) {
+                                        let _ = ws_sender.send(Message::Text(text)).await;
+                                    }
+                                    if let Some((request_id, project_path)) = first_route {
+                                        if let Some(snapshot) = TimelineSyncService::build_snapshot_message(
+                                            app_handle.as_ref(), Some(&request_id), Some(&project_path),
+                                        ).await {
+                                            if let Ok(text) = serde_json::to_string(&snapshot) {
+                                                let _ = ws_sender.send(Message::Text(text)).await;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if is_request_sync {
+                                    if let Some(request_id) = effective_target_request_id.as_deref() {
+                                        if let Some(closed_project_path) = closed_mcp_state_project_for_request(request_id).await {
+                                            let project_matches = normalized_project_path.as_deref()
+                                                .map(|path| normalize_bridge_project_path(path) == closed_project_path)
+                                                .unwrap_or(true);
+                                            if project_matches {
+                                                let closed_message = BridgeMessage {
+                                                    message_type: "mcp_state".to_string(),
+                                                    payload: serde_json::json!({
+                                                        "request": null,
+                                                        "showMcpPopup": false,
+                                                        "request_id": request_id,
+                                                        "project_path": closed_project_path,
+                                                    }),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&closed_message) {
+                                                    let _ = ws_sender.send(Message::Text(text)).await;
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let fallback_route = if effective_target_request_id.is_none()
                                     && normalized_project_path.is_none()
                                 {
@@ -6616,10 +8018,20 @@ async fn handle_axum_connection(
                                         cache_age_ms,
                                         sync_reason
                                     ));
+                                    let cached_payload = if let Some(request_id) = effective_target_request_id.as_deref() {
+                                        if closed_mcp_state_project_for_request(request_id).await.is_some() {
+                                            None
+                                        } else {
+                                            cached_payload
+                                        }
+                                    } else {
+                                        cached_payload
+                                    };
                                     timeline_route_hint = cached_payload.clone();
 
                                     if let Some(mut payload) = cached_payload {
-                                        ensure_custom_prompts_in_mcp_state(
+                                        stamp_local_mobile_computer_source(&mut payload);
+                                        refresh_custom_prompts_in_mcp_state(
                                             app_handle.as_ref(),
                                             &mut payload,
                                         );
@@ -6707,6 +8119,7 @@ async fn handle_axum_connection(
                                             "sync_reason": sync_reason,
                                             "live_goal": live_goal,
                                         });
+                                        refresh_custom_prompts_in_mcp_state(app_handle.as_ref(), &mut payload);
                                         inject_cached_quota_snapshot_and_refresh_async(
                                             app_handle.as_ref(),
                                             &tx,
@@ -6728,6 +8141,7 @@ async fn handle_axum_connection(
                                             "cache_source": "quota_snapshot",
                                             "sync_reason": sync_reason,
                                         });
+                                        refresh_custom_prompts_in_mcp_state(app_handle.as_ref(), &mut payload);
                                         inject_cached_quota_snapshot_and_refresh_async(
                                             app_handle.as_ref(),
                                             &tx,
@@ -6771,18 +8185,14 @@ async fn handle_axum_connection(
                                     }
                                 }
 
-                                if let Some(app_handle) = app_handle.as_ref() {
-                                    if let Some(snapshot_msg) = TimelineSyncService::build_snapshot_message(
-                                        app_handle,
-                                        timeline_request_id.as_deref(),
-                                        timeline_project_path.as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        if let Ok(text) = serde_json::to_string(&snapshot_msg) {
-                                            if let Err(err) = ws_sender.send(Message::Text(text)).await {
-                                                log::warn!("[Bridge] 发送时间线快照失败: {}", err);
-                                            }
+                                if let Some(snapshot_msg) = TimelineSyncService::build_snapshot_message(
+                                    app_handle.as_ref(),
+                                    timeline_request_id.as_deref(),
+                                    timeline_project_path.as_deref(),
+                                ).await {
+                                    if let Ok(text) = serde_json::to_string(&snapshot_msg) {
+                                        if let Err(err) = ws_sender.send(Message::Text(text)).await {
+                                            log::warn!("[Bridge] 发送时间线快照失败: {}", err);
                                         }
                                     }
                                 }
@@ -7009,11 +8419,34 @@ async fn handle_push_unsubscribe(
     Json(serde_json::json!({ "ok": removed, "count": subscriptions.len() })).into_response()
 }
 
-/// GET /api/mobile/pairing — 返回 iOS companion 实验阶段的临时配对信息
+/// GET /api/android/pairing — trusted desktop issues a short-lived Android QR.
+fn android_pairing_issue_denial(
+    remote_addr: SocketAddr,
+    headers: &HeaderMap,
+    audience: Option<crate::bridge::auth::BridgeTokenAudience>,
+) -> Option<(StatusCode, &'static str)> {
+    if !remote_addr.ip().is_loopback() || is_public_bridge_request(headers) {
+        return Some((StatusCode::FORBIDDEN, "pairing_local_desktop_only"));
+    }
+    if audience != Some(crate::bridge::auth::BridgeTokenAudience::DesktopRenderer) {
+        return Some((StatusCode::UNAUTHORIZED, "pairing_desktop_auth_required"));
+    }
+    None
+}
+
 async fn handle_api_mobile_pairing(
     State(state): State<BridgeHttpState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    verified_audience: Option<axum::extract::Extension<VerifiedBridgeAudience>>,
 ) -> Response {
+    if let Some((status, error)) = android_pairing_issue_denial(
+        remote_addr,
+        &headers,
+        verified_audience.map(|axum::extract::Extension(value)| value.0),
+    ) {
+        return json_error_response(status, error);
+    }
     let started_at = std::time::Instant::now();
     let public_request = is_public_bridge_request(&headers);
     let requires_auth = public_route_requires_auth(&headers);
@@ -7189,6 +8622,9 @@ fn public_route_requires_auth(headers: &HeaderMap) -> bool {
 
 const TRUSTED_INTERNAL_CAPABILITY_HEADER: &str = "x-iterate-trusted-capability";
 
+#[derive(Clone, Copy)]
+struct VerifiedBridgeAudience(crate::bridge::auth::BridgeTokenAudience);
+
 fn trusted_internal_capability(headers: &HeaderMap) -> bool {
     headers
         .get(TRUSTED_INTERNAL_CAPABILITY_HEADER)
@@ -7213,9 +8649,6 @@ fn direct_network_bridge_auth_path(path: &str) -> bool {
         || matches!(
             path,
             "/api/active-sessions"
-                | "/api/apns/register"
-                | "/api/apns/live-activity/register"
-                | "/api/apns/live-activity/update"
                 | "/api/apns/notify"
                 | "/api/audio-assets"
                 | "/api/cleanup-session"
@@ -7223,7 +8656,7 @@ fn direct_network_bridge_auth_path(path: &str) -> bool {
                 | "/api/ghost-suggestions"
                 | "/api/import-prompts-dir"
                 | "/api/mcp-tools"
-                | "/api/mobile/pairing"
+                | "/api/android/pairing"
                 | "/api/mobile/paired-device-file-roots"
                 | "/api/open-codex-chat"
                 | "/api/phone-action"
@@ -7522,7 +8955,7 @@ fn log_ghost_suggestions_write(principal: Option<&AuthPrincipal>, action: &str, 
     );
 }
 
-/// POST /api/mobile/pairing/claim — iOS 使用一次性 pairing token 换长期 device token
+/// POST /api/android/pairing/claim — Android exchanges one-time QR for a device token.
 async fn claim_mobile_pairing_core(
     pairing_token_raw: &str,
     device_id_raw: &str,
@@ -7543,14 +8976,13 @@ async fn claim_mobile_pairing_core(
     let device_name = device_name_raw
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("iPhone")
+        .unwrap_or("Android")
         .to_string();
     let client_kind = client_kind_raw
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("ios")
+        .unwrap_or("")
         .to_ascii_lowercase();
-    if client_kind != "ios" {
+    if client_kind != "android" {
         return Err("invalid_client_kind".to_string());
     }
 
@@ -7572,13 +9004,7 @@ async fn claim_mobile_pairing_core(
             if receipt.device_id != device_id {
                 return Err("pairing_token_already_claimed".to_string());
             }
-            return Ok(MobilePairingClaimResponse {
-                ok: true,
-                device_id: receipt.device_id.clone(),
-                device_token: receipt.device_token.clone(),
-                scopes: receipt.scopes.clone(),
-                pairing_session_id: receipt.session_id.clone(),
-            });
+            return Err("pairing_token_already_claimed".to_string());
         }
     }
 
@@ -7650,16 +9076,21 @@ async fn claim_mobile_pairing_core(
     }
 
     if let Some(store) = test_store {
-        replace_paired_device_record(store, record);
+        replace_android_paired_device_record(store, record).map_err(str::to_string)?;
     } else {
         let path = paired_devices_path();
-        if let Err(err) = mutate_paired_device_store_at(&path, |store| {
-            replace_paired_device_record(store, record);
-            ((), true)
+        match mutate_paired_device_store_at(&path, |store| {
+            let result = replace_android_paired_device_record(store, record);
+            let changed = result.is_ok();
+            (result, changed)
         }) {
-            log::warn!("[Bridge][MobileAuth] failed to save paired device: {}", err);
-            mark_mobile_pairing_session_failed(&token_info.session_id).await;
-            return Err("save_paired_device_failed".to_string());
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(err) => {
+                log::warn!("[Bridge][MobileAuth] failed to save paired device: {}", err);
+                mark_mobile_pairing_session_failed(&token_info.session_id).await;
+                return Err("save_paired_device_failed".to_string());
+            }
         }
     }
 
@@ -7668,7 +9099,6 @@ async fn claim_mobile_pairing_core(
         device_id: device_id.to_string(),
         device_name,
         client_kind,
-        device_token: device_token.clone(),
         scopes: scopes.clone(),
         claimed_at: now_string,
         expires_at: token_info.expires_at.clone(),
@@ -7772,6 +9202,7 @@ async fn handle_api_mobile_pairing_claim(
                 json_error_response(StatusCode::BAD_REQUEST, &error)
             }
             "pairing_token_already_claimed" => json_error_response(StatusCode::CONFLICT, &error),
+            "device_id_retired_ios" => json_error_response(StatusCode::CONFLICT, &error),
             _ => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
         },
     }
@@ -7836,7 +9267,7 @@ async fn mobile_pairing_session_snapshot(session_id: &str) -> Option<MobilePairi
             .filter(|info| {
                 info.authenticated_client_kind
                     .as_deref()
-                    .is_some_and(|client_kind| client_kind.eq_ignore_ascii_case("ios"))
+                    .is_some_and(|client_kind| client_kind.eq_ignore_ascii_case("android"))
             })
             .filter(|info| {
                 info.authenticated_device_id.as_deref() == Some(receipt.device_id.as_str())
@@ -7886,7 +9317,7 @@ async fn mobile_pairing_session_snapshot(session_id: &str) -> Option<MobilePairi
     })
 }
 
-/// GET /api/mobile/pairing/sessions/:session_id — authenticated, redacted session progress.
+/// GET /api/android/pairing/sessions/:session_id — authenticated session progress.
 async fn handle_api_mobile_pairing_session(
     Path(session_id): Path<String>,
     headers: HeaderMap,
@@ -7896,6 +9327,13 @@ async fn handle_api_mobile_pairing_session(
             .await
     {
         return response;
+    }
+
+    if crate::tunnel::commands::configured_formal_mobile_route().is_some_and(|r|r.transport=="cloud_hub") {
+        return match crate::cross_device::hub_transport::mobile_pairing_session(&session_id).await {
+            Ok(session)=>Json(serde_json::json!({"ok":true,"session":session})).into_response(),
+            Err(_)=>json_error_response(StatusCode::BAD_REQUEST,"cloud_pairing_session_unavailable"),
+        };
     }
 
     let Some(snapshot) = mobile_pairing_session_snapshot(&session_id).await else {
@@ -7908,7 +9346,7 @@ async fn handle_api_mobile_pairing_session(
     .into_response()
 }
 
-/// GET /api/mobile/pairing/status — read-only pairing diagnostics (no token generation)
+/// GET /api/android/pairing/status — read-only pairing diagnostics (no token generation)
 async fn handle_api_mobile_pairing_status(
     State(state): State<BridgeHttpState>,
     headers: HeaderMap,
@@ -7947,6 +9385,15 @@ async fn handle_api_mobile_pairing_status(
         }
     }
     let redact_public_anonymous = public_request && auth_principal.is_none();
+
+    if crate::tunnel::commands::configured_formal_mobile_route().is_some_and(|r|r.transport=="cloud_hub") {
+        let route=crate::tunnel::commands::get_formal_mobile_route_status().await;
+        let base=route.base_url.clone().unwrap_or_default();
+        return Json(serde_json::json!({"ok":true,"transport_mode":"cloud_hub","base_url":base,
+            "ws_url":format!("{}/ws",base.replacen("https://","wss://",1)),"candidates":[{"transport_mode":"cloud_hub","base_url":base,
+            "ws_url":format!("{}/ws",base.replacen("https://","wss://",1)),"health":route.health}],"formal_route":route,
+            "capabilities":{"quick_tunnel_test":false},"warning":"新设备配对由阿里云中心管理；已有设备权限保持不变。"})).into_response();
+    }
 
     let result = build_pairing_candidates_bounded(state.port, "status").await;
     if redact_public_anonymous {
@@ -9886,7 +11333,7 @@ async fn handle_api_config_post(
                 patch_app_config(&config, &body).map(|new_config| (config.clone(), new_config))
             });
 
-            let Some((previous_config, new_config)) = config_pair else {
+            let Some((mut previous_config, new_config)) = config_pair else {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "invalid_config_patch"})),
@@ -9894,17 +11341,23 @@ async fn handle_api_config_post(
                     .into_response();
             };
 
-            if let Err(error) = crate::config::storage::save_standalone_config(&new_config) {
-                log::warn!("[Bridge] 保存配置失败: {}", error);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("保存失败: {}", error)})),
-                )
-                    .into_response();
-            }
+            let saved_config = match crate::config::storage::save_config_changes(&new_config) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    log::warn!("[Bridge] 保存配置失败: {}", error);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("保存失败: {}", error)})),
+                    )
+                        .into_response();
+                }
+            };
 
+            // Roll back only the fields this patch changed, and reject rollback
+            // if another writer has since changed those same fields.
+            previous_config.save_baseline = serde_json::to_value(&new_config).ok();
             match app_state.config.lock() {
-                Ok(mut config) => *config = new_config,
+                Ok(mut config) => *config = saved_config,
                 Err(_) => {
                     let _ = crate::config::storage::save_standalone_config(&previous_config);
                     return json_error_response(
@@ -13201,9 +14654,40 @@ fn persist_live_goal_progress_from_apns_update(request: &ApnsLiveActivityUpdateR
     }
 }
 
-async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) {
+fn preserve_registered_early_state(mut payload: serde_json::Value, previous: &serde_json::Value) -> serde_json::Value {
+    let same_request = extract_request_id_from_mcp_state(previous)
+        == extract_request_id_from_mcp_state(&payload)
+        && extract_project_path_from_mcp_state(previous)
+            == extract_project_path_from_mcp_state(&payload);
+    if !same_request {
+        return payload;
+    }
+    if previous.get("earlyNotification").and_then(|v| v.as_bool()) != Some(true) {
+        return previous.clone();
+    }
+    if previous.pointer("/request/codex_thread_provenance").and_then(|v| v.as_str()) == Some("caller_meta")
+        && payload.pointer("/request/codex_thread_provenance").and_then(|v| v.as_str()) != Some("caller_meta")
+        && previous.pointer("/request/codex_thread_id") == payload.pointer("/request/codex_thread_id")
+    {
+        payload["request"]["codex_thread_provenance"] = serde_json::json!("caller_meta");
+    }
+    payload
+}
+
+async fn cache_early_mcp_state(mut payload: serde_json::Value, source: &str) {
+    if reserved_native_state(&payload){return;}
+    stamp_local_mobile_computer_source(&mut payload);
     let request_id = extract_request_id_from_mcp_state(&payload);
     let project_path = extract_project_path_from_mcp_state(&payload);
+
+    let closed_routes = CLOSED_MCP_STATE_ROUTES.read().await;
+    if request_id.as_ref().is_some_and(|request_id| {
+        closed_routes.get(request_id).is_some_and(|(_, closed_at)| {
+            chrono::Utc::now().timestamp().saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS
+        })
+    }) {
+        return;
+    }
 
     record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
 
@@ -13216,6 +14700,12 @@ async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) {
         MCP_STATE_CACHE_TTL_SECS,
         MCP_STATE_CACHE_MAX_ENTRIES,
     );
+
+    // A later notification for the same request must not replace the full
+    // registered state, or erase a caller-backed thread identity.
+    if let Some(previous) = request_id.as_ref().and_then(|id| cache.get(id)) {
+        payload = preserve_registered_early_state(payload, previous);
+    }
 
     let mut cache_keys = Vec::<String>::new();
     if let Some(rid) = &request_id {
@@ -13233,6 +14723,8 @@ async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) {
 
     let mut active_registry = ACTIVE_SESSION_REGISTRY.write().await;
     update_active_session_registry(&mut active_registry, &payload);
+    drop(active_registry);
+    drop(closed_routes);
 
     bridge_debug_log(&format!(
         "[Bridge Timing] early mcp_state cached: request_id={:?}, project_path={:?}, cache_keys={}, source={}",
@@ -13272,6 +14764,9 @@ async fn handle_apns_notify(
 
     let request_id = request.request_id.clone();
     let project_path = request.project_path.clone();
+    let registered_caller_thread = request_id.as_deref()
+        .zip(project_path.as_deref())
+        .and_then(|(id, project)| crate::cross_device::registered_caller_thread(id, project));
     if request_id_is_stale_for_bridge_project_binding(
         request_id.as_deref(),
         project_path.as_deref(),
@@ -13301,6 +14796,14 @@ async fn handle_apns_notify(
                 "is_markdown": request.is_markdown,
                 "project_path": project_path,
                 "codex_thread_id": request.codex_thread_id,
+                "codex_thread_provenance": if registered_caller_thread.as_deref()
+                    == request.codex_thread_id.as_deref()
+                    && registered_caller_thread.is_some()
+                    && request.codex_thread_provenance.as_deref() == Some("caller_meta") {
+                    Some("caller_meta")
+                } else {
+                    None
+                },
                 "codex_deeplink": request.codex_deeplink,
                 "loop_active": request.loop_active,
                 "force_popup": request.force_popup,
@@ -13327,6 +14830,9 @@ async fn handle_bridge_publish(
     State(state): State<BridgeHttpState>,
     Json(mut message): Json<BridgeMessage>,
 ) -> Response {
+    if reserved_mobile_mirror_state(&message) {
+        return json_error_response(StatusCode::BAD_REQUEST, "mirror_state_owned_by_bridge");
+    }
     if let Err(response) = authorize_public_route_scope(
         &headers,
         SCOPE_BRIDGE_PUBLISH,
@@ -13337,6 +14843,7 @@ async fn handle_bridge_publish(
         return response;
     }
 
+    if reserved_native_state(&message.payload){return (StatusCode::BAD_REQUEST,"native_state_owned_by_bridge").into_response();}
     let tx = state.tx.clone();
     let publish_received_at = std::time::Instant::now();
     let publish_request_id = if message.message_type == "mcp_state" {
@@ -13356,6 +14863,33 @@ async fn handle_bridge_publish(
         publish_project_path,
         tx.receiver_count()
     ));
+
+    if message.message_type == "mcp_state" && is_explicit_closed_mcp_state(&message.payload) {
+        let (request_id, project_path) = match closed_mcp_state_route(&message.payload) {
+            Ok(route) => route,
+            Err(reason) => return json_error_response(StatusCode::BAD_REQUEST, reason),
+        };
+        let (removed_cache_keys, removed_active) = match cleanup_closed_mcp_state_route(&request_id, &project_path).await {
+            Ok(result) => result,
+            Err(reason) => return json_error_response(StatusCode::CONFLICT, reason),
+        };
+        record_last_completed_route(Some(&request_id), Some(&project_path), "mcp-state-closed").await;
+        clear_active_desktop_popup_route(Some(&request_id), Some(&project_path), "mcp-state-closed").await;
+        bridge_debug_log(&format!(
+            "[Bridge] closed mcp_state: request_id={}, project_path={}, removed_cache_keys={}, removed_active={}",
+            request_id, project_path, removed_cache_keys, removed_active
+        ));
+        let _ = tx.send(message);
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if message.message_type == "mcp_state" {
+        if let Some(request_id) = publish_request_id.as_deref() {
+            if closed_mcp_state_project_for_request(request_id).await.is_some() {
+                return stale_request_response();
+            }
+        }
+    }
 
     if message.message_type == "mcp_state"
         && request_id_is_stale_for_bridge_project_binding(
@@ -13466,6 +15000,44 @@ async fn handle_bridge_publish(
     }
 
     if message.message_type == "mcp_state" {
+        // A bridge-only owner has no GUI ConversationManager. Record the actual
+        // structured MCP prompt in the same persistent tree used by its replies.
+        if state.app_handle.is_none() {
+            let request_id = extract_request_id_from_mcp_state(&message.payload);
+            let route_id = extract_timeline_route_id_from_mcp_state(&message.payload)
+                .or_else(|| request_id.clone());
+            let project_path = extract_project_path_from_mcp_state(&message.payload);
+            let content = message.payload.pointer("/request/message").and_then(|v| v.as_str())
+                .map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+            if let (Some(route), Some(project), Some(content)) = (route_id, project_path, content) {
+                let manager = ConversationManager::new_with_forced_persistence();
+                let tree = manager.get_or_create_tree_for_route(Some(&route), Some(&project)).await;
+                let metadata = NodeMetadata {
+                    conversation_id: Some(tree.clone()),
+                    project_path: Some(project.clone()),
+                    request_id: Some(route.clone()),
+                    source: Some("bridge_headless_mcp_prompt".to_string()),
+                    ..NodeMetadata::default()
+                };
+                if let Ok(outcome) = manager.ensure_assistant_request_node(&tree, content, true, metadata).await {
+                    if !outcome.reused {
+                        super::mcp_action_recording::broadcast_latest_timeline_node(
+                            &manager, request_id.as_deref(), Some(&route), &project,
+                            "bridge_headless_mcp_prompt",
+                        ).await;
+                    }
+                    if let Some(snapshot) = TimelineSyncService::build_snapshot_message(
+                        None, Some(&route), Some(&project),
+                    ).await {
+                        if let Some(object) = message.payload.as_object_mut() {
+                            object.insert("timelineNodes".to_string(), snapshot.payload["timelineNodes"].clone());
+                            object.insert("timeline_route_id".to_string(), serde_json::json!(route));
+                            object.insert("conversation_id".to_string(), snapshot.payload["conversation_id"].clone());
+                        }
+                    }
+                }
+            }
+        }
         // 服务端注入 timelineNodes：从 ConversationManager 查找当前对话路径
         let has_frontend_timeline = message
             .payload
@@ -13656,6 +15228,7 @@ async fn handle_bridge_publish(
             }
         }
 
+        stamp_local_mobile_computer_source(&mut message.payload);
         ensure_custom_prompts_in_mcp_state(state.app_handle.as_ref(), &mut message.payload);
         ensure_ghost_suggestions_in_mcp_state(&mut message.payload);
         let project_path_for_live_goal = extract_project_path_from_mcp_state(&message.payload);
@@ -13677,6 +15250,14 @@ async fn handle_bridge_publish(
 
         let request_id = extract_request_id_from_mcp_state(&message.payload);
         let project_path = extract_project_path_from_mcp_state(&message.payload);
+        let closed_routes = CLOSED_MCP_STATE_ROUTES.read().await;
+        if request_id.as_ref().is_some_and(|request_id| {
+            closed_routes.get(request_id).is_some_and(|(_, closed_at)| {
+                chrono::Utc::now().timestamp().saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS
+            })
+        }) {
+            return stale_request_response();
+        }
         record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
         let mut cache = MCP_STATE_CACHE.write().await;
         let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
@@ -13704,6 +15285,8 @@ async fn handle_bridge_publish(
 
         let mut active_registry = ACTIVE_SESSION_REGISTRY.write().await;
         update_active_session_registry(&mut active_registry, &message.payload);
+        drop(active_registry);
+        drop(closed_routes);
     }
     let web_push_message = if message.message_type == "mcp_state"
         && !bridge_payload_suppresses_remote_notification(&message.payload)
@@ -14211,8 +15794,25 @@ fn image_content_type_for_path(file_path: &std::path::Path) -> &'static str {
 
 #[tauri::command]
 pub async fn send_to_web_bridge(message: BridgeMessage) -> Result<(), String> {
+    if reserved_mobile_mirror_state(&message) { return Err("mirror_state_owned_by_bridge".into()); }
+    if reserved_native_state(&message.payload){return Err("native_state_owned_by_bridge".into());}
     // 只通过 HTTP POST 转发到 Bridge Server（避免重复推送）
     // handle_bridge_publish 会负责缓存写入和广播到所有 WebSocket 客户端
+    if message.message_type == "mcp_state" && is_explicit_closed_mcp_state(&message.payload) {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|error| format!("创建 Bridge HTTP 客户端失败: {}", error))?;
+        let url = "http://127.0.0.1:8080/bridge/publish";
+        let request = client
+            .post(url)
+            .json(&message)
+            .timeout(std::time::Duration::from_secs(2));
+        let request = crate::bridge::auth::authorize_internal_bridge_request(request, "POST", url)?;
+        request.send().await.map_err(|error| error.to_string())?
+            .error_for_status().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
             .no_proxy() // 绕过代理
@@ -14318,6 +15918,7 @@ mod tests {
         mobile_pairing_primary_selection_reason, normalize_file_browser_roots,
         normalize_mcp_action_images, normalize_paired_device_store, parse_first_ipv4_line,
         parse_first_tailscale_ipv4_from_ifconfig, parse_rfc3339, phone_action_delivery_client_ids,
+        preserve_registered_early_state,
         phone_action_job_payload_from_message, phone_action_job_payload_size,
         phone_action_result_entry_from_message, phone_action_target_device_id,
         principal_has_any_scope, prune_active_session_registry, prune_json_cache,
@@ -14382,6 +15983,25 @@ mod tests {
 
     static PUBLIC_PROBE_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
         Lazy::new(|| tokio::sync::Mutex::new(()));
+
+    #[test]
+    fn early_notification_cannot_downgrade_full_or_misbind_thread() {
+        let full = serde_json::json!({"request":{"id":"serve-1","project_path":"P",
+            "codex_thread_id":"thread-1","codex_thread_provenance":"caller_meta"},
+            "showMcpPopup":true,"timelineNodes":[{"id":"existing"}]});
+        let late = serde_json::json!({"request":{"id":"serve-1","project_path":"P",
+            "codex_thread_id":"thread-1"},"earlyNotification":true});
+        assert_eq!(preserve_registered_early_state(late.clone(), &full), full);
+        let early = serde_json::json!({"request":{"id":"serve-1","project_path":"P",
+            "codex_thread_id":"thread-1","codex_thread_provenance":"caller_meta"},
+            "earlyNotification":true});
+        let kept = preserve_registered_early_state(late.clone(), &early);
+        assert_eq!(kept["request"]["codex_thread_provenance"], "caller_meta");
+        let different_thread = serde_json::json!({"request":{"id":"serve-1",
+            "project_path":"P","codex_thread_id":"thread-2"},"earlyNotification":true});
+        assert!(preserve_registered_early_state(different_thread, &early)
+            .pointer("/request/codex_thread_provenance").is_none());
+    }
 
     #[test]
     fn desktop_codex_live_bridge_restart_gets_a_new_epoch() {
@@ -15444,6 +17064,18 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_timeline_rejects_native_nodes_and_normalized_native_routes() {
+        let mut native = timeline_node("native", Some("tree-native"), Some("native-cli:launch:thread"), Some("C:/same"));
+        native.metadata.source = Some("codex_native".into());
+        assert!(TimelineSyncService::is_native_route(Some(" native-cli:launch:thread ")));
+        assert!(super::reserved_native_state(&serde_json::json!({"request_id":" native-cli:launch:thread "})));
+        assert!(TimelineSyncService::build_delta_message(Some("ordinary"), Some("C:/same"), &native).is_none());
+        assert!(TimelineSyncService::strip_and_filter_nodes(&[native], "tree-native", Some("native-cli:launch:thread"), Some("C:/same")).is_empty());
+        let injected = serde_json::json!({"id":"native","metadata":{"source":"codex_native","request_id":" native-cli:launch:thread ","project_path":"C:/same"}});
+        assert!(TimelineSyncService::sanitize_timeline_values(&[injected], Some("ordinary"), Some("C:/same"), None).is_empty());
+    }
+
+    #[test]
     fn timeline_sync_filters_manager_nodes_for_requested_route() {
         let nodes = vec![
             timeline_node("match", Some("tree-1"), Some("req-1"), Some("/tmp/project")),
@@ -15772,6 +17404,19 @@ mod tests {
             "created_at": chrono::Utc::now().timestamp()
         });
         std::fs::write(&route_file, format!("{route}\n")).unwrap();
+        std::fs::write(&response_file, "previous response").unwrap();
+        let consumed = try_write_serve_response_file(
+            Some(&request_id),
+            "/tmp/project-a",
+            "{\"ok\":true}",
+            MCP_ACTION_CACHE_TTL_SECS,
+            &debug_log,
+        );
+        assert!(!consumed.delivered);
+        assert_eq!(consumed.reason.as_deref(), Some("response_file_already_exists"));
+        assert_eq!(std::fs::read_to_string(&response_file).unwrap(), "previous response");
+        assert!(route_file.exists());
+        std::fs::remove_file(&response_file).unwrap();
         let delivered = try_write_serve_response_file(
             Some(&request_id),
             "/tmp/project-a",
@@ -15866,7 +17511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_submit_preflight_cleans_expired_serve_response_route() {
+    async fn room_submit_preflight_rejects_expired_route_without_deleting_it() {
         let _guard = ROOM_SUBMIT_TEST_LOCK.lock().await;
         clear_room_submit_outcome_cache_for_tests();
 
@@ -15950,7 +17595,7 @@ mod tests {
             outcome.delivery_attempts[0].reason.as_deref(),
             Some("response_route_expired")
         );
-        assert!(!route_file.exists());
+        assert!(route_file.exists());
 
         let _ = std::fs::remove_file(&route_file);
         let _ = std::fs::remove_file(&response_file);
@@ -16254,9 +17899,10 @@ mod tests {
         assert!(is_public_control_path("/api/phone-action"));
         assert!(is_public_control_path("/api/phone-action-result"));
         assert!(is_public_control_path("/api/phone-action-jobs/job-1"));
-        assert!(is_public_control_path("/api/mobile/pairing"));
-        assert!(is_public_control_path("/api/mobile/pairing/claim"));
-        assert!(is_public_control_path("/api/mobile/pairing/status"));
+        assert!(is_public_control_path("/api/android/pairing"));
+        assert!(is_public_control_path("/api/android/pairing/claim"));
+        assert!(is_public_control_path("/api/android/pairing/status"));
+        assert!(!is_public_control_path("/api/mobile/pairing"));
         assert!(is_public_control_path(
             "/api/mobile/paired-device-file-roots"
         ));
@@ -16859,16 +18505,16 @@ mod tests {
         ));
         assert!(!public_anonymous_path_allowed(
             &axum::http::Method::GET,
-            "/api/mobile/pairing/status"
+            "/api/android/pairing/status"
         ));
         assert!(public_anonymous_path_allowed(
             &axum::http::Method::POST,
-            "/api/mobile/pairing/claim"
+            "/api/android/pairing/claim"
         ));
 
         assert!(!public_anonymous_path_allowed(
             &axum::http::Method::GET,
-            "/api/mobile/pairing"
+            "/api/android/pairing"
         ));
         assert!(!public_anonymous_path_allowed(
             &axum::http::Method::GET,
@@ -17683,107 +19329,55 @@ mod tests {
     }
 
     #[test]
-    fn paired_ios_scope_set_allows_ghost_suggestion_writeback() {
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_CONFIG_READ));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_CONFIG_WRITE));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_PROMPT_LIBRARY_READ));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_PROMPT_LIBRARY_WRITE));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_GHOST_SUGGESTIONS_READ));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_PHONE_ACTION_JOB_READ));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_TUNNEL_RECOVER));
-        assert!(!mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_SERVICE_RECOVER));
-        assert!(!mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_GHOST_SUGGESTIONS_WRITE));
-        assert!(mobile_device_scopes(true)
-            .iter()
-            .any(|scope| scope == SCOPE_GHOST_SUGGESTIONS_WRITE));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_NOTIFICATION_SUBSCRIBE));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_SPEECH_MEMORY_READ));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_SPEECH_MEMORY_WRITE));
-        assert!(!mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_NOTIFICATION_SEND));
-        assert!(!mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_BRIDGE_PUBLISH));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_PAIRING_ISSUE));
-        assert!(mobile_device_scopes(false)
-            .iter()
-            .any(|scope| scope == SCOPE_FILE_LIST));
+    fn android_pairing_scopes_are_exactly_the_approved_four() {
+        let expected = vec![
+            SCOPE_STATUS_READ.to_string(),
+            SCOPE_SESSION_READ.to_string(),
+            SCOPE_SESSION_RESPOND.to_string(),
+            SCOPE_WINDOW_SHOW.to_string(),
+        ];
+        assert_eq!(mobile_device_scopes(false), expected);
+        assert_eq!(mobile_device_scopes(true), expected);
     }
 
     #[test]
-    fn legacy_ios_paired_devices_receive_current_mobile_scopes() {
+    fn previously_broad_android_scopes_are_narrowed_on_store_load() {
+        let mut device = PairedDeviceRecord {
+            device_id: "android-1".to_string(),
+            device_name: "Android".to_string(),
+            client_kind: "android".to_string(),
+            token_hash: "sha256:test".to_string(),
+            scopes: vec![SCOPE_CONFIG_WRITE.to_string(), SCOPE_SESSION_READ.to_string()],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            file_browser_roots: Vec::new(),
+            revoked_at: None,
+        };
+        assert!(super::normalize_mobile_device_scopes(&mut device));
+        assert_eq!(device.scopes, mobile_device_scopes(false));
+        assert!(!device.scopes.contains(&SCOPE_CONFIG_WRITE.to_string()));
+    }
+
+    #[test]
+    fn legacy_ios_record_is_revoked_and_retained_for_audit() {
         let mut store = PairedDeviceStore {
             devices: vec![PairedDeviceRecord {
                 device_id: "legacy-ios".to_string(),
                 device_name: "iPhone".to_string(),
                 client_kind: "ios".to_string(),
                 token_hash: "sha256:test".to_string(),
-                scopes: vec![
-                    SCOPE_STATUS_READ.to_string(),
-                    SCOPE_SESSION_READ.to_string(),
-                    SCOPE_SESSION_RESPOND.to_string(),
-                    SCOPE_WINDOW_SHOW.to_string(),
-                    SCOPE_GHOST_SUGGESTIONS_WRITE.to_string(),
-                    "speech_text.refine".to_string(),
-                ],
+                scopes: vec![SCOPE_SESSION_READ.to_string()],
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 last_seen_at: "2026-01-01T00:00:00Z".to_string(),
                 file_browser_roots: Vec::new(),
                 revoked_at: None,
             }],
         };
-
         assert!(normalize_paired_device_store(&mut store));
-
-        let scopes = &store.devices[0].scopes;
-        assert!(scopes.iter().any(|scope| scope == SCOPE_CONFIG_READ));
-        assert!(scopes.iter().any(|scope| scope == SCOPE_CONFIG_WRITE));
-        assert!(scopes
-            .iter()
-            .any(|scope| scope == SCOPE_PROMPT_LIBRARY_READ));
-        assert!(scopes
-            .iter()
-            .any(|scope| scope == SCOPE_PROMPT_LIBRARY_WRITE));
-        assert!(scopes
-            .iter()
-            .any(|scope| scope == SCOPE_GHOST_SUGGESTIONS_READ));
-        assert!(scopes
-            .iter()
-            .any(|scope| scope == SCOPE_PHONE_ACTION_JOB_READ));
-        assert!(scopes.iter().any(|scope| scope == SCOPE_TUNNEL_RECOVER));
-        assert!(scopes.iter().any(|scope| scope == SCOPE_FILE_LIST));
-        assert!(!scopes.iter().any(|scope| scope == SCOPE_SERVICE_RECOVER));
-        assert!(scopes
-            .iter()
-            .any(|scope| scope == SCOPE_GHOST_SUGGESTIONS_WRITE));
-        assert!(scopes.iter().any(|scope| scope == "speech_text.refine"));
+        assert_eq!(store.devices.len(), 1);
+        assert!(store.devices[0].revoked_at.is_some());
+        assert_eq!(store.devices[0].scopes, vec![SCOPE_SESSION_READ.to_string()]);
+        assert!(!normalize_paired_device_store(&mut store));
     }
 
     #[test]
@@ -17817,6 +19411,10 @@ mod tests {
             .expect("prompts array");
         assert_eq!(prompts.len(), 2);
         assert_eq!(prompts[1]["type"], "conditional");
+
+        let latest = serde_json::json!({"enabled": true, "prompts": [{"id": "new"}]});
+        ensure_custom_prompts_value_in_mcp_state(&mut payload, latest.clone());
+        assert_eq!(payload["customPrompts"], latest);
     }
 
     #[test]
@@ -18437,6 +20035,14 @@ mod tests {
     #[tokio::test]
     async fn sensitive_http_handlers_reject_anonymous_public_requests() {
         let state = test_bridge_state();
+        let pairing_response = handle_api_mobile_pairing(
+            State(state.clone()),
+            axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 44321))),
+            public_headers(),
+            None,
+        )
+        .await;
+        assert_eq!(pairing_response.status(), StatusCode::FORBIDDEN);
         let responses = vec![
             handle_api_config_get(State(state.clone()), public_headers()).await,
             handle_api_config_post(
@@ -18471,7 +20077,6 @@ mod tests {
             )
             .await,
             handle_api_ghost_suggestions_get(public_headers()).await,
-            handle_api_mobile_pairing(State(state.clone()), public_headers()).await,
             handle_api_cleanup_session(
                 public_headers(),
                 Json(serde_json::json!({ "request_id": "test-request" })),
@@ -18536,6 +20141,7 @@ mod tests {
                     predefined_options: vec![],
                     is_markdown: true,
                     codex_thread_id: None,
+                    codex_thread_provenance: None,
                     codex_deeplink: None,
                     loop_active: true,
                     force_popup: false,
@@ -20139,8 +21745,10 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
         let directory = tempfile::tempdir().expect("temporary paired-device directory");
         let path = directory.path().join("paired-devices.json");
         let token = "durable-device-token";
+        let mut record = paired_device_record_for_test("android", token);
+        record.client_kind = "android".to_string();
         let store = PairedDeviceStore {
-            devices: vec![paired_device_record_for_test("iphone", token)],
+            devices: vec![record],
         };
 
         super::save_paired_device_store_at(&path, &store).expect("initial paired-device save");
@@ -20155,7 +21763,7 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
                 .expect("recover paired-device backup");
         assert_eq!(
             principal.expect("paired-device principal").device_id,
-            "iphone"
+            "android"
         );
         assert!(!persisted, "30-second auth should not rewrite last_seen_at");
         assert!(!revoked);
@@ -20211,5 +21819,292 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
         .expect("read unknown paired device");
         assert!(principal.is_none());
         assert!(!revoked);
+    }
+
+    #[test]
+    fn android_initial_sync_routes_keep_distinct_live_requests_in_newest_order() {
+        let window = |request_id: Option<&str>, project_path: &str, registered_at: &str| {
+            crate::ui::window_registry::WindowInstance {
+                pid: 123,
+                project_path: project_path.to_string(),
+                window_title: "test".to_string(),
+                registered_at: registered_at.to_string(),
+                port: None,
+                request_id: request_id.map(ToOwned::to_owned),
+                request_title: None,
+            }
+        };
+        let routes = super::android_initial_sync_routes(vec![
+            window(Some("request-old"), "C:/same", "2026-09-26T01:00:00Z"),
+            window(Some("request-new"), "C:/same", "2026-09-26T02:00:00Z"),
+            window(Some("request-new"), "C:/same", "2026-09-26T02:00:00Z"),
+            window(None, "C:/idle", "2026-09-26T03:00:00Z"),
+        ]);
+        assert_eq!(routes, vec![
+            ("request-new".to_string(), "C:/same".to_string()),
+            ("request-old".to_string(), "C:/same".to_string()),
+        ]);
+        let payload = serde_json::json!({
+            "request": {"id": "request-old", "project_path": "C:/same", "message": "answer me"},
+            "showMcpPopup": true,
+        });
+        assert!(super::mcp_state_matches_exact_route(&payload, "request-old", "C:/same"));
+        assert!(!super::mcp_state_matches_exact_route(&payload, "request-new", "C:/same"));
+        assert!(!super::mcp_state_matches_exact_route(&payload, "request-old", "C:/other"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn android_initial_sync_windows_separator_identity_preserves_request_and_closed_guards() {
+        let request_id = "serve-1790913331998-e8e52f66-620c-4589-a59f-4bc6fd6820f3";
+        let project = "E:/Github/iterate-desktop";
+        let registered_project = r"E:\Github\iterate-desktop";
+        let registry_path = std::env::temp_dir().join("iterate_windows.json");
+        let prior = std::fs::read(&registry_path).ok();
+        let window = crate::ui::window_registry::WindowInstance {
+            pid: std::process::id(), project_path: registered_project.to_string(),
+            window_title: "separator regression".to_string(),
+            registered_at: chrono::Utc::now().to_rfc3339(), port: None,
+            request_id: Some(request_id.to_string()), request_title: None,
+        };
+        std::fs::write(&registry_path, serde_json::to_vec(&serde_json::json!({"instances":[window]})).unwrap()).unwrap();
+        let payload = build_payload(request_id, project, "Windows pending request");
+        let entry = ActiveSessionEntry {
+            request_id: request_id.to_string(), project_path: project.to_string(),
+            project_name: "iterate-desktop".to_string(), title: "separator regression".to_string(),
+            payload: payload.clone(), last_active_at: chrono::Utc::now().to_rfc3339(),
+        };
+        for source in ["cache", "registry"] {
+            if source == "cache" {
+                MCP_STATE_CACHE.write().await.insert(request_id.to_string(), payload.clone());
+            } else {
+                ACTIVE_SESSION_REGISTRY.write().await.insert(request_id.to_string(), entry.clone());
+            }
+            let states = super::android_initial_sync_states().await;
+            let state = states.iter().find(|state| state["request"]["id"] == request_id).unwrap();
+            assert_eq!(state["request"], payload["request"], "{source}");
+            super::CLOSED_MCP_STATE_ROUTES.write().await.insert(
+                request_id.to_string(), (registered_project.to_string(), chrono::Utc::now().timestamp()),
+            );
+            assert!(!super::android_initial_sync_states().await.iter().any(|state| state["request"]["id"] == request_id));
+            super::CLOSED_MCP_STATE_ROUTES.write().await.remove(request_id);
+            MCP_STATE_CACHE.write().await.remove(request_id);
+            ACTIVE_SESSION_REGISTRY.write().await.remove(request_id);
+        }
+        for mut invalid in [
+            build_payload("other-request", project, "wrong ID"),
+            build_payload(request_id, "E:/Github/other", "wrong directory"),
+            serde_json::json!({"request":null,"showMcpPopup":false,"request_id":request_id,"project_path":project}),
+        ] {
+            assert!(super::prepare_android_initial_sync_state(invalid.clone(), request_id, registered_project).is_none());
+            invalid["cache_source"] = serde_json::json!("bad-cache");
+            MCP_STATE_CACHE.write().await.insert(request_id.to_string(), invalid.clone());
+            assert!(super::android_initial_sync_states().await.is_empty());
+            MCP_STATE_CACHE.write().await.remove(request_id);
+            let mut invalid_entry = entry.clone();
+            invalid_entry.payload = invalid;
+            ACTIVE_SESSION_REGISTRY.write().await.insert(request_id.to_string(), invalid_entry);
+            assert!(super::android_initial_sync_states().await.is_empty());
+            ACTIVE_SESSION_REGISTRY.write().await.remove(request_id);
+        }
+        let mut wrong_entry = entry;
+        wrong_entry.project_path = "E:/Github/other".to_string();
+        ACTIVE_SESSION_REGISTRY.write().await.insert(request_id.to_string(), wrong_entry);
+        assert!(super::android_initial_sync_states().await.is_empty());
+        ACTIVE_SESSION_REGISTRY.write().await.remove(request_id);
+        // The broader action/close path comparisons retain their existing semantics.
+        assert!(!super::mcp_state_matches_exact_route(&payload, request_id, registered_project));
+        match prior {
+            Some(bytes) => std::fs::write(registry_path, bytes).unwrap(),
+            None => std::fs::remove_file(registry_path).unwrap(),
+        }
+    }
+
+    #[test]
+    fn cloud_pairing_keeps_local_authority_and_replays_only_identical_grants() {
+        use super::*;
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("paired.json");
+        let mut old=paired_device_record_for_test("android","old");old.client_kind="android".into();old.file_browser_roots=vec!["C:\\Allowed".into()];
+        mutate_paired_device_store_at(&path,|s|{s.devices.push(old.clone());((),true)}).unwrap();
+        let intent=serde_json::json!({"source_id":"win","devices":[old],"default_scopes":mobile_device_scopes(false)});
+        let result=serde_json::json!({"session":{"device_name":"Phone"},"credential":{"device_id":"android","client_kind":"android","windows_source":"win","token_hash":bridge_token_hash("new"),"scopes":old.scopes,"file_browser_roots":old.file_browser_roots,"mirror_sources":[],"revoked_at":null}});
+        let mut expanded=result.clone();expanded["credential"]["file_browser_roots"]=serde_json::json!(["C:\\Other"]);
+        assert!(apply_hub_pairing_at(&path,&intent,&expanded).is_err());
+        mutate_paired_device_store_at(&path,|s|{s.devices[0].file_browser_roots.clear();((),true)}).unwrap();
+        assert_eq!(apply_hub_pairing_at(&path,&intent,&result).unwrap_err(),"hub_pairing_local_authority_changed");
+        mutate_paired_device_store_at(&path,|s|{s.devices[0]=old.clone();((),true)}).unwrap();
+        apply_hub_pairing_at(&path,&intent,&result).unwrap();
+        apply_hub_pairing_at(&path,&intent,&result).unwrap();
+        let persisted=load_paired_device_store_at(&path).unwrap();
+        assert_eq!(persisted.devices[0].token_hash,bridge_token_hash("new"));
+        assert_eq!(persisted.devices[0].file_browser_roots,old.file_browser_roots);
+        mutate_paired_device_store_at(&path,|s|{s.devices[0].revoked_at=Some("later".into());((),true)}).unwrap();
+        assert!(apply_hub_pairing_at(&path,&intent,&result).is_err());
+        let mut ios_intent=intent.clone();ios_intent["devices"][0]["client_kind"]=serde_json::json!("ios");
+        assert_eq!(apply_hub_pairing_at(&path,&ios_intent,&result).unwrap_err(),"device_id_retired_ios");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn android_initial_sync_recovers_ready_registration_without_cache_or_response_route() {
+        let request_id = "serve-1790916412343-6186ba51-bf52-4ca9-9c5c-b3835cca2e34";
+        let key = "25ee12a1-7d76-47de-b597-d561d8c04337";
+        let project = "E:/Github/iterate-desktop";
+        let registered_project = r"E:\Github\iterate-desktop";
+        let root = tempfile::tempdir().unwrap();
+        let previous_dir = std::env::var_os("ITERATE_CROSS_DEVICE_DIR");
+        std::env::set_var("ITERATE_CROSS_DEVICE_DIR",root.path());
+        let temp = std::env::temp_dir();
+        let registry_file = temp.join("iterate_windows.json");
+        let prior_registry = std::fs::read(&registry_file).ok();
+        let request_file = temp.join(format!("iterate_request_{request_id}.json"));
+        let response_file = temp.join(format!("iterate_response_{request_id}.json"));
+        let ready_file = temp.join(format!("iterate_ready_{request_id}.json"));
+        let request = serde_json::json!({"id":request_id,"project_path":project,"message":"原始 Win 文字",
+            "predefined_options":["手机仍看不到本条"],"is_markdown":true});
+        let window = crate::ui::window_registry::WindowInstance {pid:std::process::id(),
+            project_path:registered_project.into(),window_title:"registration regression".into(),
+            registered_at:"2026-10-02T04:46:56.658229200Z".into(),port:None,request_id:Some(request_id.into()),request_title:None};
+        std::fs::write(&registry_file,serde_json::to_vec(&serde_json::json!({"instances":[window]})).unwrap()).unwrap();
+        std::fs::create_dir_all(root.path().join("deferred-requests")).unwrap();
+        std::fs::create_dir_all(root.path().join("leases")).unwrap();
+        std::fs::write(&request_file,serde_json::to_vec(&request).unwrap()).unwrap();
+        std::fs::write(&ready_file,serde_json::to_vec(&serde_json::json!({"request_id":request_id,
+            "project_path":registered_project,"ready_at":"2026-10-02T04:46:56.472Z"})).unwrap()).unwrap();
+        std::fs::write(root.path().join("leases").join(key),b"active").unwrap();
+        std::fs::write(root.path().join("deferred-requests").join(format!("{key}.json")),serde_json::to_vec(&serde_json::json!({
+            "key":key,"origin_device_id":"local-win","origin_name":"Win","request":request,
+            "request_file":request_file,"response_file":response_file,"published":false})).unwrap()).unwrap();
+        assert!(!MCP_STATE_CACHE.read().await.contains_key(request_id));
+        assert!(!ACTIVE_SESSION_REGISTRY.read().await.contains_key(request_id));
+        assert!(!temp.join(format!("iterate_response_route_{request_id}.json")).exists());
+        let states = super::android_initial_sync_states().await;
+        assert_eq!(states.len(),1);
+        assert_eq!(states[0]["request"],request);
+        assert_eq!(states[0]["cache_source"],"registered_local_source");
+        super::CLOSED_MCP_STATE_ROUTES.write().await.insert(request_id.into(),(project.into(),chrono::Utc::now().timestamp()));
+        assert!(super::android_initial_sync_states().await.is_empty());
+        super::CLOSED_MCP_STATE_ROUTES.write().await.remove(request_id);
+        std::fs::remove_file(&ready_file).unwrap();
+        assert!(super::android_initial_sync_states().await.is_empty());
+        assert!(!temp.join(format!("iterate_response_route_{request_id}.json")).exists());
+        assert!(!response_file.exists());
+        assert!(!root.path().join("results").exists());
+        std::fs::remove_file(request_file).unwrap();
+        match prior_registry {Some(bytes)=>std::fs::write(registry_file,bytes).unwrap(),None=>std::fs::remove_file(registry_file).unwrap()}
+        match previous_dir {Some(value)=>std::env::set_var("ITERATE_CROSS_DEVICE_DIR",value),None=>std::env::remove_var("ITERATE_CROSS_DEVICE_DIR")}
+    }
+
+    #[tokio::test]
+    async fn closed_mcp_state_clears_only_exact_route_before_broadcast() {
+        let project_dir = std::env::temp_dir().join(format!("iterate-closed-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.to_string_lossy().to_string();
+        let request_a = format!("close-a-{}", uuid::Uuid::new_v4());
+        let request_b = format!("close-b-{}", uuid::Uuid::new_v4());
+        let state = test_bridge_state();
+        let mut receiver = state.tx.subscribe();
+
+        for request_id in [&request_a, &request_b] {
+            let response = handle_bridge_publish(
+                HeaderMap::new(), State(state.clone()), Json(BridgeMessage {
+                    message_type: "mcp_state".to_string(),
+                    payload: build_payload(request_id, &project, "waiting"),
+                }),
+            ).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(receiver.try_recv().unwrap().message_type, "mcp_state");
+        }
+
+        let close = |request_id: Option<&str>, path: &str| BridgeMessage {
+            message_type: "mcp_state".to_string(),
+            payload: serde_json::json!({
+                "request": null,
+                "showMcpPopup": false,
+                "request_id": request_id,
+                "project_path": path,
+            }),
+        };
+        let wrong_project = format!("{project}-wrong");
+        let rejected = handle_bridge_publish(
+            HeaderMap::new(), State(state.clone()), Json(close(Some(&request_a), &wrong_project)),
+        ).await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(receiver.try_recv().is_err());
+        let missing_id = handle_bridge_publish(
+            HeaderMap::new(), State(state.clone()), Json(close(None, &project)),
+        ).await;
+        assert_eq!(missing_id.status(), StatusCode::BAD_REQUEST);
+        assert!(receiver.try_recv().is_err());
+        assert!(MCP_STATE_CACHE.read().await.contains_key(&request_a));
+
+        let response = handle_bridge_publish(
+            HeaderMap::new(), State(state.clone()), Json(close(Some(&request_a), &project)),
+        ).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(receiver.try_recv().unwrap().payload["request_id"], request_a);
+        assert_eq!(super::closed_mcp_state_project_for_request(&request_a).await.as_deref(), Some(project.as_str()));
+        let late_state = handle_bridge_publish(
+            HeaderMap::new(), State(state.clone()), Json(BridgeMessage {
+                message_type: "mcp_state".to_string(),
+                payload: build_payload(&request_a, &project, "late state"),
+            }),
+        ).await;
+        assert_eq!(late_state.status(), StatusCode::BAD_REQUEST);
+        assert!(receiver.try_recv().is_err());
+        let repeated = handle_bridge_publish(
+            HeaderMap::new(), State(state.clone()), Json(close(Some(&request_a), &project)),
+        ).await;
+        assert_eq!(repeated.status(), StatusCode::NO_CONTENT);
+        assert_eq!(receiver.try_recv().unwrap().payload["request_id"], request_a);
+        let wrong_replay = handle_bridge_publish(
+            HeaderMap::new(), State(state.clone()), Json(close(Some(&request_a), &wrong_project)),
+        ).await;
+        assert_eq!(wrong_replay.status(), StatusCode::CONFLICT);
+        assert!(receiver.try_recv().is_err());
+        let cache = MCP_STATE_CACHE.read().await;
+        assert!(!cache.contains_key(&request_a));
+        assert!(cache.contains_key(&request_b));
+        assert_eq!(extract_request_id_from_mcp_state(cache.get(&project).unwrap()).as_deref(), Some(request_b.as_str()));
+        drop(cache);
+        let registry = ACTIVE_SESSION_REGISTRY.read().await;
+        assert!(!registry.contains_key(&request_a));
+        assert!(registry.contains_key(&request_b));
+        drop(registry);
+
+        let response = handle_bridge_publish(
+            HeaderMap::new(), State(state), Json(close(Some(&request_b), &project)),
+        ).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!MCP_STATE_CACHE.read().await.contains_key(&project));
+        assert!(!ACTIVE_SESSION_REGISTRY.read().await.contains_key(&request_b));
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn active_ios_credential_is_revoked_on_access_and_audit_record_survives() {
+        let directory = tempfile::tempdir().expect("temporary paired-device directory");
+        let path = directory.path().join("paired-devices.json");
+        let token = "historical-ios-token";
+        super::save_paired_device_store_at(
+            &path,
+            &PairedDeviceStore {
+                devices: vec![paired_device_record_for_test("old-iphone", token)],
+            },
+        )
+        .expect("save historical iOS device");
+        let (principal, _, revoked) = super::authenticate_paired_device_at(
+            &path,
+            token,
+            Some("old-iphone"),
+            chrono::Utc::now(),
+        )
+        .expect("retire historical iOS device");
+        assert!(principal.is_none());
+        assert!(revoked);
+        let store = super::load_paired_device_store_at(&path).expect("load audit record");
+        assert_eq!(store.devices.len(), 1);
+        assert_eq!(store.devices[0].device_id, "old-iphone");
+        assert!(store.devices[0].revoked_at.is_some());
     }
 }

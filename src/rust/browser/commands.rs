@@ -110,6 +110,7 @@ pub async fn start_browser_monitoring(
                                 project_path: None,
                                 codex_home: None,
                                 codex_thread_id: None,
+                                codex_thread_provenance: None,
                                 codex_deeplink: None,
                                 checkpoint_id: None,
                                 checkpoint_commit: None,
