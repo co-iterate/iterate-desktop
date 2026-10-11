@@ -11,7 +11,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -25,13 +24,12 @@ fn instance_debug_log(tag: &str, message: impl AsRef<str>) {
         tag,
         message.as_ref()
     );
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/iterate-instance-debug.log")
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
+    // 多个进程共用这份日志，原来无上限（P-2026-9337）。
+    let _ = crate::utils::logger::append_capped_log_line(
+        std::path::Path::new("/tmp/iterate-instance-debug.log"),
+        line.as_bytes(),
+        crate::utils::logger::DEBUG_LOG_MAX_BYTES,
+    );
 }
 
 const DEFAULT_LOCAL_BRIDGE_BASE_URL: &str = "http://127.0.0.1:8080";
@@ -146,6 +144,10 @@ fn serve_response_route_file(request_id: &str) -> PathBuf {
     ))
 }
 
+const LIVE_SERVE_ROUTE_RENEW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs((crate::server::SERVE_RESPONSE_ROUTE_TTL_SECS / 6) as u64);
+const LIVE_SERVE_ROUTE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn register_serve_response_route(
     request_id: &str,
     request: &DialogRequest,
@@ -159,10 +161,7 @@ fn register_serve_response_route(
         "created_at": chrono::Utc::now().timestamp(),
     });
 
-    match std::fs::write(
-        &route_file,
-        serde_json::to_string(&payload).unwrap_or_default(),
-    ) {
+    match crate::server::write_serve_response_route_atomically(&route_file, &payload) {
         Ok(()) => instance_debug_log(
             "[serve-response-route-registered]",
             format!(
@@ -186,7 +185,7 @@ fn register_serve_response_route(
     route_file
 }
 
-fn notify_bridge_apns_on_popup_ready(request_id: String, request: &DialogRequest) {
+fn notify_bridge_registered_request(request_id: String, request: &DialogRequest, source: &str) {
     let payload = serde_json::json!({
         "title": "iterate",
         "body": request.message.clone(),
@@ -202,7 +201,7 @@ fn notify_bridge_apns_on_popup_ready(request_id: String, request: &DialogRequest
         "codex_deeplink": request.codex_deeplink,
         "loop_active": request.loop_active,
         "force_popup": request.force_popup,
-        "source": "desktop_popup_ready",
+        "source": source,
     });
 
     tokio::spawn(async move {
@@ -301,6 +300,77 @@ fn notify_bridge_apns_on_popup_ready(request_id: String, request: &DialogRequest
             ),
         );
     });
+}
+
+fn initial_popup_dialog_from_request(
+    mut request: serde_json::Value,
+) -> Result<(String, DialogRequest), String> {
+    let request_id = request
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .ok_or("missing popup request id")?
+        .to_string();
+    let project = request
+        .get("project_path")
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.trim().is_empty())
+        .ok_or("missing popup project path")?
+        .to_string();
+    request["workspace"] = serde_json::json!(project);
+    request["options"] = request
+        .get("predefined_options")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let dialog: DialogRequest = serde_json::from_value(request).map_err(|e| e.to_string())?;
+    if dialog.message.trim().is_empty() {
+        return Err("empty popup message".to_string());
+    }
+    Ok((request_id, dialog))
+}
+
+/// Older resident serve processes can keep running after a local app update.
+/// Bootstrap from the new child before any WebView work when its parent lacks the new path.
+pub(crate) fn register_initial_popup_transport() -> Result<(), String> {
+    if std::env::var("ITERATE_PARENT_PUBLISHES_REQUEST").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    // Plain --ui/--mcp-request dialogs need not have a headless reply route.
+    // Only bootstrap a still-pending request that the resident server can answer.
+    let Some(response_file) = std::env::var_os("ITERATE_RESPONSE_FILE") else {
+        return Ok(());
+    };
+    if Path::new(&response_file).exists() {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os("ITERATE_MCP_REQUEST_FILE") else {
+        return Ok(());
+    };
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("popup request exceeds transport limit".to_string());
+    }
+    let request = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let (request_id, dialog) = initial_popup_dialog_from_request(request)?;
+    if !serve_response_route_file(&request_id).is_file() {
+        return Ok(());
+    }
+    crate::ui::window_registry::WindowRegistry::register_spawned_popup(
+        std::process::id(),
+        &dialog.workspace,
+        &request_id,
+        &dialog.message,
+    )?;
+    instance_debug_log(
+        "[popup-native-registered]",
+        format!("request_id={}", request_id),
+    );
+    notify_bridge_registered_request(request_id, &dialog, "desktop_request_registered");
+    Ok(())
 }
 
 async fn wait_child_exit_with_timeout(
@@ -709,6 +779,11 @@ pub fn handle_cli_args() -> Result<()> {
     }
 
     let (flags, options) = parse_args();
+
+    if flags.contains(&"--desktop-build-info".to_string()) {
+        println!("{}", crate::app::desktop_health::build_info());
+        return Ok(());
+    }
 
     // 检查是否是 --ui 模式（兼容旧版 --ui）
     if flags.contains(&"--ui".to_string()) {
@@ -1244,13 +1319,50 @@ fn handle_serve_mode(port: u16, workspace: Option<String>) -> Result<()> {
         println!("Use: python3 cunzhi.py {} --message \"Your message\"", port);
 
         // 处理请求队列
+        // 非首选端口的 serve 空闲太久就自行退出，避免同项目 busy 时开出的实例常驻（P-2026-9340）。
+        let idle_exit_after = serve_idle_exit_after(port);
+        let mut last_activity = tokio::time::Instant::now();
+        let mut unregistered_at: Option<tokio::time::Instant> = None;
         loop {
+            let idle_deadline = match (idle_exit_after, unregistered_at) {
+                (_, Some(at)) => at + SERVE_IDLE_EXIT_GRACE,
+                (Some(after), None) => last_activity + after,
+                (None, None) => last_activity + std::time::Duration::from_secs(365 * 24 * 3600),
+            };
             tokio::select! {
                 Some(mut request) = request_rx.recv() => {
+                    if unregistered_at.take().is_some() {
+                        // 退出宽限期内来了请求（mcp-server 刚选中这个端口），恢复注册继续服务。
+                        let _ = crate::server::register_port(port, workspace.as_deref());
+                        instance_debug_log(
+                            "[serve-idle-exit-cancelled]",
+                            format!("port={}, workspace={:?}", port, workspace),
+                        );
+                    }
                     if let Some(response_tx) = request.response_tx.take() {
                         // 启动 GUI 处理这个请求
                         let response = handle_dialog_request(&request).await;
                         let _ = response_tx.send(response);
+                    }
+                    last_activity = tokio::time::Instant::now();
+                }
+                _ = tokio::time::sleep_until(idle_deadline), if idle_exit_after.is_some() => {
+                    if unregistered_at.is_some() {
+                        instance_debug_log(
+                            "[serve-idle-exit]",
+                            format!("port={}, workspace={:?}", port, workspace),
+                        );
+                        break;
+                    }
+                    if crate::server::unregister_port_if_allocation_idle(port) {
+                        unregistered_at = Some(tokio::time::Instant::now());
+                        instance_debug_log(
+                            "[serve-idle-exit-unregistered]",
+                            format!("port={}, workspace={:?}", port, workspace),
+                        );
+                    } else {
+                        // 有进程正在分配端口，下一轮再试。
+                        last_activity = tokio::time::Instant::now();
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -1297,6 +1409,34 @@ fn handle_bridge_only_mode(port: u16) -> Result<()> {
     rt.block_on(async move { crate::bridge::start_bridge_daemon(port).await })
         .map_err(|err| anyhow::anyhow!("{}", err))?;
     Ok(())
+}
+
+const SERVE_PREFERRED_PORT: u16 = 5311;
+const SERVE_IDLE_EXIT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const SERVE_IDLE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 首选端口常驻；其它端口默认空闲 30 分钟退出。`CUNZHI_SERVE_IDLE_EXIT_SECS=0` 关闭。
+fn serve_idle_exit_after(port: u16) -> Option<std::time::Duration> {
+    if port == SERVE_PREFERRED_PORT {
+        return None;
+    }
+    match std::env::var("CUNZHI_SERVE_IDLE_EXIT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => Some(SERVE_IDLE_EXIT_DEFAULT),
+    }
+}
+
+const RESPONSE_FILE_PARSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 响应文件已完整写入（能解析成 JSON）。
+fn response_file_parses(path: &std::path::Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .is_some_and(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).is_ok())
 }
 
 fn clean_dialog_dismissal_response(
@@ -1406,6 +1546,7 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
         ),
     );
     let child = std::process::Command::new(&exe_path)
+        .env("ITERATE_PARENT_PUBLISHES_REQUEST", "1")
         .env(
             "ITERATE_MCP_REQUEST_FILE",
             request_file.to_string_lossy().to_string(),
@@ -1421,7 +1562,9 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
         .env("ITERATE_STANDALONE_MODE", "1")
         .env("RUST_LOG", "off") // 禁用子进程日志
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        // 继承 serve 的 stderr（mcp-server 已把它接到 serve-<port>.log），
+        // GUI 崩溃或 panic 时留下证据（P-2026-9339）。
+        .stderr(std::process::Stdio::inherit())
         .spawn();
 
     match child {
@@ -1435,6 +1578,33 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                     child.id()
                 ),
             );
+            let registered_early =
+                match crate::ui::window_registry::WindowRegistry::register_spawned_popup(
+                    child.id(),
+                    &request.workspace,
+                    &request_id,
+                    &request.message,
+                ) {
+                    Ok(()) => {
+                        instance_debug_log(
+                            "[serve-request-native-registered]",
+                            format!("request_id={}, child_pid={}", request_id, child.id()),
+                        );
+                        notify_bridge_registered_request(
+                            request_id.clone(),
+                            request,
+                            "desktop_request_registered",
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        instance_debug_log(
+                            "[serve-request-native-register-failed]",
+                            format!("request_id={}, error={}", request_id, error),
+                        );
+                        false
+                    }
+                };
             let ready_timeout = dialog_gui_ready_timeout();
             let startup_deadline = std::time::Instant::now() + ready_timeout;
             let mut wait_result = None;
@@ -1455,7 +1625,13 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                     );
                     if ready_file_exists && !response_file_exists {
                         emit_interaction_phase(request, InteractionPhase::WaitingUser, &request_id);
-                        notify_bridge_apns_on_popup_ready(request_id.clone(), request);
+                        if !registered_early {
+                            notify_bridge_registered_request(
+                                request_id.clone(),
+                                request,
+                                "desktop_popup_ready",
+                            );
+                        }
                     } else if response_file_exists {
                         emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
                     }
@@ -1531,10 +1707,21 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                 }
             }
 
+            let mut next_route_renewal =
+                std::time::Instant::now() + LIVE_SERVE_ROUTE_RENEW_INTERVAL;
+            let mut response_file_first_seen: Option<std::time::Instant> = None;
             let wait_result = match wait_result {
                 Some(result) => result,
                 None => loop {
-                    if response_file.exists() {
+                    // 文件存在不代表写完：先确认内容能解析，最多再等一个宽限期，
+                    // 避免在 GUI 写到一半时把它杀掉（P-2026-9339）。
+                    let response_ready = response_file.exists() && {
+                        let first_seen =
+                            *response_file_first_seen.get_or_insert_with(std::time::Instant::now);
+                        response_file_parses(&response_file)
+                            || first_seen.elapsed() >= RESPONSE_FILE_PARSE_GRACE
+                    };
+                    if response_ready {
                         emit_interaction_phase(request, InteractionPhase::Responded, &request_id);
                         instance_debug_log(
                             "[serve-request-response-file-observed]",
@@ -1558,6 +1745,39 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                     match child.try_wait() {
                         Ok(Some(status)) => break Ok(status),
                         Ok(None) => {
+                            if std::time::Instant::now() >= next_route_renewal {
+                                let renewal = crate::server::renew_live_serve_response_route(
+                                    &request_id,
+                                    &request.workspace,
+                                );
+                                match renewal {
+                                    Ok(()) => {
+                                        next_route_renewal = std::time::Instant::now()
+                                            + LIVE_SERVE_ROUTE_RENEW_INTERVAL;
+                                        instance_debug_log(
+                                            "[serve-response-route-renewed]",
+                                            format!("request_id={}", request_id),
+                                        );
+                                    }
+                                    Err("response_route_missing") => {
+                                        register_serve_response_route(
+                                            &request_id,
+                                            request,
+                                            &response_file,
+                                        );
+                                        next_route_renewal = std::time::Instant::now()
+                                            + LIVE_SERVE_ROUTE_RETRY_INTERVAL;
+                                    }
+                                    Err(reason) => {
+                                        next_route_renewal = std::time::Instant::now()
+                                            + LIVE_SERVE_ROUTE_RETRY_INTERVAL;
+                                        instance_debug_log(
+                                            "[serve-response-route-renew-failed]",
+                                            format!("request_id={}, reason={}", request_id, reason),
+                                        );
+                                    }
+                                }
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         }
                         Err(err) => break Err(err),
@@ -2216,7 +2436,7 @@ fn print_help() {
         "  --port N            mobile bridge 端口（默认 8080）\n",
         "\n",
         "--cloudflare-auto-setup-smoke 模式（Tunnel + DNS，可选创建 Access allow-email policy）:\n",
-        "  --zone Z            Cloudflare zone，例如 tobooks.xin\n",
+        "  --zone Z            Cloudflare zone，例如 example.com\n",
         "  --subdomain S       要创建或验证的子域名，例如 iterate-test\n",
         "  --api-token-env ENV 从环境变量读取 Cloudflare API Token，不支持明文参数\n",
         "  --overwrite-dns B   是否覆盖冲突 DNS，默认 false\n",
@@ -2260,6 +2480,25 @@ fn write_stdout_lossy(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_delivery_legacy_child_preserves_the_initial_request_identity() {
+        let (id, dialog) = initial_popup_dialog_from_request(serde_json::json!({
+            "id": "serve-123", "project_path": "/tmp/native", "message": "hello",
+            "predefined_options": ["ok"], "is_markdown": true,
+            "codex_thread_id": "thread-a", "loop_active": true, "force_popup": true
+        }))
+        .unwrap();
+        assert_eq!(id, "serve-123");
+        assert_eq!(dialog.workspace, "/tmp/native");
+        assert_eq!(dialog.options, ["ok"]);
+        assert_eq!(dialog.codex_thread_id.as_deref(), Some("thread-a"));
+        assert!(dialog.loop_active && dialog.force_popup);
+        assert!(
+            initial_popup_dialog_from_request(serde_json::json!({"message": "missing route"}))
+                .is_err()
+        );
+    }
+
     use std::fs::File;
 
     #[test]
@@ -2270,6 +2509,19 @@ mod tests {
         assert!(!response.keep_going);
         assert_eq!(response.response_source, "popup_closed");
         assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn response_file_parses_only_complete_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iterate_response_test.json");
+        assert!(!response_file_parses(&path), "missing file");
+        std::fs::write(&path, "").unwrap();
+        assert!(!response_file_parses(&path), "empty file seen mid-write");
+        std::fs::write(&path, r#"{"user_input":"hal"#).unwrap();
+        assert!(!response_file_parses(&path), "half-written JSON");
+        std::fs::write(&path, r#"{"user_input":"hello"}"#).unwrap();
+        assert!(response_file_parses(&path));
     }
 
     #[test]
@@ -2374,13 +2626,15 @@ mod tests {
             user_input,
             "web_bridge_goal_submit",
             &[],
-            &["/Users/test/.cunzhi/images/image_123_0.jpg".to_string()],
+            &["/Users/example/.cunzhi/images/image_123_0.jpg".to_string()],
         );
 
         assert!(!enriched.contains("附件地址："));
         assert!(!enriched.contains("images[0]"));
         assert!(!enriched.contains("见 images 附件"));
-        assert!(enriched.contains("附加图片路径：\n- /Users/test/.cunzhi/images/image_123_0.jpg》"));
+        assert!(
+            enriched.contains("附加图片路径：\n- /Users/example/.cunzhi/images/image_123_0.jpg》")
+        );
         assert!(enriched.contains("》\n\n执行规则"));
     }
 
@@ -2392,13 +2646,15 @@ mod tests {
             user_input,
             "web_bridge_goal_submit",
             &["/tmp/spec.md".to_string()],
-            &["/Users/test/.cunzhi/images/image_123_0.jpg".to_string()],
+            &["/Users/example/.cunzhi/images/image_123_0.jpg".to_string()],
         );
 
         assert_eq!(enriched.matches("/tmp/spec.md").count(), 1);
         assert!(!enriched.contains("images[0]"));
         assert!(!enriched.contains("见 images 附件"));
-        assert!(enriched.contains("附加图片路径：\n- /Users/test/.cunzhi/images/image_123_0.jpg》"));
+        assert!(
+            enriched.contains("附加图片路径：\n- /Users/example/.cunzhi/images/image_123_0.jpg》")
+        );
     }
 
     #[test]
@@ -2432,7 +2688,7 @@ mod tests {
             user_input.clone(),
             "popup_submit",
             &[],
-            &["/Users/test/.cunzhi/images/image_123_0.jpg".to_string()],
+            &["/Users/example/.cunzhi/images/image_123_0.jpg".to_string()],
         );
 
         assert_eq!(enriched, user_input);

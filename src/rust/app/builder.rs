@@ -1,11 +1,6 @@
-use crate::app::commands::*;
-#[cfg(not(target_os = "windows"))]
-use crate::app::setup::setup_application;
-#[cfg(target_os = "windows")]
-use crate::app::setup::start_application_setup;
+use crate::app::{commands::*, setup::setup_application};
 use crate::config::AppState;
 use crate::conversation::ConversationManager;
-#[cfg(not(target_os = "windows"))]
 use crate::log_important;
 use crate::ui::AudioController;
 use std::collections::BTreeSet;
@@ -25,7 +20,8 @@ fn is_standalone_mcp_launch(args: &[String]) -> bool {
 
 fn should_show_main_window_on_launch(args: &[String]) -> bool {
     if is_standalone_mcp_launch(args) {
-        return true;
+        // The frontend must read the global mute preference before first presentation.
+        return false;
     }
 
     if args.iter().any(|arg| arg == "--show-main-window") {
@@ -93,7 +89,7 @@ fn prepare_macos_standalone_launch(_args: &[String]) {}
 
 pub fn check_frontend_assets() -> Result<(), String> {
     if tauri::is_dev() {
-        return Ok(());
+        return Err("development-mode binary cannot be installed as a desktop production app; use cargo tauri build".into());
     }
 
     let context = build_tauri_context();
@@ -571,9 +567,7 @@ fn forward_macos_native_text_drop(window: &tauri::Window<tauri::Wry>, event: &ta
 
 /// 构建Tauri应用
 pub fn build_tauri_app() -> Builder<tauri::Wry> {
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
@@ -583,6 +577,8 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
 
     builder
         .manage(AppState::default())
+        .manage(crate::ui::global_mute::GlobalMuteState::default())
+        .manage(crate::ui::popup_restore::PopupRestoreState::default())
         .manage(Arc::new(ConversationManager::new()))
         .manage(crate::ui::live_goal::LiveGoalTrayState::default())
         .manage(crate::ui::quota_snapshot::QuotaSnapshotState::default())
@@ -590,6 +586,12 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             should_stop: Arc::new(AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
+            crate::ui::global_mute::get_global_mute,
+            crate::ui::global_mute::set_global_mute,
+            crate::ui::global_mute::present_mcp_window,
+            crate::ui::global_mute::can_focus_popup_input,
+            crate::ui::popup_restore::set_popup_restore_enabled,
+            crate::ui::popup_restore::minimize_popup_window,
             // 基础应用命令
             crate::bridge::auth::get_bridge_desktop_token,
             get_app_info,
@@ -602,14 +604,11 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             set_auto_checkpoint_enabled,
             sync_window_state,
             reload_config,
-            crate::app::setup::get_startup_status,
-            crate::app::setup::retry_background_services,
             // 音频命令
             get_audio_notification_enabled,
             set_audio_notification_enabled,
             get_audio_url,
             set_audio_url,
-            import_custom_audio,
             play_notification_sound,
             test_audio_sound,
             stop_audio_sound,
@@ -642,6 +641,9 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             set_mcp_tool_enabled,
             get_mcp_tools_status,
             reset_mcp_tools_config,
+            crate::mcp::client_install::get_mcp_client_overview,
+            crate::mcp::client_install::connect_mcp_clients,
+            crate::mcp::client_install::disconnect_mcp_client,
             send_mcp_response,
             crate::conversation::commands::migrate_timeline_image_storage,
             get_cli_args,
@@ -721,6 +723,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_codex_thread,
             open_new_codex_chat_with_text,
             ack_mcp_request_ready,
+            crate::app::desktop_health::mark_desktop_ui_ready,
             build_mcp_send_response,
             build_mcp_continue_response,
             create_test_popup,
@@ -825,6 +828,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::tunnel::commands::get_quick_tunnel_status,
             crate::tunnel::commands::check_origin_health,
             crate::tunnel::commands::recover_bridge_origin,
+            crate::tunnel::managed::ensure_managed_mobile_route,
             crate::tunnel::commands::get_cloudflare_guided_config,
             crate::tunnel::commands::save_cloudflare_guided_config,
             crate::tunnel::commands::clear_cloudflare_guided_config,
@@ -844,17 +848,10 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
+            crate::ui::global_mute::start_global_mute_sync(app_handle.clone());
             crate::native_speech::set_app_handle(app_handle.clone());
             crate::ui::live_goal::start_live_goal_tray_timer(app_handle.clone());
             crate::ui::codex_goal_observer::start_codex_goal_observer(app_handle.clone());
-            #[cfg(target_os = "windows")]
-            {
-                crate::ui::setup_window_event_listeners(&app_handle);
-                crate::ui::window_events::start_window_registry_cleanup_task();
-                if let Err(error) = crate::ui::exit_handler::setup_exit_handlers(&app_handle) {
-                    log::warn!("设置退出处理器失败: {error}");
-                }
-            }
 
             #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main") {
@@ -873,10 +870,10 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
                 }
             }
 
-            #[cfg(not(target_os = "windows"))]
+            // 应用初始化
             tauri::async_runtime::block_on(async {
-                if let Err(error) = setup_application(&app_handle).await {
-                    log_important!(error, "应用初始化失败: {}", error);
+                if let Err(e) = setup_application(&app_handle).await {
+                    log_important!(error, "应用初始化失败: {}", e);
                 }
             });
 
@@ -887,13 +884,6 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // Windows 主窗口先显示，配置、Bridge、IPC 和浏览器监控在后台初始化，
-                // 避免双击后长时间没有任何反馈。
-                start_application_setup(app_handle);
             }
 
             Ok(())
@@ -924,6 +914,7 @@ pub fn run_tauri_app() {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
                 }

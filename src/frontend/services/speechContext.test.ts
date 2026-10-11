@@ -62,7 +62,7 @@ describe('speech context', () => {
 
   it('keeps reusable vocabulary while rejecting paths, secrets, ids, and duplicates', () => {
     assert.deepEqual(
-      extractSafeSpeechVocabularyTerms('Codex codex /Users/test/project auth_token 019f51bab1657453 迭代语音'),
+      extractSafeSpeechVocabularyTerms('Codex codex /Users/example/docs auth_token 019f51bab1657453 迭代语音'),
       ['Codex', '迭代语音'],
     )
   })

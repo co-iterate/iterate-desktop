@@ -1,7 +1,6 @@
+use crate::utils::logger::{append_capped_log_line, DEBUG_LOG_MAX_BYTES};
 use chrono::{Local, SecondsFormat};
 use serde_json::Value;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 
 fn timeline_debug_log_path() -> PathBuf {
@@ -23,14 +22,5 @@ pub fn append_timeline_debug_log(location: &str, key_params: Value) {
     let payload_text = serde_json::to_string(&key_params)
         .unwrap_or_else(|_| "{\"serialize_error\":true}".to_string());
     let line = format!("{} | {} | {}\n", timestamp, location, payload_text);
-    let file_path = timeline_debug_log_path();
-
-    if let Some(parent_dir) = file_path.parent() {
-        let _ = std::fs::create_dir_all(parent_dir);
-    }
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(file_path) {
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
-    }
+    let _ = append_capped_log_line(&timeline_debug_log_path(), line.as_bytes(), DEBUG_LOG_MAX_BYTES);
 }

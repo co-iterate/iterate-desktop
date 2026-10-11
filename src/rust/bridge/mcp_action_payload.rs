@@ -28,6 +28,33 @@ pub(super) fn normalize_mcp_action_images(payload: &serde_json::Value) -> Vec<se
     }
 }
 
+pub(super) fn normalize_mcp_action_file_paths(payload: &serde_json::Value) -> Vec<String> {
+    let Some(uploads_root) = dirs::home_dir()
+        .map(|home| home.join(".cunzhi").join("uploads"))
+        .and_then(|path| path.canonicalize().ok())
+    else {
+        return Vec::new();
+    };
+
+    normalize_mcp_action_file_paths_at(payload, &uploads_root)
+}
+
+fn normalize_mcp_action_file_paths_at(
+    payload: &serde_json::Value,
+    uploads_root: &std::path::Path,
+) -> Vec<String> {
+    payload
+        .get("file_paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|path| std::path::Path::new(path).canonicalize().ok())
+        .filter(|path| path.starts_with(uploads_root) && path.is_file())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
+}
+
 fn collapse_extra_blank_lines(text: &str) -> String {
     let mut lines = Vec::new();
     let mut blank_count = 0;
@@ -210,7 +237,7 @@ pub(super) fn build_goal_submit_prompt(goal: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_goal_submit_prompt;
+    use super::{normalize_mcp_action_file_paths_at, render_goal_submit_prompt};
 
     #[test]
     fn goal_prompt_uses_the_configured_template_and_always_injects_xi_preflight() {
@@ -221,5 +248,26 @@ mod tests {
         assert!(prompt.contains("必须执行 xi"));
         assert!(prompt.contains("禁止重复实现"));
         assert!(prompt.ends_with("1. 自定义执行规则"));
+    }
+
+    #[test]
+    fn file_paths_only_escape_from_the_controlled_upload_root() {
+        let root = tempfile::tempdir().unwrap();
+        let uploads = root.path().join("uploads");
+        let request_dir = uploads.join("request-test");
+        std::fs::create_dir_all(&request_dir).unwrap();
+        let inside = request_dir.join("inside.txt");
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&inside, b"inside").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let canonical_root = uploads.canonicalize().unwrap();
+        let payload = serde_json::json!({
+            "file_paths": [inside, outside]
+        });
+
+        let paths = normalize_mcp_action_file_paths_at(&payload, &canonical_root);
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("inside.txt"));
     }
 }

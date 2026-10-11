@@ -134,6 +134,10 @@ pub struct AiCompletionEvent {
     pub title: String,
     pub site_name: String,
     pub message_preview: String,
+    /// Chrome tab that produced the completion; used to route replies back to
+    /// the exact conversation instead of whichever tab is currently active.
+    #[serde(default)]
+    pub tab_id: Option<u32>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// 运行时间（秒）- AI Studio "Ran for Xs"
     #[serde(default)]
@@ -156,6 +160,7 @@ impl AiCompletionEvent {
             title: page_state.title.clone(),
             site_name: page_state.site_name.clone(),
             message_preview,
+            tab_id: None,
             timestamp: chrono::Utc::now(),
             run_time: None,
             think_time: None,

@@ -249,7 +249,10 @@ impl PtyExecTool {
                 request.command, reason
             );
 
-            return Ok(CallToolResult::error(vec![Content::text(error_message)]));
+            return Ok(CallToolResult {
+                content: vec![Content::text(error_message)],
+                is_error: Some(true),
+            });
         }
 
         // 获取 MCP client
@@ -276,7 +279,10 @@ impl PtyExecTool {
         }
 
         // 调用远程 MCP tool
-        let call_request = CallToolRequestParam::new("exec_pty_command").with_arguments(params);
+        let call_request = CallToolRequestParam {
+            name: "exec_pty_command".into(),
+            arguments: Some(params),
+        };
 
         let result = client.call_tool(call_request).await.map_err(|e| {
             log_important!(error, "[PtyExec] 调用远程工具失败: {}", e);
@@ -301,7 +307,10 @@ impl PtyExecTool {
         let mut params = serde_json::Map::new();
         params.insert("run_id".to_string(), serde_json::json!(request.run_id));
         params.insert("input".to_string(), serde_json::json!(request.input));
-        let call_request = CallToolRequestParam::new("write_to_pty").with_arguments(params);
+        let call_request = CallToolRequestParam {
+            name: "write_to_pty".into(),
+            arguments: Some(params),
+        };
         let result = client.call_tool(call_request).await.map_err(|e| {
             log_important!(error, "[PtyExec] write_to_pty 失败: {}", e);
             McpError::internal_error(format!("调用 write_to_pty 失败: {}", e), None)
@@ -317,7 +326,10 @@ impl PtyExecTool {
         let client = Self::get_or_create_client().await?;
         let mut params = serde_json::Map::new();
         params.insert("run_id".to_string(), serde_json::json!(request.run_id));
-        let call_request = CallToolRequestParam::new("cancel_pty_command").with_arguments(params);
+        let call_request = CallToolRequestParam {
+            name: "cancel_pty_command".into(),
+            arguments: Some(params),
+        };
         let result = client.call_tool(call_request).await.map_err(|e| {
             log_important!(error, "[PtyExec] cancel_pty 失败: {}", e);
             McpError::internal_error(format!("调用 cancel_pty_command 失败: {}", e), None)
@@ -329,8 +341,10 @@ impl PtyExecTool {
     pub async fn list_active_runs() -> Result<CallToolResult, McpError> {
         log_debug!("[PtyExec] 列出活跃会话");
         let client = Self::get_or_create_client().await?;
-        let call_request =
-            CallToolRequestParam::new("list_active_runs").with_arguments(serde_json::Map::new());
+        let call_request = CallToolRequestParam {
+            name: "list_active_runs".into(),
+            arguments: Some(serde_json::Map::new()),
+        };
         let result = client.call_tool(call_request).await.map_err(|e| {
             log_important!(error, "[PtyExec] list_active_runs 失败: {}", e);
             McpError::internal_error(format!("调用 list_active_runs 失败: {}", e), None)

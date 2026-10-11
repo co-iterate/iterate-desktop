@@ -32,7 +32,6 @@ interface Props {
   showMainLayout?: boolean
   alwaysOnTop?: boolean
   isMuted?: boolean
-  shortcutEnabled?: boolean
   projectPath?: string
   codexThreadId?: string
   linkUrl?: string
@@ -50,8 +49,6 @@ interface Emits {
   toggleMute: []
   newChat: []
   openIteratePairing: []
-  toggleShortcut: [enabled: boolean]
-  minimizeWindow: []
   toggleCodexLive: []
   toggleCodexLiveMute: []
 }
@@ -62,7 +59,6 @@ const props = withDefaults(defineProps<Props>(), {
   showMainLayout: false,
   alwaysOnTop: false,
   isMuted: false,
-  shortcutEnabled: true,
   projectPath: undefined,
   codexLivePhase: 'idle',
   codexLiveStatus: '启动全局 GPT-Live 主代理',
@@ -289,16 +285,6 @@ async function handleOpenTerminal() {
   }
 }
 
-function handleToggleShortcut() {
-  const nextEnabled = !props.shortcutEnabled
-  emit('toggleShortcut', nextEnabled)
-  message.success(nextEnabled ? '快捷键已启用' : '快捷键已禁用')
-  // 禁用时最小化窗口到 dock
-  if (!nextEnabled) {
-    emit('minimizeWindow')
-  }
-}
-
 const codexLiveActive = computed(() => ['preparing', 'connecting', 'active', 'reconnecting'].includes(props.codexLivePhase))
 const codexLiveTitle = computed(() => {
   const action = codexLiveActive.value ? '短按静音，长按 5 秒结束' : '长按 5 秒启动'
@@ -440,27 +426,12 @@ function handleCodexLiveClick() {
             <div class="i-carbon-qr-code w-4 h-4" style="color: #111827;" />
           </template>
         </n-button>
-        <n-button
-          size="small"
-          quaternary
-          circle
-          :title="props.shortcutEnabled ? '快捷键已启用 (点击禁用)' : '快捷键已禁用 (点击启用)'"
-          @click="handleToggleShortcut"
-        >
-          <template #icon>
-            <div
-              :class="props.shortcutEnabled ? 'i-carbon-flash-filled' : 'i-carbon-flash-off'"
-              class="w-4 h-4"
-              style="color: #111827;"
-            />
-          </template>
-        </n-button>
         <!-- 静音按钮 -->
         <n-button
           size="small"
           quaternary
           circle
-          :title="props.isMuted ? '通知已静音 (点击开启)' : '通知已开启 (点击静音)'"
+          :title="props.isMuted ? '静音已开启，窗口快捷键已停用（Esc 恢复）' : '通知与窗口快捷键已开启（Esc 静音）'"
           @click="handleToggleMute"
         >
           <template #icon>

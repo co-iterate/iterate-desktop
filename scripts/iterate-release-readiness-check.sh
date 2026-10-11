@@ -80,9 +80,7 @@ check_release_inputs() {
   require_file "docs/release/security-closure-2026-06-27.md" "security closure runbook"
   require_file "release-package/windows/Install iterate.bat" "Windows install helper"
   require_file "release-package/windows/Start iterate.bat" "Windows start helper"
-  require_file "docs/INSTALLATION.md" "installation guide"
-  require_file "docs/INSTALL_PROMPT.md" "installation assistant prompt"
-  require_file "docs/SYSTEM_PROMPT.md" "generic system prompt"
+  require_file "docs/iterate_安装指南.md" "installation guide"
 }
 
 check_release_public_key_embedding_contract() {

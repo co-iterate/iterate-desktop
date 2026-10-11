@@ -21,6 +21,7 @@ export interface McpRequest {
   link_url?: string
   link_title?: string
   browser_ai_response?: string
+  browser_tab_id?: number
 }
 
 export interface PopupArtifact {

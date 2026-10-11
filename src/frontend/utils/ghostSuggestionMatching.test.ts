@@ -6,6 +6,7 @@ import {
   getCommandSuggestionSuffix,
   getMatchingCommandSuggestions,
   hasVisibleCommandSuggestion,
+  MAX_RUNTIME_GHOST_SUGGESTIONS,
 } from './ghostSuggestionMatching.ts'
 
 const suggestions = [
@@ -111,6 +112,22 @@ describe('ghost suggestion matching', () => {
     assert.deepEqual(
       getMatchingCommandSuggestions(suggestions, 'ch').map(suggestion => suggestion.key),
       ['check', 'che', 'checkpoint'],
+    )
+  })
+
+  it('caps runtime matches while still finding a late exact match', () => {
+    const manySuggestions = Array.from({ length: 50 }, (_, index) => ({
+      key: `term${index}`,
+      description: '候选',
+    }))
+    manySuggestions.push({ key: 'term', description: '完整匹配' })
+
+    const matches = getMatchingCommandSuggestions(manySuggestions, 'term')
+    assert.equal(matches.length, MAX_RUNTIME_GHOST_SUGGESTIONS)
+    assert.equal(matches[0].key, 'term')
+    assert.deepEqual(
+      matches.slice(1, 4).map(suggestion => suggestion.key),
+      ['term0', 'term1', 'term2'],
     )
   })
 

@@ -99,6 +99,9 @@ jobs:
         shell: bash
         env:
           ITERATE_RELEASE_PUBLIC_KEY_B64: ${{ secrets.ITERATE_RELEASE_PUBLIC_KEY_B64 }}
+          # 托管服务地址不进源码，由仓库变量在编译期注入（src/rust/tunnel/managed.rs）
+          ITERATE_MANAGED_CONNECT_HOST: ${{ vars.ITERATE_MANAGED_CONNECT_HOST }}
+          ITERATE_MANAGED_DEVICE_DOMAIN: ${{ vars.ITERATE_MANAGED_DEVICE_DOMAIN }}
         run: |
           if [[ "${{ matrix.platform }}" == "macos-latest" ]]; then
             if [[ "${{ matrix.args }}" == *"aarch64"* ]]; then
@@ -271,6 +274,9 @@ jobs:
       - name: Build signed macOS delivery artifacts
         if: steps.macos_secrets.outputs.available == 'true'
         shell: bash
+        env:
+          ITERATE_MANAGED_CONNECT_HOST: ${{ vars.ITERATE_MANAGED_CONNECT_HOST }}
+          ITERATE_MANAGED_DEVICE_DOMAIN: ${{ vars.ITERATE_MANAGED_DEVICE_DOMAIN }}
         run: pnpm delivery:macos
 
       - name: Notarize macOS app bundle

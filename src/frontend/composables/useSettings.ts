@@ -15,7 +15,6 @@ const DEFAULT_LOOP_PROMPT = `进入 GoalRun 目标模式。
 5. 只有明显越界、破坏性操作、凭据/登录、Computer Use、提交/推送/发布，或发现需要沉淀的新问题时，才通过 zhi 询问。`
 
 function createSettings() {
-  const windowsPlatform = navigator.platform.toUpperCase().includes('WIN')
   const alwaysOnTop = ref(true) // 与后端默认值保持一致
   const audioNotificationEnabled = ref(true)
   const audioUrl = ref('')
@@ -29,7 +28,6 @@ function createSettings() {
   const windowWidth = ref(600)
   const windowHeight = ref(900)
   const fixedWindowSize = ref(false)
-  let lastSavedWindowSize = { width: 600, height: 900 }
 
   // 继续回复设置
   const continueReplyEnabled = ref(true)
@@ -102,7 +100,6 @@ function createSettings() {
           const settings = windowSettings as any
           windowWidth.value = settings.current_width || 600
           windowHeight.value = settings.current_height || 900
-          lastSavedWindowSize = { width: windowWidth.value, height: windowHeight.value }
           fixedWindowSize.value = settings.fixed || false
         }
       }
@@ -289,12 +286,6 @@ function createSettings() {
               console.log(`窗口尺寸已调整: ${width}x${height} -> ${adjustedWidth}x${adjustedHeight}`)
             }
 
-            if (windowsPlatform
-              && adjustedWidth === lastSavedWindowSize.width
-              && adjustedHeight === lastSavedWindowSize.height) {
-              return
-            }
-
             await invoke('set_window_settings', {
               windowSettings: {
                 free_width: adjustedWidth,
@@ -306,7 +297,6 @@ function createSettings() {
             // 更新本地状态
             windowWidth.value = adjustedWidth
             windowHeight.value = adjustedHeight
-            lastSavedWindowSize = { width: adjustedWidth, height: adjustedHeight }
 
             console.log(`窗口尺寸已保存: ${adjustedWidth}x${adjustedHeight}`)
           }
@@ -420,8 +410,6 @@ function createSettings() {
 
   // 窗口焦点监听器
   let windowFocusUnlisten: (() => void) | null = null
-  let focusReloadTimer: number | null = null
-  let lastFocusReloadAt = 0
 
   // 设置窗口焦点监听
   async function setupWindowFocusListener() {
@@ -431,22 +419,7 @@ function createSettings() {
       // 监听窗口获得焦点事件
       windowFocusUnlisten = await webview.onFocusChanged(({ payload: focused }) => {
         if (focused) {
-          if (!windowsPlatform) {
-            void reloadAllSettings()
-            return
-          }
-
-          if (focusReloadTimer !== null)
-            window.clearTimeout(focusReloadTimer)
-
-          focusReloadTimer = window.setTimeout(() => {
-            focusReloadTimer = null
-            const now = Date.now()
-            if (now - lastFocusReloadAt < 5000)
-              return
-            lastFocusReloadAt = now
-            void reloadAllSettings()
-          }, 750)
+          reloadAllSettings()
         }
       })
     }
@@ -460,10 +433,6 @@ function createSettings() {
     if (windowFocusUnlisten) {
       windowFocusUnlisten()
       windowFocusUnlisten = null
-    }
-    if (focusReloadTimer !== null) {
-      window.clearTimeout(focusReloadTimer)
-      focusReloadTimer = null
     }
   }
 

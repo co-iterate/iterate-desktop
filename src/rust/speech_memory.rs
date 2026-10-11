@@ -597,7 +597,7 @@ mod tests {
             normalize_vocabulary_term("迭代语音"),
             Some("迭代语音".to_string())
         );
-        assert_eq!(normalize_vocabulary_term("/Users/test/private"), None);
+        assert_eq!(normalize_vocabulary_term("/Users/example/docs"), None);
         assert_eq!(normalize_vocabulary_term("auth_token"), None);
         assert_eq!(normalize_vocabulary_term("019f51bab1657453"), None);
         assert_eq!(normalize_vocabulary_term("123456"), None);

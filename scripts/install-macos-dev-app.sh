@@ -12,6 +12,10 @@ SIGN_IDENTITY="${CUNZHI_MACOS_DEV_SIGN_IDENTITY:-}"
 ENTITLEMENTS_PATH="${CUNZHI_MACOS_ENTITLEMENTS_PATH:-${REPO_ROOT}/Entitlements.plist}"
 SIGN_TIMESTAMP="${CUNZHI_MACOS_CODESIGN_TIMESTAMP:-}"
 SOURCE_RECEIPT_TOOL="${REPO_ROOT}/scripts/macos-source-receipt.mjs"
+RECOVERY_TOOL="${REPO_ROOT}/scripts/macos-recovery.mjs"
+BACKUP_DIR="${CUNZHI_MACOS_BACKUP_DIR:-${HOME}/.cunzhi/backups/desktop-install-$(date +%Y%m%d%H%M%S)-$$}"
+INSTALL_CHANGED=0
+canonical_pid=""
 FN_OWNER_LOCK_SUFFIX="/speech/fn-owner.lock"
 
 DO_BUILD=1
@@ -48,6 +52,9 @@ Environment:
   CUNZHI_MACOS_SOURCE_APP          source app bundle override
   CUNZHI_MACOS_DEST_APP            destination app bundle override
   CUNZHI_MACOS_ALLOW_DIRTY_SOURCE  set to 1 only for an intentional dirty development receipt
+  CUNZHI_RELEASE_BRANCH            release mainline the source must contain (default: release/desktop)
+  CUNZHI_MACOS_ALLOW_LINEAGE_REGRESSION  set to 1 to install even if the source lacks the mainline
+                                   or the currently installed commit (P-2026-9347)
 EOF
 }
 
@@ -59,6 +66,25 @@ die() {
 info() {
   printf '==> %s\n' "$*"
 }
+
+restore_failed_install() {
+  local status=$?
+  trap - EXIT
+  if [[ "${status}" -ne 0 && "${INSTALL_CHANGED}" -eq 1 ]]; then
+    echo "Installation verification failed; restoring verified pre-install bundle" >&2
+    if [[ -n "${canonical_pid}" ]] && kill -0 "${canonical_pid}" 2>/dev/null; then
+      kill "${canonical_pid}" 2>/dev/null || true
+    fi
+    if node "${RECOVERY_TOOL}" restore --receipt "${BACKUP_DIR}/receipt.json" --app "${DEST_APP}"; then
+      restart_requested_background_processes || true
+      if [[ "${DO_OPEN}" -eq 1 ]]; then open -n "${DEST_APP}" || true; fi
+    else
+      echo "Automatic restore failed; verified backup retained at ${BACKUP_DIR}" >&2
+    fi
+  fi
+  exit "${status}"
+}
+trap restore_failed_install EXIT
 
 resolve_path() {
   local path="$1"
@@ -333,6 +359,7 @@ copy_app() {
     rm -rf "${staging_app}"
     die "failed to install staged app bundle"
   fi
+  INSTALL_CHANGED=1
 
   if [[ -n "${retired_app}" ]]; then
     if bundle_has_running_code "${retired_app}"; then
@@ -399,7 +426,9 @@ sign_app() {
   [[ -f "${ENTITLEMENTS_PATH}" ]] || die "missing macOS entitlements file: ${ENTITLEMENTS_PATH}"
 
   info "Signing installed app binaries with identity: ${identity}"
-  for binary_path in "${DEST_APP}/Contents/MacOS"/*; do
+  for binary_path in "${DEST_APP}/Contents/MacOS"/* \
+    "${DEST_APP}/Contents/Resources/managed-frpc" \
+    "${DEST_APP}/Contents/Resources/managed-proxy"; do
     [[ -f "${binary_path}" ]] || continue
     if [[ "$(basename "${binary_path}")" == "mcp-server" ]]; then
       codesign --force --options runtime "${timestamp_args[@]}" \
@@ -433,6 +462,7 @@ verify_app() {
   "${dest_bin}" --version >/dev/null
 
   info "Checking installed frontend assets"
+  node "${RECOVERY_TOOL}" production --app "${DEST_APP}"
   "${dest_bin}" --check-frontend-assets >/dev/null
 
   info "Verifying installed source receipt"
@@ -639,6 +669,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 if [[ "${DO_BUILD}" -eq 1 ]]; then
+  # shellcheck source=scripts/managed-build-env.sh
+  source "${REPO_ROOT}/scripts/managed-build-env.sh"
+  load_managed_build_env ${CUNZHI_REQUIRE_MANAGED:+--require} || die "managed service configuration invalid"
   info "Building desktop app"
   (cd "${REPO_ROOT}" && pnpm tauri:build)
 else
@@ -646,6 +679,14 @@ else
 fi
 
 write_or_verify_source_receipt
+info "Checking release lineage (mainline + installed commit)"
+bash "${REPO_ROOT}/scripts/check-release-lineage.sh" "${REPO_ROOT}" "${SOURCE_APP}" "${DEST_APP}"
+info "Verifying production mode before touching the installed app"
+node "${RECOVERY_TOOL}" production --app "${SOURCE_APP}"
+if [[ -d "${DEST_APP}" ]]; then
+  info "Creating and verifying the recovery bundle"
+  node "${RECOVERY_TOOL}" backup --app "${DEST_APP}" --out "${BACKUP_DIR}"
+fi
 stop_installed_app
 stop_conflicting_foreground_app_bundles
 copy_app
@@ -653,8 +694,11 @@ clear_copied_app_attributes
 sign_app
 verify_app
 restart_requested_background_processes
+info "Retiring idle serve processes still running the previous binary"
+bash "${REPO_ROOT}/scripts/retire-stale-serves.sh" "${DEST_APP}" || true
 
 if [[ "${DO_OPEN}" -eq 1 ]]; then
+  launch_since_ms="$(node -p 'Date.now()')"
   info "Opening installed app as a new canonical GUI instance"
   open -n "${DEST_APP}"
   if canonical_owner="$(wait_for_canonical_gui_owner)"; then
@@ -665,7 +709,12 @@ if [[ "${DO_OPEN}" -eq 1 ]]; then
     print_status
     die "installed app did not establish a canonical-gui Fn owner"
   fi
+  node "${RECOVERY_TOOL}" wait-ready --app "${DEST_APP}" --pid "${canonical_pid}" --since "${launch_since_ms}"
 fi
 
 print_status
-info "Done"
+if [[ "${DO_OPEN}" -eq 1 ]]; then
+  info "Installed and new production UI ready; human behavior acceptance remains separate"
+else
+  info "Installed; GUI readiness verification pending"
+fi

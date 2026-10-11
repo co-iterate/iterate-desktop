@@ -37,7 +37,7 @@ use loop_session::{
 };
 
 const HTML_ARTIFACT_CAPABILITY: &str = "html_artifact";
-const SERVE_RESPONSE_ROUTE_TTL_SECS: i64 = 30 * 60;
+pub(crate) const SERVE_RESPONSE_ROUTE_TTL_SECS: i64 = 30 * 60;
 
 fn instance_debug_log(tag: &str, message: impl AsRef<str>) {
     let line = format!(
@@ -558,6 +558,18 @@ fn serve_response_route_file(request_id: &str) -> PathBuf {
     ))
 }
 
+pub(crate) fn write_serve_response_route_atomically<T: Serialize>(
+    route_file: &Path,
+    payload: &T,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(payload).map_err(std::io::Error::other)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(std::env::temp_dir())?;
+    temporary.write_all(&body)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(route_file).map_err(|error| error.error)?;
+    Ok(())
+}
+
 fn normalize_path_for_compare(path: &str) -> String {
     let path = PathBuf::from(path);
     let path = if path.is_relative() {
@@ -713,12 +725,7 @@ fn renew_serve_response_route_file(
     route.renewed_by = Some("iterate-server".to_string());
     route.renewal_count = Some(renewal_count);
 
-    if fs::write(
-        &route_file,
-        format!("{}\n", serde_json::to_string(&route).unwrap_or_default()),
-    )
-    .is_err()
-    {
+    if write_serve_response_route_atomically(&route_file, &route).is_err() {
         return Err(RenewServeResponseRouteResponse {
             ok: false,
             status: "rejected",
@@ -749,6 +756,17 @@ fn renew_serve_response_route_file(
         original_created_at,
         renewal_count: Some(renewal_count),
     })
+}
+
+/// The `--serve` parent calls this only while its exact GUI child is still waiting.
+/// Reuse the same route validation as the authenticated room renewal endpoint.
+pub(crate) fn renew_live_serve_response_route(
+    request_id: &str,
+    expected_project: &str,
+) -> Result<(), &'static str> {
+    renew_serve_response_route_file(request_id, expected_project)
+        .map(|_| ())
+        .map_err(|response| response.reason.unwrap_or("response_route_renew_failed"))
 }
 
 async fn renew_serve_response_route(
@@ -1345,6 +1363,25 @@ pub fn register_port(port: u16, workspace: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 空闲退出前注销端口：持有 mcp-server 的分配锁（`.alloc.lock`，create_new 语义）时
+/// 删除端口文件，保证不会和正在进行的端口分配交错。拿不到锁返回 false（P-2026-9340）。
+pub fn unregister_port_if_allocation_idle(port: u16) -> bool {
+    let Some(port_dir) = dirs::home_dir().map(|home| home.join(".cunzhi_ports")) else {
+        return false;
+    };
+    let lock_path = port_dir.join(".alloc.lock");
+    let Ok(_lock) = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+    else {
+        return false;
+    };
+    unregister_port(port);
+    let _ = std::fs::remove_file(&lock_path);
+    true
+}
+
 /// 注销端口文件
 fn unregister_port(port: u16) {
     if let Some(home) = dirs::home_dir() {
@@ -1487,6 +1524,26 @@ mod tests {
 
         let _ = fs::remove_file(route_file);
         let _ = fs::remove_file(response_file);
+    }
+
+    #[test]
+    fn atomic_route_write_replaces_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("unrelated.json");
+        let route = directory.path().join("route.json");
+        fs::write(&target, b"unchanged").expect("create unrelated file");
+        symlink(&target, &route).expect("create route symlink");
+
+        write_serve_response_route_atomically(&route, &serde_json::json!({"request_id":"live"}))
+            .expect("replace symlink atomically");
+
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        assert!(fs::symlink_metadata(&route).unwrap().is_file());
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&route).unwrap()).unwrap();
+        assert_eq!(written["request_id"], "live");
     }
 
     #[test]

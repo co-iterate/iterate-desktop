@@ -13,6 +13,8 @@ use tauri::{AppHandle, Emitter};
 
 const PUBLIC_RELEASES_API_URL: &str =
     "https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest";
+const PUBLIC_RELEASES_LATEST_PAGE_URL: &str =
+    "https://github.com/kexin94yyds/iterate-releases/releases/latest";
 const TRUSTED_RELEASE_DOWNLOAD_HOST: &str = "github.com";
 const TRUSTED_RELEASE_DOWNLOAD_PATH_PREFIX: &str =
     "/kexin94yyds/iterate-releases/releases/download/";
@@ -101,23 +103,37 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
 
     log::info!("📊 GitHub API 响应状态: {}", response.status());
 
-    if !response.status().is_success() {
+    let release: serde_json::Value = if response.status().is_success() {
+        response.json().await.map_err(|e| {
+            log::error!("❌ 解析响应失败: {}", e);
+            format!("解析响应失败: {}", e)
+        })?
+    } else {
         let status = response.status();
-        let error_msg = if status == 403 {
-            "网络请求受限，请手动下载最新版本".to_string()
-        } else if status == 404 {
-            format!("发布源不可用: {}", release_api_url)
+        // 匿名 API 按出口 IP 限额（共享代理节点很容易用完），网页跳转不受此限制（P-2026-9358）
+        if status == 403 || status == 429 {
+            log::warn!("⚠️ GitHub API 受限 ({status})，改用发布页跳转获取最新版本");
+            match fetch_latest_release_via_redirect().await {
+                Ok(release) => release,
+                Err(fallback_error) => {
+                    let error_msg = format!(
+                        "网络请求受限，请手动下载最新版本: {} ({fallback_error})",
+                        PUBLIC_RELEASES_LATEST_PAGE_URL
+                    );
+                    log::error!("❌ {}", error_msg);
+                    return Err(error_msg);
+                }
+            }
         } else {
-            format!("网络请求失败: {}", status)
-        };
-        log::error!("❌ {}", error_msg);
-        return Err(error_msg);
-    }
-
-    let release: serde_json::Value = response.json().await.map_err(|e| {
-        log::error!("❌ 解析响应失败: {}", e);
-        format!("解析响应失败: {}", e)
-    })?;
+            let error_msg = if status == 404 {
+                format!("发布源不可用: {}", release_api_url)
+            } else {
+                format!("网络请求失败: {}", status)
+            };
+            log::error!("❌ {}", error_msg);
+            return Err(error_msg);
+        }
+    };
 
     log::info!("📋 成功获取 release 数据");
 
@@ -171,6 +187,75 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
 
 fn release_api_url() -> &'static str {
     PUBLIC_RELEASES_API_URL
+}
+
+/// CI 每个版本都会发布的稳定文件名（见 release.yml 的 stable aliases），各自带 .sha256 / .sig。
+const STABLE_RELEASE_ASSET_NAMES: &[&str] = &[
+    "iterate_aarch64.dmg",
+    "iterate-macos.zip",
+    "iterate-windows-x64.zip",
+];
+
+/// 不经 API：请求发布页的 latest 地址但不跟随跳转，从 Location 里取 tag。
+async fn fetch_latest_release_via_redirect() -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("创建请求失败: {e}"))?;
+    let response = client
+        .get(PUBLIC_RELEASES_LATEST_PAGE_URL)
+        .header("User-Agent", "cunzhi-app/1.0")
+        .send()
+        .await
+        .map_err(|e| format!("请求发布页失败: {e}"))?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| format!("发布页没有返回跳转地址 ({})", response.status()))?;
+    let tag = latest_tag_from_redirect_location(location)
+        .ok_or_else(|| format!("无法从跳转地址解析版本: {location}"))?;
+    log::info!("🏷️ 发布页跳转得到 tag: {}", tag);
+    Ok(synthetic_release_for_tag(&tag))
+}
+
+fn latest_tag_from_redirect_location(location: &str) -> Option<String> {
+    let path = location.split(['?', '#']).next()?;
+    let tag = path.rsplit_once("/releases/tag/")?.1.trim_end_matches('/');
+    let valid = !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    valid.then(|| tag.to_string())
+}
+
+/// 用稳定文件名拼出与 API 结构一致的 release，后续的资产选择、可信来源与签名校验保持不变。
+fn synthetic_release_for_tag(tag: &str) -> serde_json::Value {
+    let download_base = format!("https://github.com{TRUSTED_RELEASE_DOWNLOAD_PATH_PREFIX}{tag}");
+    let assets: Vec<serde_json::Value> = STABLE_RELEASE_ASSET_NAMES
+        .iter()
+        .flat_map(|name| {
+            [
+                name.to_string(),
+                format!("{name}.sha256"),
+                format!("{name}.sig"),
+            ]
+        })
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("{download_base}/{name}"),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "tag_name": tag,
+        "html_url": format!("https://github.com/kexin94yyds/iterate-releases/releases/tag/{tag}"),
+        "body": "GitHub API 暂时受限，未能获取更新说明，请在发布页查看。",
+        "assets": assets,
+    })
 }
 
 /// 简单的版本比较函数
@@ -1172,13 +1257,71 @@ fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_platform_download_asset, macos_update_signature_details_trusted, parse_sha256_checksum,
-        platform_download_asset_with_checksum, release_download_url_is_trusted, verify_file_sha256,
-        verify_update_signature_bytes, verify_update_signature_bytes_with_public_key_sources,
-        MacOsCodeSignatureDetails, ReleaseAsset, RELEASE_PUBLIC_KEY_ENV,
+        get_platform_download_asset, latest_tag_from_redirect_location,
+        macos_update_signature_details_trusted, parse_sha256_checksum,
+        platform_download_asset_with_checksum, release_download_url_is_trusted,
+        synthetic_release_for_tag, verify_file_sha256, verify_update_signature_bytes,
+        verify_update_signature_bytes_with_public_key_sources, MacOsCodeSignatureDetails,
+        ReleaseAsset, RELEASE_PUBLIC_KEY_ENV,
     };
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+
+    #[test]
+    fn latest_redirect_location_yields_tag() {
+        assert_eq!(
+            latest_tag_from_redirect_location(
+                "https://github.com/kexin94yyds/iterate-releases/releases/tag/v0.6.6"
+            )
+            .as_deref(),
+            Some("v0.6.6")
+        );
+        assert_eq!(
+            latest_tag_from_redirect_location(
+                "/kexin94yyds/iterate-releases/releases/tag/v1.2.3/?x=1#y"
+            )
+            .as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            latest_tag_from_redirect_location("https://github.com/login"),
+            None
+        );
+        assert_eq!(
+            latest_tag_from_redirect_location(
+                "https://github.com/kexin94yyds/iterate-releases/releases/tag/v1/../../evil"
+            ),
+            None
+        );
+        assert_eq!(
+            latest_tag_from_redirect_location(
+                "https://github.com/kexin94yyds/iterate-releases/releases/tag/"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn synthetic_release_selects_signed_trusted_platform_asset() {
+        let release = synthetic_release_for_tag("v0.6.6");
+        assert_eq!(release["tag_name"], "v0.6.6");
+        let asset = get_platform_download_asset(&release).expect("platform asset");
+        let prefix = "https://github.com/kexin94yyds/iterate-releases/releases/download/v0.6.6/";
+        assert!(
+            asset.download_url.starts_with(prefix),
+            "{}",
+            asset.download_url
+        );
+        assert!(release_download_url_is_trusted(&asset.download_url));
+        assert_eq!(asset.sha256_url, format!("{}.sha256", asset.download_url));
+        assert_eq!(asset.signature_url, format!("{}.sig", asset.download_url));
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(asset.name, "iterate_aarch64.dmg");
+        }
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert_eq!(asset.name, "iterate-windows-x64.zip");
+        }
+    }
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde_json::json;
     use std::sync::Mutex;

@@ -1,6 +1,56 @@
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
+/// A slow device/environment must not delay every device behind it.
+pub(super) async fn collect_apns_delivery_results<F>(
+    jobs: impl IntoIterator<Item = F>,
+) -> Vec<String>
+where
+    F: std::future::Future<Output = Option<String>>,
+{
+    use futures_util::StreamExt;
+    futures_util::stream::iter(jobs)
+        .buffer_unordered(4)
+        .filter_map(|result| async move { result })
+        .collect()
+        .await
+}
+
+#[cfg(test)]
+mod delivery_concurrency_tests {
+    use super::collect_apns_delivery_results;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn native_delivery_devices_run_concurrently_with_a_bound_and_keep_failures() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let jobs = (0..12).map(|number| {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                (number % 3 == 0).then(|| format!("invalid-{number:02}"))
+            }
+        });
+        let mut results = collect_apns_delivery_results(jobs).await;
+        results.sort();
+        assert_eq!(
+            results,
+            ["invalid-00", "invalid-03", "invalid-06", "invalid-09"]
+        );
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+}
+
 pub(super) const APNS_TOKEN_STALE_DAYS: i64 = 30;
 pub(super) const APNS_NOTIFICATION_DEDUPE_SECS: u64 = 30;
 pub(super) const APNS_NOTIFICATION_REQUEST_DEDUPE_SECS: u64 = 6 * 60 * 60;

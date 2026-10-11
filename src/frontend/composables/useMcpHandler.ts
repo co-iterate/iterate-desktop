@@ -3,9 +3,9 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ref } from 'vue'
 import { clearActiveMcpFatalContext, setActiveMcpFatalContext } from '../utils/mcpFatalError'
+import { isMuted, refreshGlobalMute, toggleMute } from './useGlobalMute'
 import { useNotification } from './useNotification'
 
-const MUTE_STORAGE_KEY = 'iterate.muted'
 const LAST_VALID_PROJECT_PATH_KEY = 'iterate.last_valid_project_path'
 const DEFAULT_CONTINUE_PROMPT = '请按照最佳实践继续'
 const DEFAULT_LOOP_PROMPT = '进入自主循环模式。\n\n## 执行规则\n1. 基于当前上下文，按最佳实践继续执行当前任务\n2. 每轮完成后立即调用 iterate/zhi 汇报进度，不要等待用户\n3. 如果任务未完成且无需用户决策，继续自动执行下一步\n\n## 停止条件（满足任一即停止）\n- 任务已全部完成\n- 遇到必须由用户决定的问题\n- 遇到无法自动解决的错误（连续失败2次）\n- 不确定下一步该做什么\n\n## 汇报格式\n每轮简要说明：做了什么 → 结果如何 → 下一步计划'
@@ -294,17 +294,6 @@ export function resolveMcpLaunchContext(): Promise<McpLaunchContext> {
   return cachedMcpLaunchContext
 }
 
-// 静音状态（模块级单例，确保所有调用者共享同一个状态）
-const isMuted = ref(localStorage.getItem(MUTE_STORAGE_KEY) === 'true')
-
-/**
- * 切换静音状态
- */
-function toggleMute() {
-  isMuted.value = !isMuted.value
-  localStorage.setItem(MUTE_STORAGE_KEY, String(isMuted.value))
-}
-
 /**
  * MCP处理组合式函数
  */
@@ -352,14 +341,38 @@ export function useMcpHandler() {
 
     if (dismissal.hidStandaloneWindow) {
       try {
-        const window = getCurrentWindow()
-        await window.show()
-        await window.setFocus()
+        await refreshGlobalMute()
+        await invoke('present_mcp_window')
       }
       catch (error) {
         console.error('恢复MCP窗口失败:', error)
       }
     }
+  }
+
+  function handleRemoteActionHandled(payload: any) {
+    // Remote phone replies have already been delivered by Rust. This handler
+    // only finishes the resident desktop presentation. It must never submit a
+    // second response, and it must never close a sibling request in the same
+    // project.
+    const currentRequestId = resolveRequestId(mcpRequest.value)
+    const targetRequestId = resolveRequestId(payload)
+    if (!currentRequestId || !targetRequestId || currentRequestId !== targetRequestId) {
+      console.log('[MCP] 忽略不匹配的远端 action ACK:', {
+        current: currentRequestId,
+        target: targetRequestId,
+      })
+      return
+    }
+
+    if (isMcpProcess.value) {
+      // Standalone popup completion is owned by its exact response-file route.
+      // Main-process Tauri events are not a cross-process close protocol.
+      return
+    }
+
+    showMcpPopup.value = false
+    mcpRequest.value = null
   }
 
   function resolveProjectPath(request: any): string | null {
@@ -439,6 +452,7 @@ export function useMcpHandler() {
    * 显示MCP弹窗
    */
   async function showMcpDialog(request: any) {
+    await refreshGlobalMute()
     const projectPath = resolveProjectPath(request)
     const routedRequest = await freezeConversationRouteId(request, projectPath)
     const requestId = resolveRequestId(routedRequest)
@@ -487,33 +501,14 @@ export function useMcpHandler() {
 
     // 根据配置决定是否显示前端弹窗
     if (shouldShowFrontendPopup) {
-      const shouldForceShow = !!(routedRequest?.loop_active || routedRequest?.force_popup)
-      // 循环检查点 / loop 完成交付：强制取消静音并显示窗口
-      if (shouldForceShow && isMuted.value) {
-        console.log('🔔 关键 loop 弹窗：自动取消静音，显示窗口')
-        toggleMute()
-        mcpRequest.value = routedRequest
-        showMcpPopup.value = true
+      // All requests, including loop/force_popup, use the same native mute boundary.
+      mcpRequest.value = routedRequest
+      showMcpPopup.value = true
+      try {
+        await invoke('present_mcp_window')
       }
-      // 静音模式：跳过弹窗显示，窗口最小化到 Dock
-      else if (isMuted.value) {
-        console.log('🔕 静音模式：跳过弹窗显示，窗口最小化')
-        // 仍然设置请求数据，但不显示弹窗
-        mcpRequest.value = routedRequest
-        showMcpPopup.value = true
-        // 最小化窗口到 Dock
-        try {
-          const window = getCurrentWindow()
-          await window.minimize()
-        }
-        catch (error) {
-          console.error('最小化窗口失败:', error)
-        }
-      }
-      else {
-        // 正常模式：设置请求数据和显示状态
-        mcpRequest.value = routedRequest
-        showMcpPopup.value = true
+      catch (error) {
+        console.error('应用弹窗静音策略失败:', error)
       }
     }
     else {
@@ -536,7 +531,8 @@ export function useMcpHandler() {
         notification.init()
         const title = 'iterate'
         const body = request?.message?.substring(0, 100) || '有新的 MCP 请求'
-        notification.sendNotification(title, body)
+        if (!await refreshGlobalMute())
+          notification.sendNotification(title, body)
       }
       catch (error) {
         console.error('发送系统通知失败:', error)
@@ -563,6 +559,7 @@ export function useMcpHandler() {
    * 检查MCP模式
    */
   async function checkMcpMode() {
+    await refreshGlobalMute()
     try {
       const launchContext = await resolveMcpLaunchContext()
       console.log('[checkMcpMode] launch context:', launchContext)
@@ -609,6 +606,10 @@ export function useMcpHandler() {
         }
 
         showMcpDialog(payload)
+      })
+
+      await listen('bridge-mcp-action-handled', (event) => {
+        handleRemoteActionHandled(event.payload)
       })
     }
     catch (error) {
@@ -745,6 +746,7 @@ export function useMcpHandler() {
     handleUpdateConditionalState,
     handleUpdateConditionalActive,
     handleUpdateCustomPromptOrder,
+    handleRemoteActionHandled,
     showMcpDialog,
     checkMcpMode,
     setupMcpEventListener,

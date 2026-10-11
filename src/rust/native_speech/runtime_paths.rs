@@ -31,11 +31,29 @@ impl RuntimeNamespace {
     }
 }
 
+fn current_security_session() -> io::Result<String> {
+    // AuthSession.h: SecuritySessionId / SessionAttributeBits are UInt32.
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SessionGetInfo(session: u32, actual: *mut u32, attributes: *mut u32) -> i32;
+    }
+    let mut actual = 0_u32;
+    let status = unsafe { SessionGetInfo(u32::MAX, &mut actual, std::ptr::null_mut()) };
+    if status != 0 || actual == 0 || actual >= u32::MAX - 1 {
+        return Err(io::Error::other(format!(
+            "cannot resolve Fn owner security session: status={status} session={actual}"
+        )));
+    }
+    Ok(format!("security-{actual:x}"))
+}
+
 pub fn production_owner_lock_path() -> io::Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
-    let session = std::env::var("SECURITYSESSIONID")
-        .or_else(|_| std::env::var("XPC_SERVICE_NAME"))
-        .unwrap_or_else(|_| "gui".into());
+    // LaunchServices gives each app instance a different XPC_SERVICE_NAME, and
+    // SECURITYSESSIONID is not consistently exported by GUI/shell launchers.
+    // Ask Security.framework for the real login session so all eligible owners
+    // (and their one-shot paste helpers) contend on the same kernel file lock.
+    let session = current_security_session()?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unavailable"))?;

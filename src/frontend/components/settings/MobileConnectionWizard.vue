@@ -27,7 +27,7 @@ const { dataUrl: qrCodeUrl, error: qrCodeError } = useLocalQrCode(qrSource, { wi
 const stageText = computed(() => {
   switch (state.value.stage) {
     case 'bootstrap': return '正在检查桌面端连接'
-    case 'preparing_bridge': return '正在准备当前电脑'
+    case 'preparing_bridge': return '正在准备这台 Mac'
     case 'setup_required': return '需要配置正式公网连接'
     case 'recovering_formal_route': return '正在恢复正式公网连接'
     case 'issuing_pairing': return '正在生成一次性二维码'
@@ -93,7 +93,7 @@ watch(show, (visible) => {
           {{ stageText }}
         </div>
         <div class="mt-1 text-xs opacity-60">
-          iterate 只会通过当前电脑已配置并验证的正式公网路线生成二维码。
+          iterate 只会通过这台 Mac 已配置并验证的正式公网路线生成二维码。
         </div>
       </div>
 
@@ -124,7 +124,7 @@ watch(show, (visible) => {
 
       <template v-else-if="state.stage === 'setup_required'">
         <n-alert type="info" :bordered="false">
-          当前电脑还没有登记正式公网路线。复制下面的安全提示词交给 AI；遇到 Cloudflare 登录、域名、DNS、管理员权限或凭据步骤时，AI 必须停下来由你确认。
+          这台 Mac 还没有登记正式公网路线。复制下面的安全提示词交给 AI；遇到 Cloudflare 登录、域名、DNS、管理员权限或凭据步骤时，AI 必须停下来由你确认。
         </n-alert>
         <div class="prompt-preview">
           <div class="text-xs font-medium">
@@ -173,7 +173,7 @@ watch(show, (visible) => {
           二维码将在 {{ remainingSeconds }} 秒后过期。请只在目标 iPhone 上扫描。
         </div>
         <div v-if="pairingPayload?.device_name" class="text-center text-xs opacity-55">
-          当前电脑：{{ pairingPayload.device_name }}
+          这台 Mac：{{ pairingPayload.device_name }}
         </div>
         <div v-if="qrCodeError" class="text-xs text-error">
           本地二维码生成失败：{{ qrCodeError.message }}

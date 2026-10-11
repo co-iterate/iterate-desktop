@@ -3,8 +3,7 @@ set -euo pipefail
 
 LABEL="${LABEL:-com.cunzhi.iterate.bridge}"
 PORT="${PORT:-8080}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_PATH="${WORKSPACE_PATH:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+WORKSPACE_PATH="${WORKSPACE_PATH:-${HOME}/cunzhi}"
 if [ -z "${APP_BIN:-}" ]; then
   if [ -x "/Applications/iterate.app/Contents/MacOS/iterate" ]; then
     APP_BIN="/Applications/iterate.app/Contents/MacOS/iterate"
@@ -35,6 +34,8 @@ load_apns_env_defaults() {
 
   local old_key_id="${APNS_KEY_ID:-}" old_team_id="${APNS_TEAM_ID:-}" old_key_path="${APNS_AUTH_KEY_PATH:-}"
   local old_topic="${APNS_TOPIC:-}" old_env="${APNS_ENV:-}"
+  local old_sandbox_key_id="${APNS_SANDBOX_KEY_ID:-}" old_sandbox_key_path="${APNS_SANDBOX_AUTH_KEY_PATH:-}"
+  local old_production_key_id="${APNS_PRODUCTION_KEY_ID:-}" old_production_key_path="${APNS_PRODUCTION_AUTH_KEY_PATH:-}"
 
   # apns-env.sh is documented as a sourceable private shell snippet.
   # Source it here, but preserve any explicit non-empty environment overrides.
@@ -46,6 +47,10 @@ load_apns_env_defaults() {
   if [ -n "${old_key_path}" ]; then APNS_AUTH_KEY_PATH="${old_key_path}"; fi
   if [ -n "${old_topic}" ]; then APNS_TOPIC="${old_topic}"; fi
   if [ -n "${old_env}" ]; then APNS_ENV="${old_env}"; fi
+  if [ -n "${old_sandbox_key_id}" ]; then APNS_SANDBOX_KEY_ID="${old_sandbox_key_id}"; fi
+  if [ -n "${old_sandbox_key_path}" ]; then APNS_SANDBOX_AUTH_KEY_PATH="${old_sandbox_key_path}"; fi
+  if [ -n "${old_production_key_id}" ]; then APNS_PRODUCTION_KEY_ID="${old_production_key_id}"; fi
+  if [ -n "${old_production_key_path}" ]; then APNS_PRODUCTION_AUTH_KEY_PATH="${old_production_key_path}"; fi
 }
 
 load_apns_env_defaults
@@ -145,6 +150,10 @@ render_apns_env_vars() {
   render_env_var "APNS_KEY_ID" "${APNS_KEY_ID:-}"
   render_env_var "APNS_TEAM_ID" "${APNS_TEAM_ID:-}"
   render_env_var "APNS_AUTH_KEY_PATH" "${APNS_AUTH_KEY_PATH:-}"
+  render_env_var "APNS_SANDBOX_KEY_ID" "${APNS_SANDBOX_KEY_ID:-}"
+  render_env_var "APNS_SANDBOX_AUTH_KEY_PATH" "${APNS_SANDBOX_AUTH_KEY_PATH:-}"
+  render_env_var "APNS_PRODUCTION_KEY_ID" "${APNS_PRODUCTION_KEY_ID:-}"
+  render_env_var "APNS_PRODUCTION_AUTH_KEY_PATH" "${APNS_PRODUCTION_AUTH_KEY_PATH:-}"
   render_env_var "APNS_TOPIC" "${APNS_TOPIC:-}"
   render_env_var "APNS_ENV" "${APNS_ENV:-}"
 }

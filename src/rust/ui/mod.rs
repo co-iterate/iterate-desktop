@@ -6,6 +6,10 @@ pub mod commands;
 pub mod exit;
 pub mod exit_handler;
 pub mod font_commands;
+pub mod global_mute;
+pub mod global_mute_store;
+pub mod popup_restore;
+pub mod popup_restore_store;
 pub mod live_goal;
 #[cfg(target_os = "macos")]
 pub mod macos_text_drop;

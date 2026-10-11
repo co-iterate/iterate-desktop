@@ -4,7 +4,6 @@ fn main() {
     println!("cargo:rerun-if-changed=dist/index.html");
     println!("cargo:rerun-if-changed=mobile.html");
     println!("cargo:rerun-if-env-changed=TARGET");
-    println!("cargo:rerun-if-env-changed=ITERATE_REQUIRE_ACTIVATION");
 
     if cargo_target_is_macos() {
         compile_macos_speech_bridge();

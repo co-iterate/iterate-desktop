@@ -20,7 +20,7 @@ function sampleResult(collectedAt = '2026-06-28T08:00:00.000Z') {
       ports: [
         {
           port: 5318,
-          registeredWorkspace: '/Users/test/project',
+          registeredWorkspace: '/Users/example/cunzhi',
           healthOk: true,
           statusOk: true,
           status: {
@@ -32,7 +32,7 @@ function sampleResult(collectedAt = '2026-06-28T08:00:00.000Z') {
       ],
       processes: {
         counts: { serve: 2, mcpServers: 1, codexAppServers: 1 },
-        serve: [{ pid: 12345, command: 'iterate --serve --port 5318 --workspace /Users/test/project' }],
+        serve: [{ pid: 12345, command: 'iterate --serve --port 5318 --workspace /Users/example/cunzhi' }],
       },
       connectionStatus: {
         websocket: {
@@ -50,9 +50,9 @@ function sampleResult(collectedAt = '2026-06-28T08:00:00.000Z') {
       {
         code: 'workspace_idle_serve_over_budget',
         severity: 'warn',
-        workspace: '/Users/test/project',
+        workspace: '/Users/example/cunzhi',
         idlePorts: [5314, 5318],
-        message: '/Users/test/project has 2 idle serve ports',
+        message: '/Users/example/cunzhi has 2 idle serve ports',
       },
     ],
     recoveryPlan: {
@@ -61,7 +61,7 @@ function sampleResult(collectedAt = '2026-06-28T08:00:00.000Z') {
           code: 'trim_extra_idle_workspace_serve',
           mode: 'manual_confirm',
           exec: false,
-          workspace: '/Users/test/project',
+          workspace: '/Users/example/cunzhi',
           reason: 'workspace_idle_serve_over_budget',
         },
       ],
@@ -70,7 +70,7 @@ function sampleResult(collectedAt = '2026-06-28T08:00:00.000Z') {
       {
         code: 'trim_extra_idle_workspace_serve',
         status: 'skipped',
-        workspace: '/Users/test/project',
+        workspace: '/Users/example/cunzhi',
         reason: 'exec_false',
       },
     ],
@@ -91,7 +91,7 @@ test('redactHealthResult removes raw connection payloads and keeps operational s
   assert.deepEqual(record.snapshot.ports, [
     {
       port: 5318,
-      registeredWorkspace: '/Users/test/project',
+      registeredWorkspace: '/Users/example/cunzhi',
       healthOk: true,
       statusOk: true,
       isBusy: false,

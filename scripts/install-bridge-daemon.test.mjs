@@ -29,6 +29,10 @@ function baseEnvironment(workspace, appBin, overrides = {}) {
     APNS_KEY_ID: '',
     APNS_TEAM_ID: '',
     APNS_AUTH_KEY_PATH: '',
+    APNS_SANDBOX_KEY_ID: '',
+    APNS_SANDBOX_AUTH_KEY_PATH: '',
+    APNS_PRODUCTION_KEY_ID: '',
+    APNS_PRODUCTION_AUTH_KEY_PATH: '',
     APNS_TOPIC: '',
     APNS_ENV: '',
     ...overrides,
@@ -45,6 +49,10 @@ test('render persists APNs environment from apns-env.sh into LaunchAgent plist',
     'export APNS_KEY_ID="FILE_KEY"',
     'export APNS_TEAM_ID="FILE_TEAM"',
     `export APNS_AUTH_KEY_PATH="${workspace}/AuthKey_FILE.p8"`,
+    'export APNS_SANDBOX_KEY_ID="SANDBOX_KEY"',
+    `export APNS_SANDBOX_AUTH_KEY_PATH="${workspace}/AuthKey_SANDBOX.p8"`,
+    'export APNS_PRODUCTION_KEY_ID="PRODUCTION_KEY"',
+    `export APNS_PRODUCTION_AUTH_KEY_PATH="${workspace}/AuthKey_PRODUCTION.p8"`,
     'export APNS_TOPIC="com.iterate.notify.file"',
     'export APNS_ENV="sandbox"',
     '',
@@ -61,6 +69,12 @@ test('render persists APNs environment from apns-env.sh into LaunchAgent plist',
   assert.match(result.stdout, /<key>APNS_TEAM_ID<\/key>\s*<string>FILE_TEAM<\/string>/);
   assert.match(result.stdout, /<key>APNS_AUTH_KEY_PATH<\/key>/);
   assert.match(result.stdout, new RegExp(`${workspace}/AuthKey_FILE\\.p8`.replaceAll('/', '\\/')));
+  assert.match(result.stdout, /<key>APNS_SANDBOX_KEY_ID<\/key>\s*<string>SANDBOX_KEY<\/string>/);
+  assert.match(result.stdout, /<key>APNS_SANDBOX_AUTH_KEY_PATH<\/key>/);
+  assert.match(result.stdout, new RegExp(`${workspace}/AuthKey_SANDBOX\\.p8`.replaceAll('/', '\\/')));
+  assert.match(result.stdout, /<key>APNS_PRODUCTION_KEY_ID<\/key>\s*<string>PRODUCTION_KEY<\/string>/);
+  assert.match(result.stdout, /<key>APNS_PRODUCTION_AUTH_KEY_PATH<\/key>/);
+  assert.match(result.stdout, new RegExp(`${workspace}/AuthKey_PRODUCTION\\.p8`.replaceAll('/', '\\/')));
   assert.match(result.stdout, /<key>APNS_TOPIC<\/key>\s*<string>com\.iterate\.notify\.file<\/string>/);
   assert.match(result.stdout, /<key>APNS_ENV<\/key>\s*<string>sandbox<\/string>/);
 });

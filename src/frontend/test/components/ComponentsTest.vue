@@ -3,7 +3,6 @@ import { onMounted, ref } from 'vue'
 import FeatureCard from '../../components/common/FeatureCard.vue'
 import UsageQuotaPopover from '../../components/common/UsageQuotaPopover.vue'
 import PopupActions from '../../components/popup/PopupActions.vue'
-import AudioSettings from '../../components/settings/AudioSettings.vue'
 import CheckpointSettings from '../../components/settings/CheckpointSettings.vue'
 import ReplySettings from '../../components/settings/ReplySettings.vue'
 import ThemeSettings from '../../components/settings/ThemeSettings.vue'
@@ -205,25 +204,6 @@ const usageProviders = [
               <div class="demo-info">
                 <n-tag size="small">
                   src/frontend/components/settings/WindowSettings.vue
-                </n-tag>
-              </div>
-            </div>
-
-            <!-- 音频设置 -->
-            <div class="component-demo">
-              <h4>AudioSettings 公开版静音状态</h4>
-              <div class="demo-container">
-                <AudioSettings
-                  :audio-notification-enabled="audioNotificationEnabled"
-                  :audio-url="audioUrl"
-                  @toggle-audio-notification="handleToggleAudioNotification"
-                  @update-audio-url="handleUpdateAudioUrl"
-                  @test-audio="handleTestAudio"
-                />
-              </div>
-              <div class="demo-info">
-                <n-tag size="small">
-                  src/frontend/components/settings/AudioSettings.vue
                 </n-tag>
               </div>
             </div>

@@ -7,6 +7,7 @@ import {
   NCheckbox,
   NCollapse,
   NCollapseItem,
+  NCollapseTransition,
   NConfigProvider,
   NDialogProvider,
   NEmpty,
@@ -22,6 +23,7 @@ import {
   NModal,
   NNotificationProvider,
   NSelect,
+  NSkeleton,
   NSpace,
   NSpin,
   NSwitch,
@@ -51,6 +53,7 @@ const naive = create({
     NCheckbox,
     NCollapse,
     NCollapseItem,
+    NCollapseTransition,
     NConfigProvider,
     NEmpty,
     NFormItem,
@@ -63,6 +66,7 @@ const naive = create({
     NInputNumber,
     NModal,
     NSelect,
+    NSkeleton,
     NSpace,
     NSpin,
     NSwitch,
@@ -101,7 +105,7 @@ if (!window.__TAURI__) {
     started_at_ms: Date.now() - 59 * 60 * 1000,
     updated_at_ms: Date.now(),
     completed_at_ms: null,
-    project_path: '/Users/test/project',
+    project_path: '/Users/example/cunzhi',
     request_id: 'preview-request',
     codex_thread_id: 'preview-codex-thread',
     codex_deeplink: 'codex://thread/preview-codex-thread',
@@ -331,9 +335,43 @@ if (!window.__TAURI__) {
   ]
   let mockMcpTools = createMockMcpTools()
 
+  let mockGlobalMute: [number, boolean] = [1, false]
+  let mockPopupInDock = false
+  let mockPopupFocused = true
+
   const mockInvoke = async (command: string, args?: Record<string, unknown>) => {
     console.log(`模拟 Tauri 调用: ${command}`, args)
     goalRunInvokeLog.push({ command, args })
+    if (command === 'get_global_mute')
+      return [...mockGlobalMute]
+    if (command === 'set_global_mute') {
+      mockGlobalMute = [mockGlobalMute[0] + 1, Boolean(args?.muted)]
+      if (mockGlobalMute[1]) {
+        mockPopupInDock = true
+        mockPopupFocused = false
+      }
+      return [...mockGlobalMute]
+    }
+    if (command === 'present_mcp_window') {
+      mockPopupInDock = mockGlobalMute[1]
+      mockPopupFocused = !mockPopupInDock
+      return null
+    }
+    if (command === 'can_focus_popup_input')
+      return !mockPopupInDock && mockPopupFocused
+    if (command === 'plugin:window|minimize') {
+      mockPopupInDock = true
+      mockPopupFocused = false
+      return null
+    }
+    if (command === 'plugin:window|unminimize') {
+      mockPopupInDock = false
+      return null
+    }
+    if (command === 'plugin:window|set_focus') {
+      mockPopupFocused = !mockPopupInDock
+      return null
+    }
     if (command === 'get_mcp_tools_config') {
       return mockMcpTools.map(tool => ({ ...tool }))
     }
@@ -374,7 +412,7 @@ if (!window.__TAURI__) {
         started_at_ms: now,
         updated_at_ms: now,
         completed_at_ms: null,
-        project_path: args?.projectPath || '/Users/test/project',
+        project_path: args?.projectPath || '/Users/example/cunzhi',
         request_id: args?.requestId || `preview-${now}`,
         codex_thread_id: args?.codexThreadId || 'preview-codex-thread',
         codex_deeplink: args?.codexDeeplink || 'codex://thread/preview-codex-thread',

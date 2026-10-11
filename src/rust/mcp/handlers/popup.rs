@@ -12,7 +12,7 @@ use crate::mcp::types::PopupRequest;
 
 const IPC_ADDR: &str = "127.0.0.1:37101";
 const IPC_CONNECT_TIMEOUT_MS: u64 = 180;
-const IPC_READ_TIMEOUT_MS: u64 = 30_000;
+const IPC_WRITE_TIMEOUT_MS: u64 = 30_000;
 
 /// 创建 Tauri 弹窗
 ///
@@ -79,8 +79,11 @@ fn forward_request_to_running_app_sync(request: &PopupRequest) -> Result<String>
     let addr: SocketAddr = IPC_ADDR.parse()?;
     let mut stream =
         TcpStream::connect_timeout(&addr, Duration::from_millis(IPC_CONNECT_TIMEOUT_MS))?;
-    stream.set_read_timeout(Some(Duration::from_millis(IPC_READ_TIMEOUT_MS)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(IPC_READ_TIMEOUT_MS)))?;
+    // A visible popup is allowed to wait for the user indefinitely. A read
+    // timeout would mistake a slow reply for IPC failure and open a duplicate
+    // fallback popup while the original is still active.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(Duration::from_millis(IPC_WRITE_TIMEOUT_MS)))?;
 
     let request_bytes = serde_json::to_vec(request)?;
     write_frame_sync(&mut stream, &request_bytes)?;

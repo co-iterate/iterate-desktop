@@ -36,6 +36,7 @@ export function useEventHandlers(actions: any, _mcpRequest?: any) {
         user_input,
         selected_options,
         images,
+        file_paths,
         project_path,
         request_id,
         requestId,
@@ -68,11 +69,16 @@ export function useEventHandlers(actions: any, _mcpRequest?: any) {
               })
               .filter(Boolean)
           : []
+        const normalizedFilePaths = Array.isArray(file_paths)
+          ? file_paths.filter((path: unknown): path is string => typeof path === 'string' && path.length > 0)
+          : []
 
         const response = {
           user_input: user_input || null,
           selected_options: selected_options || [],
           images: normalizedImages,
+          file_paths: normalizedFilePaths,
+          image_paths: [],
           project_path: project_path || null,
           metadata: {
             timestamp: new Date().toISOString(),

@@ -1,6 +1,5 @@
 /* eslint-disable test/no-import-node-test */
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
@@ -283,9 +282,10 @@ test('desktop Live mirrors iOS execution display state without hiding ordinary t
   assert.match(hudText, /return latestTranscript \|\| statusText/)
 })
 
-test('Mac detects explicit tasks while keeping natural approval gated', async () => {
+test('Mac detects explicit tasks while iOS keeps natural approval gated', async () => {
   const manager = await read('src/frontend/composables/useDesktopCodexLive.ts')
   const decisions = await read('src/frontend/utils/codexLiveVoiceDecision.ts')
+  const iosManager = await read('ios-app/IterateNotify/CodexLiveManager.swift')
 
   assert.match(manager, /isExplicitCodexLiveExecutionRequest/)
   assert.match(decisions, /awaitingConfirmation[\s\S]*isCodexLiveAffirmativeDecision/)
@@ -296,15 +296,6 @@ test('Mac detects explicit tasks while keeping natural approval gated', async ()
   assert.match(manager, /explicitExecutionRequestPending/)
   assert.match(manager, /isExplicitCodexLiveExecutionRequest/)
   assert.match(manager, /scheduleReconnect[\s\S]*explicitExecutionRequestPending = false/)
-})
-
-const iosManagerUrl = new URL('ios-app/IterateNotify/CodexLiveManager.swift', root)
-
-test('iOS keeps natural approval gated when the private client source is available', {
-  skip: !existsSync(iosManagerUrl),
-}, async () => {
-  const iosManager = await read('ios-app/IterateNotify/CodexLiveManager.swift')
-
   assert.match(iosManager, /CharacterSet\.whitespacesAndNewlines[\s\S]*\.union\(\.punctuationCharacters\)[\s\S]*\.union\(\.symbols\)/)
   assert.match(iosManager, /return normalized == "需求已经确认是否现在开始执行"/)
   assert.doesNotMatch(iosManager, /isExecutionConfirmationQuestion[\s\S]{0,800}contains\(where: normalized\.contains\)/)

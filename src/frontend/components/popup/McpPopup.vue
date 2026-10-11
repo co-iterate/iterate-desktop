@@ -45,8 +45,6 @@ interface ConversationNode {
   }
 }
 
-type PromptContextState = Record<string, { current_state?: boolean, is_active?: boolean }>
-
 interface Props {
   request: McpRequest | null
   appConfig: AppConfig
@@ -54,7 +52,6 @@ interface Props {
   testMode?: boolean
   isMuted?: boolean
   contextKey?: string
-  contextPromptState?: PromptContextState
   timelineTreeId?: string | null
   timelineCurrentNodeId?: string | null
   timelineMockNodes?: ConversationNode[]
@@ -86,6 +83,7 @@ interface TimelinePrefillPayload extends PopupInputData {
 interface PopupInputRef {
   statusText?: string
   updateData: (data: PopupInputData) => void
+  getFinalUserInput: () => string
   recordSubmittedInputForAutoPromotion: () => void
   handleQuoteMessage: (messageContent: string) => void
   insertSelectedTextQuote: (selection: PopupTextSelection) => Promise<boolean>
@@ -121,6 +119,9 @@ const pendingTimelinePrefill = ref<TimelinePrefillPayload | null>(null)
 const timelineEdgeActive = ref(false)
 const TIMELINE_EDGE_TRIGGER_PX = 16
 const TIMELINE_EDGE_ACTIVE_PX = 42
+const shouldAppendConversationContext = computed(() =>
+  props.request?.browser_ai_response == null && props.request?.browser_tab_id == null,
+)
 
 // 处理输入框中输入 "@" 或 "爱特" 自动弹出文件菜单
 function handleAtTrigger() {
@@ -552,7 +553,7 @@ function handleMiddleZoneClick(event: MouseEvent) {
 
 async function scheduleInputFocus(
   reason: string,
-  options: { preserveExistingFocus?: boolean, activateWindow?: boolean } = {},
+  options: { preserveExistingFocus?: boolean } = {},
 ) {
   if (!isVisible.value || loading.value || !inputRef.value)
     return
@@ -563,15 +564,6 @@ async function scheduleInputFocus(
   }
 
   clearFocusRetryTimer()
-
-  if (options.activateWindow) {
-    try {
-      await invoke('activate_app_window')
-    }
-    catch (error) {
-      console.log(`[McpPopup] 激活窗口失败: ${reason}`, error)
-    }
-  }
 
   await nextTick()
 
@@ -700,24 +692,6 @@ watch(() => props.request, async (newRequest) => {
     loading.value = true
     // 每次显示弹窗时重新加载配置
     loadReplyConfig()
-
-    const shouldForceShow = !!(newRequest.loop_active || newRequest.force_popup)
-
-    // 循环检查点 / loop 完成交付：自动取消静音并显示窗口
-    if (shouldForceShow && props.isMuted) {
-      emit('toggleMute')
-      console.log('🔔 关键 loop 弹窗：自动取消静音')
-    }
-
-    // 窗口居中到当前屏幕（静音模式下跳过，避免覆盖 minimize）
-    if (!props.isMuted || shouldForceShow) {
-      try {
-        await invoke('center_window')
-      }
-      catch (e) {
-        console.log('窗口居中失败:', e)
-      }
-    }
 
     void nextTick().then(() => {
       loading.value = false
@@ -928,7 +902,10 @@ async function handleSubmit() {
   submitting.value = true
 
   try {
-    const finalUserInput = buildFinalUserInput(userInput.value, attachedFiles.value)
+    const finalUserInput = buildFinalUserInput(
+      inputRef.value?.getFinalUserInput() ?? userInput.value,
+      attachedFiles.value,
+    )
     inputRef.value?.recordSubmittedInputForAutoPromotion()
     const response = {
       user_input: finalUserInput,
@@ -939,7 +916,7 @@ async function handleSubmit() {
       metadata: {
         timestamp: new Date().toISOString(),
         request_id: props.request?.id || null,
-        source: resolveSubmitSource(finalUserInput, selectedOptions.value),
+        source: resolveSubmitSource(finalUserInput ?? '', selectedOptions.value),
       },
     }
 
@@ -1275,8 +1252,7 @@ defineExpose({
             ref="inputRef"
             :request="request"
             :context-key="popupContextKey"
-            :context-prompt-state="props.contextPromptState"
-            :enable-context-append="true"
+            :enable-context-append="shouldAppendConversationContext"
             :loading="loading"
             :submitting="submitting"
             @update="handleInputUpdate"

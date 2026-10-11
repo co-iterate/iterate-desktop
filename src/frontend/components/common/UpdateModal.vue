@@ -2,6 +2,7 @@
 import { useMessage } from 'naive-ui'
 import { computed } from 'vue'
 import { useVersionCheck } from '../../composables/useVersionCheck'
+import { functionalColors } from '../../theme/colors'
 
 interface Props {
   show: boolean
@@ -184,7 +185,7 @@ async function handleRestart() {
                 :percentage="Math.round(updateProgress.percentage)"
                 :show-indicator="false"
                 :height="8"
-                color="#3b82f6"
+                :color="functionalColors.info"
               />
               <div class="flex justify-between text-xs text-on-surface-secondary dark:text-on-surface-secondary">
                 <span>{{ Math.round(updateProgress.downloaded / 1024 / 1024 * 100) / 100 }}MB</span>

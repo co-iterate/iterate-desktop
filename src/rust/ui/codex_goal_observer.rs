@@ -694,16 +694,16 @@ mod tests {
             project_path_from_arg_values(vec![
                 "--serve".to_string(),
                 "--workspace".to_string(),
-                "/Users/test/project".to_string(),
+                "/Users/example/cunzhi".to_string(),
             ]),
-            Some("/Users/test/project".to_string())
+            Some("/Users/example/cunzhi".to_string())
         );
         assert_eq!(
             project_path_from_arg_values(vec![
                 "--serve".to_string(),
-                "--workspace=/Users/test/project".to_string(),
+                "--workspace=/Users/example/cunzhi".to_string(),
             ]),
-            Some("/Users/test/project".to_string())
+            Some("/Users/example/cunzhi".to_string())
         );
         assert_eq!(project_path_from_arg_values(Vec::<String>::new()), None);
     }

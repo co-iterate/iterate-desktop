@@ -22,24 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position, State};
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-trait BackgroundCommandExt {
-    fn without_console_window(&mut self) -> &mut Self;
-}
-
-impl BackgroundCommandExt for std::process::Command {
-    fn without_console_window(&mut self) -> &mut Self {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            self.creation_flags(CREATE_NO_WINDOW);
-        }
-        self
-    }
-}
-
 #[cfg(target_os = "macos")]
 static STANDALONE_PREVIOUS_FRONTMOST_APPLICATION: OnceLock<
     std::sync::Mutex<Option<crate::native_speech::target::FrontmostApplication>>,
@@ -877,8 +859,11 @@ pub async fn send_mcp_response(
 
         // 如果设置了 ITERATE_RESPONSE_FILE，同时写入文件（--serve 模式需要）
         if let Ok(response_file) = std::env::var("ITERATE_RESPONSE_FILE") {
-            std::fs::write(&response_file, &response_str)
-                .map_err(|e| format!("写入响应文件失败: {}", e))?;
+            crate::utils::atomic_file::write_file_atomically(
+                std::path::Path::new(&response_file),
+                response_str.as_bytes(),
+            )
+            .map_err(|e| format!("写入响应文件失败: {}", e))?;
         }
         // 对话已结束，通知主进程清除 MCP_STATE_CACHE（子进程内存与主进程隔离）
         // 这里必须等待请求返回；standalone 子进程退出很快，fire-and-forget 会导致清理丢失。
@@ -1813,6 +1798,15 @@ fn extract_user_response_content(response: &serde_json::Value) -> Option<String>
                 return Some(format!("[{} image(s)]", image_count));
             }
 
+            if let Some(file_count) = map
+                .get("file_paths")
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+                .filter(|count| *count > 0)
+            {
+                return Some(format!("[{} file(s)]", file_count));
+            }
+
             None
         }
         _ => None,
@@ -2081,10 +2075,7 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
 
     // 根据操作系统选择合适的命令
     let result = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "start", &url])
-            .without_console_window()
-            .spawn()
+        Command::new("cmd").args(["/C", "start", &url]).spawn()
     } else if cfg!(target_os = "macos") {
         Command::new("open").arg(&url).spawn()
     } else {
@@ -2119,7 +2110,6 @@ pub async fn open_local_path(
     let result = if cfg!(target_os = "windows") {
         Command::new("cmd")
             .args(["/C", "start", "", &resolved_path_string])
-            .without_console_window()
             .spawn()
     } else if cfg!(target_os = "macos") {
         let mut command = Command::new("open");
@@ -3375,46 +3365,19 @@ pub async fn update_custom_prompt_order(
     Ok(())
 }
 
-/// 更新条件性prompt状态
+/// 更新条件性prompt状态；弹窗开关可同时激活该项。
 #[tauri::command]
 pub async fn update_conditional_prompt_state(
     prompt_id: String,
     new_state: bool,
+    is_active: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    {
-        let mut config = state
-            .config
-            .lock()
-            .map_err(|e| format!("获取配置失败: {}", e))?;
-
-        // 查找并更新指定prompt的current_state
-        if let Some(prompt) = config
-            .custom_prompt_config
-            .prompts
-            .iter_mut()
-            .find(|p| p.id == prompt_id)
-        {
-            prompt.current_state = new_state;
-            prompt.updated_at = chrono::Utc::now().to_rfc3339();
-        } else {
-            return Err(format!("未找到ID为 {} 的prompt", prompt_id));
-        }
-    }
-
-    // 保存配置到文件
-    save_config(&state, &app)
-        .await
-        .map_err(|e| format!("保存配置失败: {}", e))?;
-
-    // 广播配置变更，通知所有客户端刷新
-    broadcast_custom_prompt_config_changed(&app);
-
-    Ok(())
+    persist_conditional_prompt_settings(&prompt_id, Some(new_state), is_active, &state, &app)
 }
 
-/// 更新条件性prompt启用状态
+/// 更新条件性prompt启用状态。
 #[tauri::command]
 pub async fn update_conditional_prompt_active(
     prompt_id: String,
@@ -3422,34 +3385,23 @@ pub async fn update_conditional_prompt_active(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    {
-        let mut config = state
-            .config
-            .lock()
-            .map_err(|e| format!("获取配置失败: {}", e))?;
+    persist_conditional_prompt_settings(&prompt_id, None, Some(is_active), &state, &app)
+}
 
-        // 查找并更新指定prompt的is_active状态
-        if let Some(prompt) = config
-            .custom_prompt_config
-            .prompts
-            .iter_mut()
-            .find(|p| p.id == prompt_id)
-        {
-            prompt.is_active = is_active;
-            prompt.updated_at = chrono::Utc::now().to_rfc3339();
-        } else {
-            return Err(format!("未找到ID为 {} 的prompt", prompt_id));
-        }
-    }
-
-    // 保存配置到文件
-    save_config(&state, &app)
-        .await
-        .map_err(|e| format!("保存配置失败: {}", e))?;
-
-    // 广播配置变更，通知所有客户端刷新
-    broadcast_custom_prompt_config_changed(&app);
-
+fn persist_conditional_prompt_settings(
+    prompt_id: &str,
+    current_state: Option<bool>,
+    is_active: Option<bool>,
+    state: &State<'_, AppState>,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let path = crate::config::get_config_path(app).map_err(|e| e.to_string())?;
+    let mut config = state.config.lock().map_err(|e| format!("获取配置失败: {}", e))?;
+    *config = crate::config::patch_conditional_prompt_settings(
+        &path, prompt_id, current_state, is_active,
+    ).map_err(|e| format!("保存上下文追加设置失败: {}", e))?;
+    drop(config);
+    broadcast_custom_prompt_config_changed(app);
     Ok(())
 }
 
@@ -3779,13 +3731,11 @@ pub async fn open_in_ide(project_path: String) -> Result<(), String> {
         // Windows: 先尝试 windsurf，再尝试 cursor
         let result = Command::new("cmd")
             .args(["/C", "windsurf", &project_path])
-            .without_console_window()
             .spawn();
 
         if result.is_err() {
             Command::new("cmd")
                 .args(["/C", "cursor", &project_path])
-                .without_console_window()
                 .spawn()
                 .map_err(|e| format!("打开 IDE 失败: {}", e))?;
         }
@@ -4563,15 +4513,33 @@ fn open_local_target_in_editor(target: &LocalOpenTarget) -> Result<(), String> {
 #[cfg(test)]
 mod local_file_path_tests {
     use super::{
-        normalize_local_file_path, read_file_base64, resolve_confirmed_external_file_target,
-        resolve_local_open_path, resolve_local_open_target,
+        expand_home_prefix, normalize_local_file_path, read_file_base64,
+        resolve_confirmed_external_file_target, resolve_local_open_path, resolve_local_open_target,
     };
+
+    #[test]
+    fn expand_home_prefix_only_expands_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(expand_home_prefix("~"), home);
+        assert_eq!(
+            expand_home_prefix("~/手机:提示词"),
+            home.join("手机:提示词")
+        );
+        assert_eq!(
+            expand_home_prefix("/tmp/~/x"),
+            std::path::PathBuf::from("/tmp/~/x")
+        );
+        assert_eq!(
+            expand_home_prefix("~other/x"),
+            std::path::PathBuf::from("~other/x")
+        );
+    }
 
     #[test]
     fn normalizes_encoded_local_image_paths() {
         assert_eq!(
-            normalize_local_file_path("/Users/test/.cunzhi/images/%E4%B8%AD%E6%96%87.png"),
-            "/Users/test/.cunzhi/images/中文.png"
+            normalize_local_file_path("/Users/example/.cunzhi/images/%E4%B8%AD%E6%96%87.png"),
+            "/Users/example/.cunzhi/images/中文.png"
         );
     }
 
@@ -4579,17 +4547,19 @@ mod local_file_path_tests {
     fn normalizes_double_encoded_local_image_paths() {
         assert_eq!(
             normalize_local_file_path(
-                "/Users/test/.cunzhi/images/%25E4%25B8%25AD%25E6%2596%2587%2520%25E5%259B%25BE%25E7%2589%2587.png"
+                "/Users/example/.cunzhi/images/%25E4%25B8%25AD%25E6%2596%2587%2520%25E5%259B%25BE%25E7%2589%2587.png"
             ),
-            "/Users/test/.cunzhi/images/中文 图片.png"
+            "/Users/example/.cunzhi/images/中文 图片.png"
         );
     }
 
     #[test]
     fn strips_file_scheme_before_normalizing() {
         assert_eq!(
-            normalize_local_file_path("file:///Users/test/.cunzhi/images/%E4%B8%AD%E6%96%87.png"),
-            "/Users/test/.cunzhi/images/中文.png"
+            normalize_local_file_path(
+                "file:///Users/example/.cunzhi/images/%E4%B8%AD%E6%96%87.png"
+            ),
+            "/Users/example/.cunzhi/images/中文.png"
         );
     }
 
@@ -4805,8 +4775,15 @@ pub fn upsert_ghost_suggestion(
 }
 
 #[tauri::command]
-pub fn get_ghost_suggestion_learning_state() -> Result<serde_json::Value, String> {
+pub fn get_ghost_suggestion_learning_state(app: AppHandle) -> Result<serde_json::Value, String> {
     let store = crate::ghost_suggestion_learning::load_store()?;
+    if store.version >= 2 {
+        app.emit(
+            "ghost-suggestions-authoritative-learning-v2",
+            crate::ghost_suggestions::load_store_value(),
+        )
+        .map_err(|error| format!("广播幽灵补全学习清理结果失败: {error}"))?;
+    }
     serde_json::to_value(store).map_err(|error| format!("序列化幽灵补全学习账本失败: {error}"))
 }
 
@@ -4934,10 +4911,23 @@ pub fn append_speech_history_markdown(text: String) -> Result<serde_json::Value,
     }))
 }
 
+/// `~` / `~/...` 展开为用户目录；取不到用户目录或不是该前缀时原样返回。
+fn expand_home_prefix(path: &str) -> std::path::PathBuf {
+    let rest = match path {
+        "~" => Some(""),
+        _ => path.strip_prefix("~/"),
+    };
+    match (rest, dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => std::path::PathBuf::from(path),
+    }
+}
+
 /// 列出目录下的 .txt 提示词导出文件
 #[tauri::command]
 pub fn list_prompt_files(dir_path: String) -> Result<Vec<String>, String> {
-    let path = std::path::Path::new(&dir_path);
+    let expanded = expand_home_prefix(&dir_path);
+    let path = expanded.as_path();
     if !path.is_dir() {
         return Err(format!("目录不存在: {}", dir_path));
     }
@@ -5050,7 +5040,7 @@ mod tests {
     fn extract_user_response_content_prefers_explicit_text_fields() {
         let response = json!({
             "message": "  hello world  ",
-            "project_path": "/Users/test/project",
+            "project_path": "/Users/example/cunzhi",
         });
 
         assert_eq!(
@@ -5087,7 +5077,7 @@ mod tests {
     #[test]
     fn extract_user_response_content_does_not_leak_structured_envelope() {
         let response = json!({
-            "project_path": "/Users/test/project",
+            "project_path": "/Users/example/cunzhi",
             "metadata": {
                 "source": "tool_call",
             },
@@ -5099,12 +5089,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn codex_new_thread_deeplink_sends_zhi_to_project_path() {
-        let deeplink = super::build_codex_new_thread_deeplink("zhi", Some("/Users/test/project"))
+        let deeplink = super::build_codex_new_thread_deeplink("zhi", Some("/Users/example/cunzhi"))
             .expect("zhi should create a Codex deeplink");
 
         assert!(deeplink.starts_with("codex://new?"));
         assert!(deeplink.contains("prompt=zhi"));
-        assert!(deeplink.contains("path=%2FUsers%2Ftest%2Fproject"));
+        assert!(deeplink.contains("path=%2FUsers%2Fexample%2Fcunzhi"));
     }
 
     #[cfg(target_os = "macos")]
@@ -5142,8 +5132,8 @@ mod tests {
         )));
         assert!(candidates.contains(&std::path::PathBuf::from("/opt/homebrew/bin/codex")));
         assert_eq!(
-            super::codex_project_cli_args("/Users/test/示例项目/Agents-Anywhere"),
-            ["app", "/Users/test/示例项目/Agents-Anywhere"]
+            super::codex_project_cli_args("/Users/example/极光推送/Agents-Anywhere"),
+            ["app", "/Users/example/极光推送/Agents-Anywhere"]
         );
     }
 
@@ -5151,7 +5141,7 @@ mod tests {
     #[test]
     fn codex_new_chat_route_prefers_project_deeplink_when_project_path_exists() {
         assert_eq!(
-            super::choose_codex_new_chat_route(Some("/Users/test/project")),
+            super::choose_codex_new_chat_route(Some("/Users/example/cunzhi")),
             super::CodexNewChatRoute::ProjectDeeplinkFirst
         );
     }

@@ -608,18 +608,27 @@ fn websocket_probe_status_is_acceptable(status: reqwest::StatusCode) -> bool {
     )
 }
 
+fn public_route_proof_client(proxy_url: Option<&str>) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .http1_only();
+    // LaunchServices need not inherit shell proxy variables. Use the user's
+    // current system HTTPS proxy for both proof requests; otherwise stay direct.
+    if let Some(url) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::https(url)?);
+    }
+    builder.build()
+}
+
 async fn public_route_endpoint_proof(
     endpoint: &str,
     install_identity: &str,
     endpoint_epoch: Option<u64>,
 ) -> bool {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .http1_only()
-        .build()
-    else {
+    let proxy_url = crate::ui::codex_quota::macos_system_https_proxy_url();
+    let Ok(client) = public_route_proof_client(proxy_url.as_deref()) else {
         return false;
     };
     let health_url = format!(
@@ -659,7 +668,7 @@ async fn public_route_endpoint_proof(
             _ => false,
         };
 
-        // Probe the exact WebSocket upgrade path over the same no-proxy
+        // Probe the exact WebSocket upgrade path over the same proxy-aware
         // HTTP/1.1 client used for the cryptographic health proof. A protected
         // Bridge intentionally answers 401 before upgrade; 101 is also valid.
         let websocket_ok = if health_ok {
@@ -1475,5 +1484,80 @@ mod tests {
             quick_tunnel_config_body(&preferences)
         );
         std::fs::remove_file(path).expect("quick config should be removable");
+    }
+}
+
+#[cfg(test)]
+mod public_route_proxy_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn requests(listener: TcpListener, responses: Vec<&'static [u8]>) -> Vec<String> {
+        listener.set_nonblocking(true).unwrap();
+        responses.into_iter().map(|response| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15); // 冷启动 + 全量并行时客户端初始化可能超过 3 秒
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "probe did not reach expected endpoint");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            // macOS 上从非阻塞 listener accept 出来的连接会继承 O_NONBLOCK，数据未到时 read_exact 报 WouldBlock。
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() <= 8192);
+            }
+            stream.write_all(response).unwrap();
+            String::from_utf8(header).unwrap()
+        }).collect()
+    }
+
+    #[test]
+    fn system_proxy_handles_health_and_websocket_https_authority() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || requests(listener, vec![
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; 2
+        ]));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = public_route_proof_client(Some(&proxy)).unwrap();
+            for path in ["/.well-known/iterate/health", "/ws"] {
+                assert!(client.get(format!("https://public-proof.invalid{path}")).send().await.is_err());
+            }
+        });
+        for request in worker.join().unwrap() {
+            assert!(request.starts_with("CONNECT public-proof.invalid:443 HTTP/1.1\r\n"));
+            assert!(request.to_ascii_lowercase().contains("\r\nhost: public-proof.invalid:443\r\n"));
+        }
+    }
+
+    #[test]
+    fn absent_system_proxy_stays_direct_and_redirects_remain_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || requests(listener, vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 302 Found\r\nLocation: https://must-not-follow.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = public_route_proof_client(None).unwrap();
+            assert!(client.get(format!("{origin}/.well-known/iterate/health")).send().await.unwrap().status().is_success());
+            assert!(websocket_probe_status_is_acceptable(client.get(format!("{origin}/ws")).send().await.unwrap().status()));
+            assert_eq!(client.get(format!("{origin}/redirect")).send().await.unwrap().status(), reqwest::StatusCode::FOUND);
+        });
+        let seen = worker.join().unwrap();
+        assert!(seen[0].starts_with("GET /.well-known/iterate/health "));
+        assert!(seen[1].starts_with("GET /ws "));
     }
 }

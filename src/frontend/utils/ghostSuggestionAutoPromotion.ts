@@ -29,7 +29,7 @@ export interface GhostSuggestionAutoPromotionEntry {
 }
 
 export interface GhostSuggestionAutoPromotionState {
-  version: 1
+  version: 2
   entries: Record<string, GhostSuggestionAutoPromotionEntry>
 }
 
@@ -44,9 +44,21 @@ export interface GhostSuggestionAutoPromotionCandidate {
   description: string
 }
 
+interface DirectUserInputEventLike {
+  isTrusted: boolean
+  inputType: string
+  data: string | null
+  isComposing: boolean
+}
+
+interface DirectUserCompositionEventLike {
+  isTrusted: boolean
+  data: string
+}
+
 export function createEmptyGhostSuggestionAutoPromotionState(): GhostSuggestionAutoPromotionState {
   return {
-    version: 1,
+    version: 2,
     entries: {},
   }
 }
@@ -90,7 +102,7 @@ export function normalizeGhostSuggestionAutoPromotionState(raw: unknown): GhostS
   })
 
   return {
-    version: 1,
+    version: 2,
     entries,
   }
 }
@@ -177,6 +189,41 @@ export function extractGhostSuggestionAutoPromotionTerms(
   return Array.from(terms)
 }
 
+export function directUserLearningChunkFromInputEvent(
+  event: DirectUserInputEventLike,
+): string {
+  if (event.isComposing)
+    return ''
+
+  if (event.inputType === 'insertText')
+    return event.data ?? ''
+
+  if (event.inputType === 'insertLineBreak' || event.inputType === 'insertParagraph')
+    return '\n'
+
+  return ''
+}
+
+export function directUserLearningChunkFromCompositionEvent(
+  event: DirectUserCompositionEventLike,
+): string {
+  return event.data
+}
+
+export function extractDirectUserAuthoredPromotionTerms(
+  authoredText: string,
+  submittedInput: string,
+  existingKeys: string[] = [],
+): string[] {
+  const submittedTerms = new Set(
+    extractGhostSuggestionAutoPromotionTerms(submittedInput, existingKeys)
+      .map(term => term.toLocaleLowerCase()),
+  )
+
+  return extractGhostSuggestionAutoPromotionTerms(authoredText, existingKeys)
+    .filter(term => submittedTerms.has(term.toLocaleLowerCase()))
+}
+
 export function recordGhostSuggestionAutoPromotionAcceptance(
   state: GhostSuggestionAutoPromotionState,
   rawKey: string,
@@ -209,7 +256,7 @@ export function recordGhostSuggestionAutoPromotionAcceptance(
       }
 
   const nextState: GhostSuggestionAutoPromotionState = {
-    version: 1,
+    version: 2,
     entries: {
       ...state.entries,
       [normalizedLookupKey]: entry,
@@ -234,7 +281,7 @@ export function markGhostSuggestionAutoPromotionPromoted(
     return state
 
   return {
-    version: 1,
+    version: 2,
     entries: {
       ...state.entries,
       [key]: {
@@ -275,7 +322,7 @@ export function recordGhostSuggestionAutoPromotionTyping(
       }
 
   return {
-    version: 1,
+    version: 2,
     entries: {
       ...state.entries,
       [normalizedLookupKey]: entry,

@@ -267,6 +267,7 @@ pub struct BrowserMessage {
     pub message_type: String,
     pub message: String,
     pub tab_id: Option<u32>,
+    pub expected_url: Option<String>,
 }
 
 /// 全局消息发送通道
@@ -274,7 +275,11 @@ static BROWSER_TX: once_cell::sync::Lazy<Arc<RwLock<Option<mpsc::Sender<BrowserM
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
 /// 发送消息到浏览器
-pub async fn send_to_browser(message: String) -> Result<()> {
+pub async fn send_to_browser(
+    message: String,
+    tab_id: Option<u32>,
+    expected_url: Option<String>,
+) -> Result<()> {
     log::info!("尝试发送消息到浏览器: {}", message);
 
     // 先尝试通过 channel 发送（主应用进程）
@@ -284,7 +289,8 @@ pub async fn send_to_browser(message: String) -> Result<()> {
             let msg = BrowserMessage {
                 message_type: "send_message".to_string(),
                 message: message.clone(),
-                tab_id: None,
+                tab_id,
+                expected_url: expected_url.clone(),
             };
             log::info!("发送消息通过 channel...");
             match sender.send(msg).await {
@@ -305,11 +311,15 @@ pub async fn send_to_browser(message: String) -> Result<()> {
 
     // 如果 channel 不可用，作为客户端直接连接发送（弹窗进程）
     log::info!("Channel 不可用，尝试作为客户端发送...");
-    send_as_client(message).await
+    send_as_client(message, tab_id, expected_url).await
 }
 
 /// 作为 WebSocket 客户端发送消息（用于弹窗进程）
-async fn send_as_client(message: String) -> Result<()> {
+async fn send_as_client(
+    message: String,
+    tab_id: Option<u32>,
+    expected_url: Option<String>,
+) -> Result<()> {
     use tokio_tungstenite::connect_async;
 
     let token = browser_ws_token_from_config_or_env()?;
@@ -382,6 +392,8 @@ async fn send_as_client(message: String) -> Result<()> {
     let json = serde_json::json!({
         "type": "send_message",
         "message": message,
+        "tabId": tab_id,
+        "expectedUrl": expected_url,
     });
 
     log::info!("发送消息: {}", json);
@@ -592,6 +604,7 @@ async fn handle_connection(
                                         title: data.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                         site_name: data.get("siteName").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
                                         message_preview: ai_response, // 存储 AI 回复内容
+                                        tab_id: data.get("tabId").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()),
                                         timestamp: chrono::Utc::now(),
                                         run_time: data.get("runTime").and_then(|v| v.as_u64()).map(|v| v as u32),
                                         think_time: data.get("thinkTime").and_then(|v| v.as_u64()).map(|v| v as u32),
@@ -609,7 +622,8 @@ async fn handle_connection(
                                         let msg = BrowserMessage {
                                             message_type: "send_message".to_string(),
                                             message: message.to_string(),
-                                            tab_id: None,
+                                            tab_id: data.get("tabId").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()),
+                                            expected_url: data.get("expectedUrl").and_then(|v| v.as_str()).map(str::to_string),
                                         };
                                         // 通过 channel 转发给浏览器扩展连接
                                         let tx = BROWSER_TX.read().await;
@@ -666,6 +680,7 @@ async fn handle_connection(
                         "type": msg.message_type,
                         "message": msg.message,
                         "tabId": msg.tab_id,
+                        "expectedUrl": msg.expected_url,
                     });
                     log::info!("发送消息到浏览器: {}", json);
                     if let Err(e) = write.send(Message::Text(json.to_string())).await {
@@ -738,6 +753,10 @@ mod tests {
         connect_async,
         tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
     };
+
+    /// 这几个测试共用进程全局的 BROWSER_WS_TOKEN_ENV 环境变量和 BROWSER_TX，必须串行。
+    static BROWSER_WS_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
 
     async fn spawn_test_browser_ws_server() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -898,6 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_ws_rejects_web_page_origin_during_handshake() {
+        let _serial = BROWSER_WS_TEST_LOCK.lock().await;
         std::env::set_var(BROWSER_WS_TOKEN_ENV, "test-browser-ws-token");
         let addr = spawn_test_browser_ws_server().await;
         let url = format!("ws://{}", addr);
@@ -918,6 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_ws_unauthenticated_ping_does_not_install_browser_sender() {
+        let _serial = BROWSER_WS_TEST_LOCK.lock().await;
         std::env::set_var(BROWSER_WS_TOKEN_ENV, "test-browser-ws-token");
         let addr = spawn_test_browser_ws_server().await;
         let url = format!("ws://{}", addr);
@@ -946,6 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_ws_authenticated_ping_installs_browser_sender() {
+        let _serial = BROWSER_WS_TEST_LOCK.lock().await;
         let token = "test-browser-ws-token";
         let client_nonce = "client-nonce-123456";
         std::env::set_var(BROWSER_WS_TOKEN_ENV, token);

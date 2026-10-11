@@ -31,6 +31,19 @@ export const functionalColors = {
   info: '#3b82f6',
 }
 
+// Existing monochrome input treatment is intentionally identical in both themes.
+// Keep these separate from surface colors so theme changes do not alter focus styling.
+export const inputColors = {
+  focus: primaryColors[500],
+  hover: primaryColors[400],
+  focusRing: 'rgba(0, 0, 0, 0.1)',
+}
+
+export const interactionColors = {
+  light: { hover: 'rgba(0, 0, 0, 0.09)', pressed: 'rgba(0, 0, 0, 0.13)' },
+  dark: { hover: 'rgba(255, 255, 255, 0.09)', pressed: 'rgba(255, 255, 255, 0.13)' },
+}
+
 // 语义化颜色系统 - 重新定义 UnoCSS 基础颜色
 export const semanticColors = {
   // 重新定义 black/white 让它们适配主题

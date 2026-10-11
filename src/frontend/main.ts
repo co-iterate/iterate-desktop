@@ -104,6 +104,7 @@ async function bootstrap() {
       naiveUi.NButton,
       naiveUi.NCard,
       naiveUi.NCheckbox,
+      naiveUi.NCheckboxGroup,
       naiveUi.NCollapse,
       naiveUi.NCollapseItem,
       naiveUi.NCollapseTransition,

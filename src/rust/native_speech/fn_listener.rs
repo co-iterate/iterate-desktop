@@ -12,6 +12,31 @@ const HEALTH_STARTING: u8 = 0;
 const HEALTH_RUNNING: u8 = 1;
 const HEALTH_DISABLED: u8 = 2;
 const HEALTH_ENDED: u8 = 3;
+const TAP_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const TAP_RESUME_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapRecoveryReason {
+    InvalidPort,
+    DisabledWithoutCallback,
+    ResumeGap,
+}
+
+fn tap_recovery_reason(
+    valid: bool,
+    enabled: bool,
+    elapsed: Option<std::time::Duration>,
+) -> Option<TapRecoveryReason> {
+    if !valid {
+        Some(TapRecoveryReason::InvalidPort)
+    } else if !enabled {
+        Some(TapRecoveryReason::DisabledWithoutCallback)
+    } else if elapsed.is_none_or(|gap| gap >= TAP_RESUME_GAP) {
+        Some(TapRecoveryReason::ResumeGap)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapDisabledReason {
@@ -437,7 +462,15 @@ pub(crate) fn monotonic_us() -> u64 {
 pub fn start_transport(
     sender: Sender<FnListenerEvent>,
 ) -> Result<FnListenerHandle, FnListenerError> {
-    use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+    use core_foundation::base::TCFType;
+    use core_foundation::mach_port::{CFMachPortIsValid, CFMachPortRef};
+    use core_foundation::runloop::{
+        kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult,
+    };
+
+    extern "C" {
+        fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
+    }
     use core_graphics::event::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
         CGEventTapPlacement, CGEventType, CallbackResult, EventField,
@@ -575,8 +608,55 @@ pub fn start_transport(
         thread_health.store(HEALTH_RUNNING, Ordering::Release);
         let _ = startup_sender.send(Ok(actual_location));
 
-        if !thread_stop.load(Ordering::Acquire) {
-            CFRunLoop::run_current();
+        super::debug_log(
+            "[fn-tap-ready]",
+            format!(
+                "location={actual_location:?} health_interval_ms={}",
+                TAP_HEALTH_INTERVAL.as_millis()
+            ),
+        );
+        let mut checked_at = std::time::SystemTime::now();
+        while !thread_stop.load(Ordering::Acquire)
+            && thread_health.load(Ordering::Acquire) == HEALTH_RUNNING
+        {
+            // A disabled/invalid tap need not deliver another callback. Keep the run loop
+            // bounded so the owner can rebuild the transport without restarting the app.
+            let result = CFRunLoop::run_in_mode(
+                unsafe { kCFRunLoopDefaultMode },
+                TAP_HEALTH_INTERVAL,
+                false,
+            );
+            if thread_stop.load(Ordering::Acquire)
+                || thread_health.load(Ordering::Acquire) != HEALTH_RUNNING
+            {
+                break;
+            }
+            let now = std::time::SystemTime::now();
+            let port = tap.mach_port().as_concrete_TypeRef();
+            let valid = unsafe { CFMachPortIsValid(port) != 0 };
+            let enabled = valid && unsafe { CGEventTapIsEnabled(port) };
+            if let Some(reason) =
+                tap_recovery_reason(valid, enabled, now.duration_since(checked_at).ok())
+            {
+                super::debug_log(
+                    "[fn-tap-recovery]",
+                    format!("reason={reason:?} location={actual_location:?}"),
+                );
+                thread_health.store(HEALTH_DISABLED, Ordering::Release);
+                break;
+            }
+            checked_at = now;
+            if matches!(
+                result,
+                CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped
+            ) {
+                super::debug_log("[fn-tap-ended]", format!("run_loop={result:?}"));
+                break;
+            }
+        }
+        current_run_loop.remove_source(&source, unsafe { kCFRunLoopCommonModes });
+        if let Ok(mut shared_run_loop) = thread_run_loop.lock() {
+            *shared_run_loop = None;
         }
         if thread_health.load(Ordering::Acquire) != HEALTH_DISABLED {
             thread_health.store(HEALTH_ENDED, Ordering::Release);
@@ -670,6 +750,38 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tap_health_recovers_without_a_disabled_callback() {
+        use std::time::Duration;
+        assert_eq!(
+            tap_recovery_reason(true, false, Some(Duration::ZERO)),
+            Some(TapRecoveryReason::DisabledWithoutCallback)
+        );
+        assert_eq!(
+            tap_recovery_reason(false, true, Some(Duration::ZERO)),
+            Some(TapRecoveryReason::InvalidPort)
+        );
+    }
+
+    #[test]
+    fn tap_health_rebuilds_after_sleep_or_clock_discontinuity_but_not_idle() {
+        assert_eq!(
+            tap_recovery_reason(true, true, Some(TAP_RESUME_GAP)),
+            Some(TapRecoveryReason::ResumeGap)
+        );
+        assert_eq!(
+            tap_recovery_reason(true, true, None),
+            Some(TapRecoveryReason::ResumeGap)
+        );
+        // No key events for hours is healthy if the run loop keeps checking.
+        for _ in 0..10_000 {
+            assert_eq!(
+                tap_recovery_reason(true, true, Some(TAP_HEALTH_INTERVAL)),
+                None
+            );
+        }
+    }
 
     #[test]
     fn fn_edge_decoder_reports_one_press_and_matching_release() {

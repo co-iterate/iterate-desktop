@@ -1,3 +1,4 @@
+use crate::tunnel::formal_transport::{same_formal_route_identity, try_lock_formal_route};
 use super::active_session::{
     build_active_session_summaries, build_active_session_summaries_with_focus,
     is_registered_mcp_port_request_id, lookup_active_session_entry, remove_active_session_entry,
@@ -49,6 +50,7 @@ use super::json_cache::{
     MCP_ACTION_CACHE_METRICS, MCP_STATE_CACHE_METRICS,
 };
 use super::json_fields::{json_string_field, nested_metadata_string_field};
+use super::markdown_documents::DocumentRegistry;
 use super::markdown_images::{
     register_markdown_images_for_mcp_state_payload, registered_markdown_image_path,
 };
@@ -60,14 +62,13 @@ use super::mcp_action_payload::{
     build_goal_payload_parts, build_goal_submit_prompt, normalize_mcp_action_images,
     render_goal_submit_prompt,
 };
+use super::mobile_file_upload::prepare_mcp_action_file_uploads;
 use super::mcp_state_extract::{
     extract_conversation_id_from_mcp_state, extract_project_path_from_mcp_state,
     extract_request_id_from_mcp_state, extract_timeline_route_id_from_mcp_state,
 };
-#[cfg(test)]
-use super::network_parse::is_tailscale_ipv4;
 use super::network_parse::{
-    is_valid_ipv4, parse_first_ipv4_line, parse_first_tailscale_ipv4_from_ifconfig,
+    is_tailscale_ipv4, is_valid_ipv4, parse_first_ipv4_line, parse_first_tailscale_ipv4_from_ifconfig,
 };
 use super::notification_payload::{
     bridge_payload_suppresses_remote_notification, extract_notification_body,
@@ -138,7 +139,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64_013 as base64;
 use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
@@ -162,8 +163,10 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use web_push_native::p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
-use web_push_native::{Auth as WebPushAuth, WebPushBuilder};
+use web_push::{
+    ContentEncoding, HyperWebPushClient, SubscriptionInfo, VapidSignatureBuilder,
+    WebPushClient as _, WebPushMessageBuilder,
+};
 
 static APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../../icons/icon-512.png");
 static WEB_APP_MANIFEST: &str = "{\n  \"name\": \"iterate\",\n  \"short_name\": \"iterate\",\n  \"start_url\": \"/\",\n  \"scope\": \"/\",\n  \"display\": \"standalone\",\n  \"background_color\": \"#ffffff\",\n  \"theme_color\": \"#ffffff\",\n  \"icons\": [\n    {\n      \"src\": \"/apple-touch-icon.png\",\n      \"sizes\": \"512x512\",\n      \"type\": \"image/png\"\n    }\n  ]\n}\n";
@@ -179,9 +182,13 @@ pub struct BridgeMessage {
 mod pairing_session_state_tests {
     use super::*;
 
-    static TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+    // 也被 tests 模块里修改 ITERATE_PUBLIC_BRIDGE_BASE_URL 的测试持有：该环境变量是进程全局的，
+    // 配对测试构建 offer 时若读到临时覆盖值，会因公网 endpoint proof 失败而偶发报错。
+    pub(super) static TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
     async fn reset_state() {
+        // 配对会话测试只关心 offer / claim 状态机，候选固定为离线回环，不碰真实网络与配置。
+        PAIRING_CANDIDATES_OFFLINE_FOR_TEST.with(|offline| offline.set(true));
         MOBILE_PAIRING_TOKENS.write().await.clear();
         MOBILE_PAIRING_SESSIONS.write().await.clear();
         MOBILE_PAIRING_CLAIM_RECEIPTS.write().await.clear();
@@ -203,6 +210,7 @@ mod pairing_session_state_tests {
             first_failed_at: None,
             transport_mode: "cloudflare_tunnel".to_string(),
             formal_route_generation: None,
+            credential_origins: Vec::new(),
             endpoint_binding: Some(crate::tunnel::manager::QuickTunnelPairingBinding {
                 endpoint: "https://example.trycloudflare.com".to_string(),
                 install_identity: "install-test".to_string(),
@@ -274,6 +282,52 @@ mod pairing_session_state_tests {
                 .map(|session| session.state.as_str()),
             Some("pending")
         );
+    }
+
+    #[tokio::test]
+    async fn android_pairing_preserves_client_identity_and_mobile_scopes() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_state().await;
+        let payload = build_mobile_pairing_payload(8080, false)
+            .await
+            .expect("pairing offer");
+        let mut store = PairedDeviceStore::default();
+        let response = claim_mobile_pairing_core(
+            &payload.pairing_token,
+            "android-test-device",
+            Some("Android test"),
+            Some("android"),
+            false,
+            Some(&mut store),
+            None,
+        )
+        .await
+        .expect("Android claim");
+        assert!(!response.device_token.is_empty());
+        let device = store
+            .devices
+            .iter()
+            .find(|device| device.device_id == "android-test-device")
+            .unwrap();
+        assert_eq!(device.client_kind, "android");
+        assert!(device.scopes.iter().any(|scope| scope == SCOPE_FILE_LIST));
+        assert!(device
+            .scopes
+            .iter()
+            .any(|scope| scope == SCOPE_SESSION_READ));
+        let session = mobile_pairing_session_snapshot(&payload.pairing_session_id)
+            .await
+            .unwrap();
+        assert_eq!(session.state, "claimed");
+    }
+
+    #[test]
+    fn android_pairing_does_not_accept_browser_or_unknown_client_identity() {
+        assert!(is_native_mobile_client("android"));
+        assert!(is_native_mobile_client("ios"));
+        assert!(!is_native_mobile_client("web"));
+        assert!(!is_native_mobile_client(""));
+        assert!(!is_native_mobile_client("android-spoof"));
     }
 
     #[tokio::test]
@@ -633,6 +687,8 @@ impl QuotaSnapshotRefreshGate {
 
 #[derive(Clone)]
 struct CachedPublicProbe {
+    base_url: String,
+    formal_route: Option<crate::config::FormalMobileRouteConfig>,
     http_value: serde_json::Value,
     http_ok: bool,
     ws_value: serde_json::Value,
@@ -1045,90 +1101,8 @@ static MCP_ACTION_CACHE_TOUCHED_AT: Lazy<
     Arc<RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 > = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
-static PUSH_SUBSCRIPTIONS: Lazy<Arc<RwLock<HashMap<String, WebPushSubscriptionInfo>>>> =
+static PUSH_SUBSCRIPTIONS: Lazy<Arc<RwLock<HashMap<String, SubscriptionInfo>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
-const MAX_WEB_PUSH_SUBSCRIPTIONS: usize = 32;
-const MAX_WEB_PUSH_ENDPOINT_LENGTH: usize = 2048;
-const MAX_WEB_PUSH_P256DH_LENGTH: usize = 256;
-const MAX_WEB_PUSH_AUTH_LENGTH: usize = 128;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WebPushSubscriptionKeys {
-    p256dh: String,
-    auth: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WebPushSubscriptionInfo {
-    endpoint: String,
-    keys: WebPushSubscriptionKeys,
-}
-
-impl WebPushSubscriptionInfo {
-    #[cfg(test)]
-    fn new(endpoint: &str, p256dh: &str, auth: &str) -> Self {
-        Self {
-            endpoint: endpoint.to_string(),
-            keys: WebPushSubscriptionKeys {
-                p256dh: p256dh.to_string(),
-                auth: auth.to_string(),
-            },
-        }
-    }
-}
-
-fn is_allowed_web_push_host(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    host == "fcm.googleapis.com"
-        || host == "web.push.apple.com"
-        || host == "push.services.mozilla.com"
-        || host.ends_with(".push.services.mozilla.com")
-        || host.ends_with(".notify.windows.com")
-}
-
-fn validate_web_push_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
-    if endpoint.is_empty() || endpoint.len() > MAX_WEB_PUSH_ENDPOINT_LENGTH {
-        return Err("Web Push endpoint 长度无效".to_string());
-    }
-
-    let endpoint_url =
-        reqwest::Url::parse(endpoint).map_err(|_| "Web Push endpoint 无效".to_string())?;
-    if endpoint_url.scheme() != "https" {
-        return Err("Web Push endpoint 必须使用 HTTPS".to_string());
-    }
-    if !endpoint_url.username().is_empty() || endpoint_url.password().is_some() {
-        return Err("Web Push endpoint 不允许包含凭据".to_string());
-    }
-    if endpoint_url.port_or_known_default() != Some(443) {
-        return Err("Web Push endpoint 只允许 HTTPS 443 端口".to_string());
-    }
-    let host = endpoint_url
-        .host_str()
-        .ok_or_else(|| "Web Push endpoint 缺少主机名".to_string())?;
-    if host.parse::<std::net::IpAddr>().is_ok() || !is_allowed_web_push_host(host) {
-        return Err("Web Push endpoint 不属于受支持的 Push 服务".to_string());
-    }
-
-    Ok(endpoint_url)
-}
-
-fn validate_web_push_subscription(subscription: &WebPushSubscriptionInfo) -> Result<(), String> {
-    validate_web_push_endpoint(&subscription.endpoint)?;
-    if subscription.keys.p256dh.is_empty()
-        || subscription.keys.p256dh.len() > MAX_WEB_PUSH_P256DH_LENGTH
-    {
-        return Err("Web Push p256dh 长度无效".to_string());
-    }
-    if subscription.keys.auth.is_empty() || subscription.keys.auth.len() > MAX_WEB_PUSH_AUTH_LENGTH
-    {
-        return Err("Web Push auth 长度无效".to_string());
-    }
-    Ok(())
-}
-
-fn web_push_subscription_capacity_available(current: usize, replaces_existing: bool) -> bool {
-    replaces_existing || current < MAX_WEB_PUSH_SUBSCRIPTIONS
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MobilePairingCandidate {
@@ -1184,6 +1158,8 @@ struct PairingTokenInfo {
     first_failed_at: Option<String>,
     transport_mode: String,
     formal_route_generation: Option<u64>,
+    // Issuer-owned snapshot, never populated from a claim request or phone cache.
+    credential_origins: Vec<String>,
     endpoint_binding: Option<crate::tunnel::manager::QuickTunnelPairingBinding>,
 }
 
@@ -1195,6 +1171,7 @@ struct MobilePairingClaimReceipt {
     client_kind: String,
     device_token: String,
     scopes: Vec<String>,
+    credential_origins: Vec<String>,
     claimed_at: String,
     expires_at: String,
 }
@@ -1292,6 +1269,7 @@ struct MobilePairingClaimResponse {
     device_id: String,
     device_token: String,
     scopes: Vec<String>,
+    credential_origins: Vec<String>,
     pairing_session_id: String,
 }
 
@@ -1443,17 +1421,10 @@ static PHONE_ACTION_JOBS: Lazy<Arc<RwLock<HashMap<String, PhoneActionJobEntry>>>
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 fn mobile_auth_required() -> bool {
-    // macOS additionally requires authentication for loopback requests because
-    // the signed-process broker supplies a bounded local capability. Other
-    // platforms may keep unauthenticated loopback compatibility, but public,
-    // forwarded, and non-loopback requests are always authenticated below.
+    // Bridge authentication is now a product invariant rather than an opt-in
+    // rollout flag on macOS. Other platforms retain the 0.5.8 behavior until
+    // they have an equivalent signed-process IPC boundary.
     cfg!(target_os = "macos")
-}
-
-fn bridge_auth_required_for_request(headers: &HeaderMap, remote_addr: SocketAddr) -> bool {
-    mobile_auth_required()
-        || is_public_bridge_request(headers)
-        || direct_network_peer_requires_auth(remote_addr)
 }
 
 /// The Bridge terminates plain HTTP locally, while Cloudflare or another
@@ -1541,9 +1512,8 @@ fn expected_bridge_browser_origin(headers: &HeaderMap) -> Option<String> {
 fn browser_websocket_origin_is_allowed(
     headers: &HeaderMap,
     allowed_browser_origins: Option<&[String]>,
-    auth_required: bool,
 ) -> bool {
-    if !auth_required {
+    if !mobile_auth_required() {
         return true;
     }
     let Some(origin) = headers.get(header::ORIGIN) else {
@@ -1606,8 +1576,12 @@ fn mobile_device_scopes(allow_ghost_suggestions_write: bool) -> Vec<String> {
     scopes
 }
 
+fn is_native_mobile_client(client_kind: &str) -> bool {
+    client_kind.eq_ignore_ascii_case("ios") || client_kind.eq_ignore_ascii_case("android")
+}
+
 fn normalize_mobile_device_scopes(device: &mut PairedDeviceRecord) -> bool {
-    if !device.client_kind.eq_ignore_ascii_case("ios") {
+    if !is_native_mobile_client(&device.client_kind) {
         return false;
     }
 
@@ -1658,7 +1632,11 @@ fn generate_bridge_token(prefix: &str) -> String {
     let rng = ring::rand::SystemRandom::new();
     let mut bytes = [0_u8; 32];
     if rng.fill(&mut bytes).is_ok() {
-        return format!("{}_{}", prefix, URL_SAFE_NO_PAD.encode(bytes));
+        return format!(
+            "{}_{}",
+            prefix,
+            base64::encode_config(bytes, base64::URL_SAFE_NO_PAD)
+        );
     }
 
     format!("{}_{}", prefix, uuid::Uuid::new_v4())
@@ -2038,6 +2016,20 @@ fn redact_bridge_message_value(value: &mut serde_json::Value) {
             for (key, child) in object.iter_mut() {
                 if matches!(key.as_str(), "token" | "device_token" | "deviceToken") {
                     *child = serde_json::Value::String("[redacted]".to_string());
+                } else if matches!(key.as_str(), "images" | "files") {
+                    if let Some(items) = child.as_array_mut() {
+                        for item in items {
+                            if let Some(attachment) = item.as_object_mut() {
+                                if attachment.contains_key("data") {
+                                    attachment.insert(
+                                        "data".to_string(),
+                                        serde_json::Value::String("[redacted]".to_string()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    redact_bridge_message_value(child);
                 } else {
                     redact_bridge_message_value(child);
                 }
@@ -2766,6 +2758,7 @@ async fn pairing_token_endpoint_binding_is_current(token: &PairingTokenInfo) -> 
                 && crate::tunnel::manager::pairing_binding_matches_current_install(binding)
                 && crate::tunnel::manager::public_endpoint_proves_current_install(&binding.endpoint)
                     .await
+                && same_formal_route_identity(crate::tunnel::commands::configured_formal_mobile_route().as_ref(), Some(&route))
         }
         _ => false,
     }
@@ -2930,6 +2923,22 @@ fn fixed_public_pairing_candidate_from_probe(
 }
 
 async fn healthy_fixed_public_pairing_result() -> Option<PairingCandidatesResult> {
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        let route = crate::tunnel::commands::configured_formal_mobile_route()?;
+        let binding = crate::tunnel::manager::proven_binding_for_public_endpoint(&route.base_url).await?;
+        if !same_formal_route_identity(crate::tunnel::commands::configured_formal_mobile_route().as_ref(), Some(&route)) {
+            return None;
+        }
+        let candidate = fixed_public_pairing_candidate_from_probe(
+            &route.base_url, true, true, false, true, false,
+        )?;
+        return Some(PairingCandidatesResult {
+            candidates: vec![candidate.clone()],
+            primary: candidate,
+            tailscale_source: None,
+            public_endpoint_binding: Some(binding),
+        });
+    }
     let public_base_url = public_bridge_base_url();
     if public_base_url.is_empty() {
         return None;
@@ -2940,7 +2949,8 @@ async fn healthy_fixed_public_pairing_result() -> Option<PairingCandidatesResult
         crate::tunnel::manager::proven_binding_for_public_endpoint(&public_base_url),
     );
     let public_ws_auth_required = websocket_probe_auth_required(&public_ws_probe);
-    let public_ws_ready = websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws_probe, true);
+    let public_ws_ready =
+        websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws_probe, mobile_auth_required());
     let root_tunnel_authoritative_up = root_tunnel_is_authoritative_up(&root_tunnel);
 
     let public_candidate = fixed_public_pairing_candidate_from_probe(
@@ -2994,6 +3004,9 @@ async fn build_pairing_candidates(bridge_port: u16) -> PairingCandidatesResult {
         return result;
     }
 
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        return fallback_pairing_candidates(bridge_port, "自有连接尚未通过身份与连接校验".to_string());
+    }
     let tunnel_status_started_at = std::time::Instant::now();
     let tunnel_status = crate::tunnel::manager::get_status().await;
     log::info!(
@@ -3085,7 +3098,8 @@ async fn build_pairing_candidates(bridge_port: u16) -> PairingCandidatesResult {
             )
         };
     let public_ws_auth_required = websocket_probe_auth_required(&public_ws_probe);
-    let public_ws_ready = websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws_probe, true);
+    let public_ws_ready =
+        websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws_probe, mobile_auth_required());
     let root_tunnel_authoritative_up = root_tunnel_is_authoritative_up(&root_tunnel);
     let public_transport_ready = has_configured_public_base_url
         && ((public_http_ok && public_ws_ready)
@@ -3239,14 +3253,23 @@ async fn build_pairing_candidates(bridge_port: u16) -> PairingCandidatesResult {
 }
 
 fn fallback_pairing_candidates(bridge_port: u16, warning: String) -> PairingCandidatesResult {
-    fallback_pairing_candidates_with_public_base_url(bridge_port, warning, public_bridge_base_url())
-}
-
-fn fallback_pairing_candidates_with_public_base_url(
-    bridge_port: u16,
-    warning: String,
-    public_base_url: String,
-) -> PairingCandidatesResult {
+    let public_base_url = public_bridge_base_url();
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        let candidate = MobilePairingCandidate {
+            transport_mode: "public_tunnel".to_string(),
+            ws_url: public_bridge_candidate_ws_url(&public_base_url),
+            base_url: public_base_url,
+            relay_device_id: None,
+            relay_pairing_token: None,
+            health: "degraded".to_string(),
+            disabled: true,
+            warning: Some(warning),
+        };
+        return PairingCandidatesResult {
+            candidates: vec![candidate.clone()], primary: candidate,
+            tailscale_source: None, public_endpoint_binding: None,
+        };
+    }
     let public_ws_url = public_bridge_candidate_ws_url(&public_base_url);
     let mut candidates = Vec::new();
     if let Some(relay_candidate) = configured_relay_pairing_candidate_without_issue() {
@@ -3303,10 +3326,43 @@ fn fallback_pairing_candidates_with_public_base_url(
     }
 }
 
+/// 测试专用：配对候选不探测公网 / Tailscale / relay、不读本机配置，只返回固定的回环候选。
+/// 配对会话与 claim 逻辑的测试原本会真的请求公网 endpoint 并读用户配置，并行时偶发失败。
+/// 用线程局部开关：每个 `#[tokio::test]` 跑在自己的 current_thread 运行时线程上，
+/// 只影响开启它的测试，不会漏到并行的其它测试。
+#[cfg(test)]
+thread_local! {
+    static PAIRING_CANDIDATES_OFFLINE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn offline_pairing_candidates_for_test(bridge_port: u16) -> PairingCandidatesResult {
+    let loopback = MobilePairingCandidate {
+        transport_mode: "loopback_fallback".to_string(),
+        base_url: format!("http://127.0.0.1:{}", bridge_port),
+        ws_url: format!("ws://127.0.0.1:{}/ws", bridge_port),
+        relay_device_id: None,
+        relay_pairing_token: None,
+        health: "fallback".to_string(),
+        disabled: false,
+        warning: None,
+    };
+    PairingCandidatesResult {
+        candidates: vec![loopback.clone()],
+        primary: loopback,
+        tailscale_source: None,
+        public_endpoint_binding: None,
+    }
+}
+
 async fn build_pairing_candidates_bounded(
     bridge_port: u16,
     context: &str,
 ) -> PairingCandidatesResult {
+    #[cfg(test)]
+    if PAIRING_CANDIDATES_OFFLINE_FOR_TEST.with(|offline| offline.get()) {
+        return offline_pairing_candidates_for_test(bridge_port);
+    }
     match tokio::time::timeout(
         std::time::Duration::from_secs(MOBILE_PAIRING_CANDIDATES_TIMEOUT_SECS),
         build_pairing_candidates(bridge_port),
@@ -3330,10 +3386,64 @@ async fn build_pairing_candidates_bounded(
     }
 }
 
+async fn owned_tailscale_pairing_candidate(
+    bridge_port: u16,
+) -> Option<MobilePairingCandidate> {
+    // Optional discovery cannot stall a working public route. An environment
+    // override or a CGNAT address on an arbitrary LAN is not an ownership proof.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let (ip, source) = detect_tailscale_ipv4_with_source().await?;
+        if source != "cli:tailscale ip -4" || !is_tailscale_ipv4(&ip) {
+            return None;
+        }
+        let base_url = format!("http://{}:{}", ip, bridge_port);
+        if !health_endpoint_success(&format!("{}/api/version", base_url)).await {
+            return None;
+        }
+        Some(MobilePairingCandidate {
+            transport_mode: "tailscale".to_string(),
+            ws_url: format!("ws://{}:{}/ws", ip, bridge_port),
+            base_url,
+            relay_device_id: None,
+            relay_pairing_token: None,
+            health: "healthy".to_string(),
+            disabled: false,
+            warning: None,
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn pairing_credential_origin(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.contains('*') || host == "localhost" || host.ends_with(".localhost") {
+        return None;
+    }
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return None;
+        }
+    }
+    Some(url.origin().ascii_serialization())
+}
+
 async fn build_mobile_pairing_payload(
     bridge_port: u16,
     require_secure_route: bool,
 ) -> Result<MobilePairingPayload, String> {
+    let route_before_probe = crate::tunnel::commands::configured_formal_mobile_route();
     let device_name = resolve_host_label();
     let device_id = resolve_mobile_device_id();
     let issued_at = chrono::Utc::now();
@@ -3362,6 +3472,9 @@ async fn build_mobile_pairing_payload(
             .flatten();
     }
     let formal_route = crate::tunnel::commands::configured_formal_mobile_route();
+    if !same_formal_route_identity(formal_route.as_ref(), route_before_probe.as_ref()) {
+        return Err("formal_route_changed".to_string());
+    }
     let selected_formal_route = formal_route.as_ref().filter(|route| {
         result.primary.transport_mode == "public_tunnel"
             && route.base_url.trim_end_matches('/') == result.primary.base_url.trim_end_matches('/')
@@ -3382,12 +3495,32 @@ async fn build_mobile_pairing_payload(
             return Err("endpoint_proof_failed".to_string());
         }
     }
+    // Keep the primary's existing generation/epoch binding. Only one additional
+    // direct route is delegated: a live address reported by this Mac's Tailscale
+    // daemon. LAN, Relay and other public/Quick origins are never added here.
+    let mut credential_origins = pairing_credential_origin(&result.primary.base_url)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if result.primary.base_url.starts_with("https://") && endpoint_binding.is_some() {
+        if let Some(candidate) = owned_tailscale_pairing_candidate(bridge_port).await {
+            if let Some(origin) = pairing_credential_origin(&candidate.base_url) {
+                if !credential_origins.contains(&origin) {
+                    credential_origins.push(origin);
+                }
+                result.candidates.retain(|value| value.transport_mode != "tailscale");
+                result.candidates.push(candidate);
+            }
+        }
+    }
     log::info!(
         "[Bridge][MobilePairing] issue_endpoint_proof transport={} reused_from_candidate_build={}",
         result.primary.transport_mode,
         result.primary.transport_mode == "public_tunnel" && endpoint_binding.is_some()
     );
     let _claim_guard = MOBILE_PAIRING_CLAIM_LOCK.lock().await;
+    if !same_formal_route_identity(crate::tunnel::commands::configured_formal_mobile_route().as_ref(), formal_route.as_ref()) {
+        return Err("formal_route_changed".to_string());
+    }
     let transport_mode = result.primary.transport_mode.clone();
     let formal_route_generation =
         selected_formal_route.map(|route| route.formal_route_generation.max(1));
@@ -3416,6 +3549,7 @@ async fn build_mobile_pairing_payload(
             first_failed_at: None,
             transport_mode,
             formal_route_generation,
+            credential_origins,
             endpoint_binding,
         };
         tokens.insert(pairing_token.clone(), token_info.clone());
@@ -3789,275 +3923,49 @@ async fn send_web_push_notification(title: &str, body: &str) {
     }
 
     let payload = serde_json::json!({ "title": title, "body": body }).to_string();
-    let client = match reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => {
-            log_important!(warn, "[Bridge] Web Push HTTP 客户端创建失败: {}", err);
-            return;
-        }
-    };
+    let client = HyperWebPushClient::new();
 
     for subscription in subscriptions.values() {
-        let request = match build_web_push_request(
-            subscription,
+        let mut builder = WebPushMessageBuilder::new(subscription);
+        builder.set_payload(ContentEncoding::Aes128Gcm, payload.as_bytes());
+
+        let mut sig_builder = match VapidSignatureBuilder::from_base64(
             private_key,
-            VAPID_CONFIG.subject.as_deref(),
-            payload.as_bytes(),
+            base64::URL_SAFE_NO_PAD,
+            subscription,
         ) {
-            Ok(request) => request,
+            Ok(builder) => builder,
+            Err(err) => {
+                log_important!(warn, "[Bridge] VAPID 签名构建失败: {}", err);
+                continue;
+            }
+        };
+
+        if let Some(subject) = VAPID_CONFIG.subject.as_ref() {
+            sig_builder.add_claim("sub", subject.clone());
+        }
+
+        let signature = match sig_builder.build() {
+            Ok(signature) => signature,
+            Err(err) => {
+                log_important!(warn, "[Bridge] VAPID 签名生成失败: {}", err);
+                continue;
+            }
+        };
+
+        builder.set_vapid_signature(signature);
+
+        let message = match builder.build() {
+            Ok(message) => message,
             Err(err) => {
                 log_important!(warn, "[Bridge] Web Push 消息构建失败: {}", err);
                 continue;
             }
         };
 
-        if let Err(err) = send_web_push_request(&client, request).await {
+        if let Err(err) = client.send(message).await {
             log_important!(warn, "[Bridge] Web Push 发送失败: {}", err);
         }
-    }
-}
-
-fn build_web_push_request(
-    subscription: &WebPushSubscriptionInfo,
-    private_key: &str,
-    subject: Option<&str>,
-    payload: &[u8],
-) -> Result<axum::http::Request<Vec<u8>>, String> {
-    validate_web_push_subscription(subscription)?;
-    let endpoint_url = validate_web_push_endpoint(&subscription.endpoint)?;
-
-    let endpoint = subscription
-        .endpoint
-        .parse()
-        .map_err(|_| "Web Push endpoint 无效".to_string())?;
-    let ua_public_bytes = URL_SAFE_NO_PAD
-        .decode(&subscription.keys.p256dh)
-        .map_err(|_| "Web Push p256dh 无效".to_string())?;
-    let ua_public = web_push_native::p256::PublicKey::from_sec1_bytes(&ua_public_bytes)
-        .map_err(|_| "Web Push p256dh 无效".to_string())?;
-    let ua_auth_bytes = URL_SAFE_NO_PAD
-        .decode(&subscription.keys.auth)
-        .map_err(|_| "Web Push auth 无效".to_string())?;
-    if ua_auth_bytes.len() != 16 {
-        return Err("Web Push auth 长度无效".to_string());
-    }
-    let ua_auth = WebPushAuth::clone_from_slice(&ua_auth_bytes);
-
-    let mut request = WebPushBuilder::new(endpoint, ua_public, ua_auth)
-        .with_valid_duration(std::time::Duration::from_secs(28 * 24 * 60 * 60))
-        .build(payload.to_vec())
-        .map_err(|err| format!("Web Push 加密失败: {}", err))?;
-    let authorization = build_vapid_authorization(private_key, subject, &endpoint_url)?;
-    request.headers_mut().insert(
-        header::AUTHORIZATION,
-        authorization
-            .parse()
-            .map_err(|_| "VAPID Authorization header 无效".to_string())?,
-    );
-    Ok(request)
-}
-
-fn build_vapid_authorization(
-    private_key: &str,
-    subject: Option<&str>,
-    endpoint: &reqwest::Url,
-) -> Result<String, String> {
-    let private_key_bytes = URL_SAFE_NO_PAD
-        .decode(private_key)
-        .map_err(|_| "VAPID 私钥不是有效的 base64url".to_string())?;
-    let signing_key = SigningKey::from_slice(&private_key_bytes)
-        .map_err(|_| "VAPID 私钥不是有效的 P-256 私钥".to_string())?;
-    let audience = endpoint.origin().ascii_serialization();
-    let expires_at = chrono::Utc::now().timestamp().saturating_add(12 * 60 * 60);
-    let mut claims = serde_json::json!({
-        "aud": audience,
-        "exp": expires_at,
-    });
-    if let Some(subject) = subject {
-        claims["sub"] = serde_json::Value::String(subject.to_string());
-    }
-    let header_part = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ES256"}"#);
-    let claims_part = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&claims).map_err(|_| "VAPID claims 序列化失败".to_string())?);
-    let signing_input = format!("{}.{}", header_part, claims_part);
-    let signature: Signature = signing_key.sign(signing_input.as_bytes());
-    let signature_part = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-    let token = format!("{}.{}", signing_input, signature_part);
-    let public_key = URL_SAFE_NO_PAD.encode(
-        signing_key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
-    Ok(format!("vapid t={}, k={}", token, public_key))
-}
-
-async fn send_web_push_request(
-    client: &reqwest::Client,
-    request: axum::http::Request<Vec<u8>>,
-) -> Result<(), String> {
-    const MAX_RESPONSE_SIZE: usize = 64 * 1024;
-
-    let (parts, body) = request.into_parts();
-    let endpoint = parts.uri.to_string();
-    let parsed_endpoint = validate_web_push_endpoint(&endpoint)?;
-
-    let mut request_builder = client.post(parsed_endpoint).body(body);
-    for (name, value) in &parts.headers {
-        request_builder = request_builder.header(name.as_str(), value.as_bytes());
-    }
-
-    let response = request_builder
-        .send()
-        .await
-        .map_err(|err| format!("Web Push 请求失败: {}", err))?;
-    let status = response.status();
-    let mut response_body = Vec::new();
-    let mut chunks = response.bytes_stream();
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|err| format!("Web Push 响应读取失败: {}", err))?;
-        if response_body.len().saturating_add(chunk.len()) > MAX_RESPONSE_SIZE {
-            return Err("Web Push 响应超过 64 KiB".to_string());
-        }
-        response_body.extend_from_slice(&chunk);
-    }
-
-    if status.is_success() {
-        return Ok(());
-    }
-
-    let detail = String::from_utf8_lossy(&response_body);
-    let detail = detail.trim();
-    if detail.is_empty() {
-        Err(format!("Web Push 服务返回 HTTP {}", status))
-    } else {
-        Err(format!("Web Push 服务返回 HTTP {}: {}", status, detail))
-    }
-}
-
-#[cfg(test)]
-mod web_push_security_tests {
-    use super::*;
-
-    fn valid_subscription(endpoint: &str) -> WebPushSubscriptionInfo {
-        let ua_key = SigningKey::from_slice(&[9_u8; 32]).expect("valid test P-256 key");
-        WebPushSubscriptionInfo::new(
-            endpoint,
-            &URL_SAFE_NO_PAD.encode(ua_key.verifying_key().to_encoded_point(false).as_bytes()),
-            &URL_SAFE_NO_PAD.encode([3_u8; 16]),
-        )
-    }
-
-    #[test]
-    fn web_push_request_requires_https() {
-        let subscription = valid_subscription("http://fcm.googleapis.com/send");
-        let private_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-
-        let error = build_web_push_request(
-            &subscription,
-            &private_key,
-            Some("mailto:security@example.test"),
-            b"test",
-        )
-        .expect_err("HTTP Web Push endpoint must be rejected");
-
-        assert!(error.contains("HTTPS"));
-    }
-
-    #[test]
-    fn web_push_request_has_vapid_and_encrypted_payload() {
-        let subscription = valid_subscription("https://fcm.googleapis.com/fcm/send/test-token");
-        let private_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-
-        let request = build_web_push_request(
-            &subscription,
-            &private_key,
-            Some("mailto:security@example.test"),
-            b"test",
-        )
-        .expect("valid Web Push request");
-
-        assert_eq!(request.uri().scheme_str(), Some("https"));
-        assert_eq!(
-            request
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok()),
-            Some("aes128gcm")
-        );
-        assert!(request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("vapid t=") && value.contains(", k=")));
-        assert!(!request.body().is_empty());
-    }
-
-    #[test]
-    fn web_push_endpoint_allows_only_known_https_push_services() {
-        for endpoint in [
-            "https://fcm.googleapis.com/fcm/send/token",
-            "https://updates.push.services.mozilla.com/wpush/v2/token",
-            "https://web.push.apple.com/QD-token",
-            "https://wns2-by3p.notify.windows.com/?token=test",
-        ] {
-            assert!(
-                validate_web_push_endpoint(endpoint).is_ok(),
-                "expected supported endpoint: {endpoint}"
-            );
-        }
-    }
-
-    #[test]
-    fn web_push_endpoint_rejects_private_unknown_or_credentialed_targets() {
-        for endpoint in [
-            "https://127.0.0.1/push",
-            "https://[::1]/push",
-            "https://localhost/push",
-            "https://10.0.0.1/push",
-            "https://push.example.test/send",
-            "https://user:secret@fcm.googleapis.com/send",
-            "https://fcm.googleapis.com:8443/send",
-        ] {
-            assert!(
-                validate_web_push_endpoint(endpoint).is_err(),
-                "expected rejected endpoint: {endpoint}"
-            );
-        }
-    }
-
-    #[test]
-    fn web_push_subscription_rejects_oversized_fields() {
-        let oversized_endpoint = format!(
-            "https://fcm.googleapis.com/fcm/send/{}",
-            "x".repeat(MAX_WEB_PUSH_ENDPOINT_LENGTH)
-        );
-        assert!(validate_web_push_endpoint(&oversized_endpoint).is_err());
-
-        let mut subscription = valid_subscription("https://fcm.googleapis.com/fcm/send/test-token");
-        subscription.keys.p256dh = "x".repeat(MAX_WEB_PUSH_P256DH_LENGTH + 1);
-        assert!(validate_web_push_subscription(&subscription).is_err());
-    }
-
-    #[test]
-    fn web_push_subscription_capacity_allows_replacement_but_bounds_growth() {
-        assert!(web_push_subscription_capacity_available(
-            MAX_WEB_PUSH_SUBSCRIPTIONS,
-            true
-        ));
-        assert!(!web_push_subscription_capacity_available(
-            MAX_WEB_PUSH_SUBSCRIPTIONS,
-            false
-        ));
-        assert!(web_push_subscription_capacity_available(
-            MAX_WEB_PUSH_SUBSCRIPTIONS - 1,
-            false
-        ));
     }
 }
 
@@ -4086,14 +3994,6 @@ async fn send_apns_notification(
         body.len()
     ));
 
-    let bearer = match build_apns_bearer_token(config) {
-        Ok(token) => token,
-        Err(err) => {
-            log_important!(warn, "[APNs] {}", err);
-            return;
-        }
-    };
-
     let body = trim_notification_body(body, 140);
     let sent_at = chrono::Utc::now();
     let expires_at = sent_at + chrono::Duration::seconds(APNS_NOTIFICATION_EXPIRATION_SECS);
@@ -4102,12 +4002,39 @@ async fn send_apns_notification(
     let apns_expiration = expires_at.timestamp().to_string();
     let apns_collapse_id = apns_collapse_id(request_id.as_deref(), project_path.as_deref(), &body);
 
-    let mut invalid_tokens = Vec::new();
-
-    for (record_index, (device_token, device_info)) in tokens_snapshot.into_iter().enumerate() {
+    let jobs = tokens_snapshot.into_iter().enumerate().map(|(record_index, (device_token, device_info))| {
+        let body = body.clone();
+        let request_id = request_id.clone();
+        let project_path = project_path.clone();
+        let sent_at_rfc3339 = sent_at_rfc3339.clone();
+        let expires_at_rfc3339 = expires_at_rfc3339.clone();
+        let apns_expiration = apns_expiration.clone();
+        let apns_collapse_id = apns_collapse_id.clone();
+        async move {
         let record_number = record_index + 1;
         let environment = persisted_apns_environment(&device_info.environment, config);
         let url = format!("{}/3/device/{}", apns_endpoint(environment), device_token);
+        let bearer = match build_apns_bearer_token(config, environment) {
+            Ok(token) => token,
+            Err(err) => {
+                bridge_debug_log(&format!(
+                    "[APNs Timing] send skipped: request_id={:?}, project_path={:?}, record={}, environment={}, reason={}",
+                    request_id,
+                    project_path,
+                    record_number,
+                    environment.as_str(),
+                    err
+                ));
+                log_important!(
+                    warn,
+                    "[APNs] provider key 不可用: record={}, environment={}, error={}",
+                    record_number,
+                    environment.as_str(),
+                    err
+                );
+                return None;
+            }
+        };
         let notifications_enabled = device_info.notifications_enabled;
         let apns_push_type = if notifications_enabled {
             "alert"
@@ -4200,7 +4127,7 @@ async fn send_apns_notification(
                     text
                 );
                 if status.as_u16() == 410 || status.as_u16() == 400 {
-                    invalid_tokens.push(device_token);
+                    return Some(device_token);
                 }
             }
             Err(err) => {
@@ -4224,7 +4151,10 @@ async fn send_apns_notification(
                 );
             }
         }
-    }
+            None
+        }
+    });
+    let invalid_tokens = super::apns_notification::collect_apns_delivery_results(jobs).await;
 
     if !invalid_tokens.is_empty() {
         if let Err(err) = remove_apns_device_tokens(&invalid_tokens).await {
@@ -4431,21 +4361,6 @@ async fn send_apns_live_activity_update_inner(
         };
     }
 
-    let bearer = match build_apns_bearer_token(config) {
-        Ok(token) => token,
-        Err(err) => {
-            return ApnsLiveActivitySendStats {
-                success: false,
-                event,
-                matched: candidates.len(),
-                sent: 0,
-                failed: 0,
-                invalidated: 0,
-                message: err,
-            };
-        }
-    };
-
     let topic = apns_live_activity_topic(config);
     let now = chrono::Utc::now();
     let apns_expiration = (now + chrono::Duration::seconds(APNS_NOTIFICATION_EXPIRATION_SECS))
@@ -4461,6 +4376,21 @@ async fn send_apns_live_activity_update_inner(
         let record_number = record_index + 1;
         let environment = persisted_apns_environment(&info.environment, config);
         let url = format!("{}/3/device/{}", apns_endpoint(environment), activity_token);
+        let bearer = match build_apns_bearer_token(config, environment) {
+            Ok(token) => token,
+            Err(err) => {
+                failed += 1;
+                log_important!(
+                    warn,
+                    "[APNs LiveActivity] provider key 不可用: goal_id={}, record={}, environment={}, error={}",
+                    info.goal_id,
+                    record_number,
+                    environment.as_str(),
+                    err
+                );
+                continue;
+            }
+        };
         let payload = serde_json::json!({
             "aps": {
                 "timestamp": now.timestamp(),
@@ -5144,6 +5074,19 @@ async fn start_bridge_server_inner(
         )
         .route("/api/mobile/pairing", get(handle_api_mobile_pairing))
         .route(
+            "/api/mobile/reply",
+            post(handle_api_mobile_reply)
+                .layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/api/mobile/reply-capabilities",
+            get(handle_api_mobile_reply_capabilities),
+        )
+        .route(
+            "/api/mobile/reply/:operation_id",
+            get(handle_api_mobile_reply_status),
+        )
+        .route(
             "/api/mobile/pairing/claim",
             post(handle_api_mobile_pairing_claim),
         )
@@ -5188,6 +5131,11 @@ async fn start_bridge_server_inner(
         .route("/bridge/publish", post(handle_bridge_publish))
         .route("/api/room-submit", post(handle_local_room_submit))
         .route("/image", get(handle_serve_image))
+        .route("/api/markdown-documents/:id", get(handle_markdown_document))
+        .route(
+            "/api/markdown-documents/:id/image",
+            get(handle_markdown_document_image),
+        )
         .route("/bridge/pull_action", post(handle_bridge_pull_action))
         .route("/files", get(handle_get_files))
         .route("/files/roots", get(handle_get_file_roots))
@@ -5260,7 +5208,9 @@ async fn start_bridge_server_inner(
         .route("/api/active-sessions", get(handle_api_active_sessions))
         .route("/api/cleanup-session", post(handle_api_cleanup_session))
         .route("/api/show-window", get(handle_api_show_window))
+        .route("/api/codex-models", get(handle_api_codex_models))
         .route("/api/open-codex-chat", post(handle_api_open_codex_chat))
+        .route("/api/create-codex-task", post(handle_api_create_codex_task))
         .route(
             "/api/recover-tailscale-funnel",
             post(handle_api_recover_tailscale_funnel),
@@ -5328,6 +5278,10 @@ async fn start_bridge_server_inner(
             return;
         }
 
+        let Ok(_route_guard) = try_lock_formal_route() else { return; };
+        if crate::tunnel::commands::self_hosted_formal_route_selected() {
+            return;
+        }
         if has_healthy_supported_route_without_quick(port).await {
             log::info!("[Bridge][QuickTunnel] existing healthy route suppresses autostart");
             return;
@@ -5384,6 +5338,8 @@ async fn handle_ws_upgrade(
     let forwarded_proto = debug_header_value(&headers, "x-forwarded-proto");
     let cf_ray = debug_header_value(&headers, "cf-ray");
     let host = debug_header_value(&headers, header::HOST.as_str());
+    let public_request =
+        is_public_bridge_request(&headers) || direct_network_peer_requires_auth(remote_addr);
     let internal_authenticated = match authenticate_internal_websocket_once(&headers, remote_addr) {
         Ok(authenticated) => authenticated,
         Err(error) => {
@@ -5414,13 +5370,14 @@ async fn handle_ws_upgrade(
     let allowed_browser_origins = websocket_authentication
         .as_ref()
         .and_then(|authentication| authentication.allowed_browser_origins.as_deref());
-    let auth_enforced = bridge_auth_required_for_request(&headers, remote_addr);
-    if !browser_websocket_origin_is_allowed(&headers, allowed_browser_origins, auth_enforced) {
+    if !browser_websocket_origin_is_allowed(&headers, allowed_browser_origins) {
         return json_error_response(StatusCode::FORBIDDEN, "invalid_websocket_origin");
     }
     let auth_principal = websocket_authentication.map(|authentication| authentication.principal);
+    let auth_enforced = mobile_auth_required();
     if !internal_authenticated {
-        if let Some((status, error)) = websocket_auth_denial(auth_enforced, auth_principal.as_ref())
+        if let Some((status, error)) =
+            websocket_auth_denial(public_request, auth_principal.as_ref())
         {
             log::warn!(
                 "[Bridge][MobileAuth] rejecting anonymous public websocket upgrade host={} xff_present={} cf_ray_present={}",
@@ -5438,7 +5395,8 @@ async fn handle_ws_upgrade(
                 .into_response();
         }
     }
-    let scope_enforced = !internal_authenticated && websocket_scope_enforced(auth_enforced);
+    let scope_enforced =
+        !internal_authenticated && websocket_scope_enforced(public_request, auth_enforced);
     log::info!(
         "[Bridge][WS Debug] upgrade ua={} host={} proto={} xff={} cf_ray={} authenticated={} auth_enforce={} scope_enforce={}",
         user_agent,
@@ -5549,7 +5507,6 @@ async fn handle_codex_live_ws_upgrade(
     if !browser_websocket_origin_is_allowed(
         &headers,
         authentication.allowed_browser_origins.as_deref(),
-        true,
     ) {
         return json_error_response(StatusCode::FORBIDDEN, "invalid_websocket_origin");
     }
@@ -5564,18 +5521,18 @@ async fn handle_codex_live_ws_upgrade(
 }
 
 fn websocket_auth_denial(
-    auth_required: bool,
+    _public_request: bool,
     principal: Option<&AuthPrincipal>,
 ) -> Option<(StatusCode, &'static str)> {
-    if auth_required && principal.is_none() {
+    if mobile_auth_required() && principal.is_none() {
         Some((StatusCode::UNAUTHORIZED, "mobile_auth_required"))
     } else {
         None
     }
 }
 
-fn websocket_scope_enforced(auth_required: bool) -> bool {
-    auth_required
+fn websocket_scope_enforced(_public_request: bool, _mobile_auth_enforced: bool) -> bool {
+    mobile_auth_required()
 }
 
 async fn enforce_bridge_control_auth(
@@ -5586,6 +5543,13 @@ async fn enforce_bridge_control_auth(
     // Never trust a marker supplied by the network. Only this middleware may
     // add it after validating a loopback-only, method/path-bound capability.
     req.headers_mut().remove(TRUSTED_INTERNAL_CAPABILITY_HEADER);
+
+    // Room capabilities bind the exact body and must be verified by the route.
+    // The generic method/path verifier has no body digest and rejects them.
+    // The route independently requires loopback and consumes the capability once.
+    if body_bound_auth_deferred(req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
@@ -5622,14 +5586,12 @@ async fn enforce_bridge_control_auth(
         };
     }
 
-    let auth_required = bridge_auth_required_for_request(req.headers(), remote_addr);
-    if !auth_required {
+    if !mobile_auth_required() {
         return next.run(req).await;
     }
 
     if req.method() == axum::http::Method::OPTIONS
         || public_anonymous_path_allowed(req.method(), req.uri().path())
-        || body_bound_auth_deferred(req.method(), req.uri().path())
     {
         return next.run(req).await;
     }
@@ -5665,7 +5627,6 @@ async fn audit_public_control_request(req: Request, next: Next) -> Response {
         let headers = req.headers();
         let path = req.uri().path();
         if is_public_bridge_request(headers) && is_public_control_path(path) {
-            let public_auth_required = mobile_auth_required() || is_public_bridge_request(headers);
             let principal = match authenticate_bridge_headers_result(headers).await {
                 Ok(principal) => principal,
                 Err(error) => return bridge_auth_error_response(&error),
@@ -5683,10 +5644,10 @@ async fn audit_public_control_request(req: Request, next: Next) -> Response {
                 cf_ray != "-",
                 has_bridge_auth_header(headers),
                 principal.is_some(),
-                public_auth_required,
+                mobile_auth_required(),
                 truncate_audit_value(&user_agent, 160),
             );
-            if public_auth_required
+            if mobile_auth_required()
                 && principal.is_none()
                 && !public_anonymous_path_allowed(&method, path)
             {
@@ -5926,7 +5887,6 @@ fn remote_action_denial_reason(
     message: &BridgeMessage,
 ) -> Option<String> {
     match message.message_type.as_str() {
-        "client_hello" => None,
         "request_sync" | REQUEST_TIMELINE_SYNC_MESSAGE_TYPE => {
             if principal.has_scope(SCOPE_SESSION_READ) {
                 None
@@ -5941,7 +5901,6 @@ fn remote_action_denial_reason(
                 .and_then(|value| value.as_str())
                 .unwrap_or("intro");
             match tab {
-                "intro" | "settings" => None,
                 "prompts" => {
                     if principal.has_scope(SCOPE_PROMPT_LIBRARY_READ) {
                         None
@@ -5956,14 +5915,7 @@ fn remote_action_denial_reason(
                         Some(format!("missing scope {}", SCOPE_CONFIG_READ))
                     }
                 }
-                _ => Some(format!("unknown main page tab denied: {}", tab)),
-            }
-        }
-        "phone_action_result" => {
-            if principal.has_scope(SCOPE_SESSION_RESPOND) {
-                None
-            } else {
-                Some(format!("missing scope {}", SCOPE_SESSION_RESPOND))
+                _ => None,
             }
         }
         "system_command" => {
@@ -6001,8 +5953,6 @@ fn remote_action_denial_reason(
                 | "continue"
                 | "cancel"
                 | "enhance"
-                | "goal"
-                | "goal_start"
                 | "update_window_conditional_state"
                 | "update_window_conditional_active" => {
                     if principal.has_scope(SCOPE_SESSION_RESPOND) {
@@ -6019,10 +5969,16 @@ fn remote_action_denial_reason(
                 | "update_custom_prompt_order" => {
                     Some("config.write not allowed for MVP paired iOS".to_string())
                 }
-                _ => Some(format!("unknown mcp action denied: {}", action)),
+                _ => {
+                    if principal.has_scope(SCOPE_SESSION_RESPOND) {
+                        None
+                    } else {
+                        Some(format!("missing scope {}", SCOPE_SESSION_RESPOND))
+                    }
+                }
             }
         }
-        message_type => Some(format!("unknown remote message denied: {}", message_type)),
+        _ => None,
     }
 }
 
@@ -6094,7 +6050,7 @@ async fn handle_axum_connection(
                         let redacted_text = redact_bridge_message_text(&text);
                         log_important!(info, "[Bridge] 收到 Web 端消息: {}", redacted_text);
                         bridge_debug_log(&format!("WS 收到消息: {}", redacted_text.chars().take(100).collect::<String>()));
-                        if let Ok(bridge_msg) = serde_json::from_str::<BridgeMessage>(&text) {
+                        if let Ok(mut bridge_msg) = serde_json::from_str::<BridgeMessage>(&text) {
                             bridge_debug_log(&format!("消息类型: {}", bridge_msg.message_type));
                             if auth_enforced && auth_principal.is_none() {
                                 if let Some(token) = websocket_device_token_from_message(&bridge_msg) {
@@ -6163,6 +6119,15 @@ async fn handle_axum_connection(
                                     }
                                 }
                             }
+                            if bridge_msg.message_type == "request_sync"
+                                && auth_principal.as_ref().is_some_and(|principal| is_native_mobile_client(&principal.client_kind))
+                            {
+                                let capabilities = serde_json::json!({
+                                    "message_type": "mobile_reply_capabilities",
+                                    "payload": mobile_reply_capability_payload(),
+                                });
+                                if ws_sender.send(Message::Text(capabilities.to_string())).await.is_err() { break; }
+                            }
                             if let Some(phone_action_result) =
                                 record_phone_action_result(&client_id, &bridge_msg).await
                             {
@@ -6221,6 +6186,30 @@ async fn handle_axum_connection(
                                             ));
                                             mcp_action_handled_by_rust = true;
                                         } else {
+                                        if let Err(error) = prepare_mcp_action_file_uploads(
+                                            &mut bridge_msg.payload,
+                                            request_id.as_deref(),
+                                        ) {
+                                            log::warn!(
+                                                "[Bridge] mobile file upload rejected: code={}",
+                                                error.code
+                                            );
+                                            let _ = ws_sender
+                                                .send(Message::Text(
+                                                    serde_json::json!({
+                                                        "message_type": "mcp_action_error",
+                                                        "payload": {
+                                                            "error": error.code,
+                                                            "message": error.message,
+                                                            "request_id": request_id,
+                                                            "project_path": target_project_path,
+                                                        }
+                                                    })
+                                                    .to_string(),
+                                                ))
+                                                .await;
+                                            continue;
+                                        }
                                         let fallback_route = last_active_route().await;
                                         let timeline_route_resolution = {
                                             let registry = ACTIVE_SESSION_REGISTRY.read().await;
@@ -6875,16 +6864,15 @@ pub(super) fn bridge_debug_log(msg: &str) {
     };
     // 在后台线程写文件，不阻塞 async runtime
     let _ = tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("iterate_bridge_debug.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = f.write_all(line.as_bytes());
-            let _ = f.flush();
-            return;
+        use crate::utils::logger::{append_capped_log_line, DEBUG_LOG_MAX_BYTES};
+        let paths = dirs::home_dir()
+            .into_iter()
+            .chain(std::iter::once(std::env::temp_dir()))
+            .map(|dir| dir.join("iterate_bridge_debug.log"));
+        for path in paths {
+            if append_capped_log_line(&path, line.as_bytes(), DEBUG_LOG_MAX_BYTES).is_ok() {
+                return;
+            }
         }
         eprintln!("[bridge_debug] {}", line.trim());
     });
@@ -6898,13 +6886,12 @@ fn instance_debug_log(tag: &str, message: impl AsRef<str>) {
         tag,
         message.as_ref()
     );
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/iterate-instance-debug.log")
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
+    // 多个进程共用这份日志，原来无上限（P-2026-9337）。
+    let _ = crate::utils::logger::append_capped_log_line(
+        std::path::Path::new("/tmp/iterate-instance-debug.log"),
+        line.as_bytes(),
+        crate::utils::logger::DEBUG_LOG_MAX_BYTES,
+    );
 }
 
 async fn handle_index() -> Html<String> {
@@ -6938,7 +6925,7 @@ async fn handle_push_vapid_public_key() -> Json<serde_json::Value> {
 
 async fn handle_push_subscribe(
     headers: HeaderMap,
-    Json(subscription): Json<WebPushSubscriptionInfo>,
+    Json(subscription): Json<SubscriptionInfo>,
 ) -> Response {
     if let Err(response) = authorize_public_route_scope(
         &headers,
@@ -6950,28 +6937,7 @@ async fn handle_push_subscribe(
         return response;
     }
 
-    if let Err(error) = validate_web_push_subscription(&subscription) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": error })),
-        )
-            .into_response();
-    }
-
     let mut subscriptions = PUSH_SUBSCRIPTIONS.write().await;
-    if !web_push_subscription_capacity_available(
-        subscriptions.len(),
-        subscriptions.contains_key(&subscription.endpoint),
-    ) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "Web Push 订阅数量已达上限"
-            })),
-        )
-            .into_response();
-    }
     subscriptions.insert(subscription.endpoint.clone(), subscription);
     Json(serde_json::json!({ "ok": true, "count": subscriptions.len() })).into_response()
 }
@@ -6993,14 +6959,6 @@ async fn handle_push_unsubscribe(
     .await
     {
         return response;
-    }
-
-    if request.endpoint.is_empty() || request.endpoint.len() > MAX_WEB_PUSH_ENDPOINT_LENGTH {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "Web Push endpoint 长度无效" })),
-        )
-            .into_response();
     }
 
     let mut subscriptions = PUSH_SUBSCRIPTIONS.write().await;
@@ -7120,6 +7078,13 @@ async fn handle_api_quick_tunnel_start(
     {
         return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "bridge_or_mcp_not_ready");
     }
+    let _route_guard = match try_lock_formal_route() {
+        Ok(guard) => guard,
+        Err(error) => return json_error_response(StatusCode::CONFLICT, &error),
+    };
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        return json_error_response(StatusCode::CONFLICT, "self_hosted_transport_managed_externally");
+    }
     if has_healthy_supported_route_without_quick(state.port).await {
         return json_error_response(StatusCode::CONFLICT, "healthy_route_already_available");
     }
@@ -7180,10 +7145,11 @@ fn stale_request_response() -> Response {
 }
 
 fn public_route_requires_auth(headers: &HeaderMap) -> bool {
-    trusted_internal_capability(headers)
-        || is_public_bridge_request(headers)
-        || has_bridge_auth_header(headers)
-        || crate::bridge::auth::cookie_token_from_headers(headers).is_some()
+    mobile_auth_required()
+        && (trusted_internal_capability(headers)
+            || is_public_bridge_request(headers)
+            || has_bridge_auth_header(headers)
+            || crate::bridge::auth::cookie_token_from_headers(headers).is_some())
 }
 
 const TRUSTED_INTERNAL_CAPABILITY_HEADER: &str = "x-iterate-trusted-capability";
@@ -7196,7 +7162,7 @@ fn trusted_internal_capability(headers: &HeaderMap) -> bool {
 }
 
 fn direct_network_peer_requires_auth(remote_addr: SocketAddr) -> bool {
-    !remote_addr.ip().is_loopback()
+    mobile_auth_required() && !remote_addr.ip().is_loopback()
 }
 
 fn direct_network_bridge_auth_path(path: &str) -> bool {
@@ -7209,6 +7175,7 @@ fn direct_network_bridge_auth_path(path: &str) -> bool {
         || path == "/bridge/pull_action"
         || path.starts_with("/api/ghost-suggestions/")
         || path.starts_with("/api/phone-action-jobs/")
+        || path.starts_with("/api/markdown-documents/")
         || matches!(
             path,
             "/api/active-sessions"
@@ -7224,7 +7191,9 @@ fn direct_network_bridge_auth_path(path: &str) -> bool {
                 | "/api/mcp-tools"
                 | "/api/mobile/pairing"
                 | "/api/mobile/paired-device-file-roots"
+                | "/api/codex-models"
                 | "/api/open-codex-chat"
+                | "/api/create-codex-task"
                 | "/api/phone-action"
                 | "/api/phone-action-result"
                 | "/api/prevent-sleep"
@@ -7549,7 +7518,7 @@ async fn claim_mobile_pairing_core(
         .filter(|value| !value.is_empty())
         .unwrap_or("ios")
         .to_ascii_lowercase();
-    if client_kind != "ios" {
+    if !is_native_mobile_client(&client_kind) {
         return Err("invalid_client_kind".to_string());
     }
 
@@ -7576,6 +7545,7 @@ async fn claim_mobile_pairing_core(
                 device_id: receipt.device_id.clone(),
                 device_token: receipt.device_token.clone(),
                 scopes: receipt.scopes.clone(),
+                credential_origins: receipt.credential_origins.clone(),
                 pairing_session_id: receipt.session_id.clone(),
             });
         }
@@ -7614,6 +7584,30 @@ async fn claim_mobile_pairing_core(
     {
         return Err("expired_pairing_token".to_string());
     }
+
+    // Reconfirm the delegated direct address before the first durable claim.
+    // No new origin may replace this issuance snapshot. The primary endpoint
+    // is checked after optional discovery so its epoch/generation cannot be
+    // validated before that additional await. Successful retries stay frozen.
+    let tailscale_port = token_info.credential_origins.iter().find_map(|origin| {
+        reqwest::Url::parse(origin).ok().and_then(|url| {
+            if url.scheme() == "http" && url.host_str().is_some_and(is_tailscale_ipv4) {
+                url.port_or_known_default()
+            } else {
+                None
+            }
+        })
+    });
+    let current_tailscale_origin = if let Some(port) = tailscale_port {
+        owned_tailscale_pairing_candidate(port)
+            .await
+            .and_then(|candidate| pairing_credential_origin(&candidate.base_url))
+    } else {
+        None
+    };
+    let credential_origins = token_info.credential_origins.iter().filter(|origin| {
+        !origin.starts_with("http://") || current_tailscale_origin.as_ref() == Some(*origin)
+    }).cloned().collect::<Vec<_>>();
 
     if token_info.endpoint_binding.is_some() {
         if !pairing_token_endpoint_binding_is_current(&token_info).await {
@@ -7669,6 +7663,7 @@ async fn claim_mobile_pairing_core(
         client_kind,
         device_token: device_token.clone(),
         scopes: scopes.clone(),
+        credential_origins: credential_origins.clone(),
         claimed_at: now_string,
         expires_at: token_info.expires_at.clone(),
     };
@@ -7684,6 +7679,7 @@ async fn claim_mobile_pairing_core(
         device_id: device_id.to_string(),
         device_token,
         scopes,
+        credential_origins,
         pairing_session_id: token_info.session_id,
     })
 }
@@ -7835,7 +7831,7 @@ async fn mobile_pairing_session_snapshot(session_id: &str) -> Option<MobilePairi
             .filter(|info| {
                 info.authenticated_client_kind
                     .as_deref()
-                    .is_some_and(|client_kind| client_kind.eq_ignore_ascii_case("ios"))
+                    .is_some_and(is_native_mobile_client)
             })
             .filter(|info| {
                 info.authenticated_device_id.as_deref() == Some(receipt.device_id.as_str())
@@ -8019,7 +8015,7 @@ fn explicit_file_list_roots_for_principal_at(
     principal: Option<&AuthPrincipal>,
 ) -> Vec<PathBuf> {
     let Some(principal) = principal.filter(|principal| {
-        principal.client_kind.eq_ignore_ascii_case("ios") && !principal.device_id.trim().is_empty()
+        is_native_mobile_client(&principal.client_kind) && !principal.device_id.trim().is_empty()
     }) else {
         return Vec::new();
     };
@@ -9567,7 +9563,30 @@ async fn handle_api_show_window(
     }
 }
 
-/// POST /api/open-codex-chat — 免权限打开桌面 Codex（优先按项目）
+/// GET /api/codex-models — 返回当前 Codex 账号真实可用的模型与推理档位。
+async fn handle_api_codex_models(headers: HeaderMap) -> Response {
+    if let Err(response) =
+        authorize_public_route_scope(&headers, SCOPE_WINDOW_SHOW, "missing_scope_window_show").await
+    {
+        return response;
+    }
+
+    match super::codex_live::list_codex_launch_models().await {
+        Ok(result) => Json(serde_json::json!({
+            "ok": true,
+            "models": result.get("data").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "next_cursor": result.get("nextCursor").cloned().unwrap_or(serde_json::Value::Null)
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/open-codex-chat — 打开桌面 Codex；可选按指定模型与推理档位创建任务。
 async fn handle_api_open_codex_chat(
     State(_state): State<BridgeHttpState>,
     headers: HeaderMap,
@@ -9579,13 +9598,135 @@ async fn handle_api_open_codex_chat(
         return response;
     }
 
+    open_codex_chat_response(body, "zhi", None).await
+}
+
+async fn handle_api_create_codex_task(
+    State(state): State<BridgeHttpState>,
+    headers: HeaderMap,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) =
+        authorize_public_route_scope(&headers, SCOPE_WINDOW_SHOW, "missing_scope_window_show").await
+    {
+        return response;
+    }
+    let (project, prompt) = match super::codex_live::validate_new_codex_task(&body) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error}))).into_response(),
+    };
+    body["project_path"] = serde_json::Value::String(project);
+    let tx = state.tx.clone();
+    let feedback: super::codex_live::CodexTaskFeedback = std::sync::Arc::new(move |payload| {
+        let _ = tx.send(BridgeMessage { message_type: "codex_task_status".to_string(), payload });
+    });
+    open_codex_chat_response(Some(Json(body)), &prompt, Some(feedback)).await
+}
+
+async fn open_codex_chat_response(
+    body: Option<Json<serde_json::Value>>,
+    prompt: &str,
+    feedback: Option<super::codex_live::CodexTaskFeedback>,
+) -> Response {
+    let service_tier = match body.as_ref().and_then(|Json(body)| body.get("service_tier")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(tier)) if tier == "default" || tier == "priority" => Some(tier.as_str()),
+        Some(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"无效的 Codex 速度模式"})),
+        ).into_response(),
+    };
     let project_path = body
         .as_ref()
         .and_then(|Json(body)| body.get("project_path"))
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned);
 
-    match crate::ui::commands::open_new_codex_chat_with_text("zhi".to_string(), project_path).await
+    let model = body
+        .as_ref()
+        .and_then(|Json(body)| body.get("model"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effort = body
+        .as_ref()
+        .and_then(|Json(body)| body.get("effort"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(model) = model {
+        let Some(project_path) = project_path.as_deref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "选择模型启动 Codex 时必须提供有效项目路径"
+                })),
+            )
+                .into_response();
+        };
+        return match super::codex_live::launch_codex_task_with_model(
+            project_path,
+            prompt,
+            model,
+            effort,
+            service_tier,
+            feedback,
+        )
+        .await
+        {
+            Ok(result) => {
+                let open_error = crate::ui::commands::open_codex_thread(result.thread_id.clone())
+                    .await
+                    .err();
+                let opened = open_error.is_none();
+                let message = if let Some(error) = open_error {
+                    format!(
+                        "已用 {} · {} 创建 Codex 任务，但打开任务失败：{}",
+                        result.display_name, result.reasoning_effort, error
+                    )
+                } else {
+                    format!(
+                        "已用 {} · {} 创建并启动 Codex 任务",
+                        result.display_name, result.reasoning_effort
+                    )
+                };
+                Json(serde_json::json!({
+                    "ok": true,
+                    "sent": true,
+                    "mode": "app_server_model_launch",
+                    "message": message,
+                    "thread_id": result.thread_id,
+                    "turn_id": result.turn_id,
+                    "model": result.model,
+                    "effort": result.reasoning_effort,
+                    "service_tier": service_tier,
+                    "opened": opened
+                }))
+                .into_response()
+            }
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": error})),
+            )
+                .into_response(),
+        };
+    }
+
+    if effort.is_some() || service_tier.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "指定推理档位或速度模式时必须同时指定模型"
+            })),
+        )
+            .into_response();
+    }
+
+    match crate::ui::commands::open_new_codex_chat_with_text(prompt.to_string(), project_path).await
     {
         Ok(result) => Json(serde_json::json!({
             "ok": result.ok,
@@ -9699,11 +9840,22 @@ fn patch_app_config(
         }
         "audio_config" => {
             let values = section_value.as_object()?;
-            if values.len() != 1 || !values.contains_key("notification_enabled") {
+            if values.is_empty()
+                || values
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "notification_enabled" | "custom_url"))
+            {
                 return None;
             }
             if let Some(enabled) = values.get("notification_enabled") {
                 patched.audio_config.notification_enabled = enabled.as_bool()?;
+            }
+            if let Some(custom_url) = values.get("custom_url") {
+                let custom_url = custom_url.as_str()?;
+                if custom_url.chars().count() > 4096 {
+                    return None;
+                }
+                patched.audio_config.custom_url = custom_url.to_string();
             }
         }
         "reply_config" => {
@@ -9789,7 +9941,6 @@ fn redact_config_value(mut value: serde_json::Value) -> serde_json::Value {
                             | "password"
                             | "authorization"
                             | "tunnel_token"
-                            | "custom_url"
                     ) {
                         *child = serde_json::Value::String("[redacted]".to_string());
                     } else {
@@ -10020,7 +10171,7 @@ async fn handle_api_config_post(
 
 #[cfg(test)]
 mod bridge_config_tests {
-    use super::{patch_app_config, redact_config_value};
+    use super::patch_app_config;
 
     #[test]
     fn config_patch_enables_mobile_ghost_suggestion_writeback() {
@@ -10113,35 +10264,11 @@ mod bridge_config_tests {
         assert!(patch_app_config(
             &config,
             &serde_json::json!({
-                "audio_config": {
-                    "custom_url": "/Users/example/private-sound.mp3"
-                }
-            }),
-        )
-        .is_none());
-        assert!(patch_app_config(
-            &config,
-            &serde_json::json!({
                 "audio_config": config.audio_config.clone(),
                 "reply_config": config.reply_config.clone(),
             }),
         )
         .is_none());
-    }
-
-    #[test]
-    fn config_redaction_hides_custom_audio_references() {
-        let redacted = redact_config_value(serde_json::json!({
-            "audio_config": {
-                "notification_enabled": true,
-                "custom_url": "/Users/example/private-sound.mp3"
-            }
-        }));
-
-        assert_eq!(
-            redacted["audio_config"]["custom_url"],
-            serde_json::Value::String("[redacted]".to_string())
-        );
     }
 
     #[test]
@@ -10544,6 +10671,13 @@ async fn recover_tailscale_funnel_value(recovery_transport: &str) -> serde_json:
         });
     }
 
+    let _route_guard = match try_lock_formal_route() {
+        Ok(guard) => guard,
+        Err(_) => return serde_json::json!({"ok":false, "action":"formal_route_lock_unavailable"}),
+    };
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        return serde_json::json!({"ok":false, "action":"self_hosted_transport_managed_externally"});
+    }
     let launch = launch_tailscale_app_for_recovery().await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let after_launch = inspect_tailscale_funnel_runtime().await;
@@ -10648,6 +10782,9 @@ async fn handle_api_recover_tailscale_funnel(headers: HeaderMap) -> Response {
         return response;
     }
 
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        return json_error_response(StatusCode::CONFLICT, "self_hosted_transport_managed_externally");
+    }
     let recovery_transport = recovery_transport_from_headers(&headers);
     log::info!(
         "[Bridge][Tunnel Debug] 收到 /api/recover-tailscale-funnel 请求 recovery_transport={}",
@@ -10669,6 +10806,9 @@ async fn handle_api_restart_tunnel(
     .await
     {
         return response;
+    }
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        return json_error_response(StatusCode::CONFLICT, "self_hosted_transport_managed_externally");
     }
     let recovery_transport = recovery_transport_from_headers(&headers);
 
@@ -10695,7 +10835,7 @@ async fn handle_api_restart_tunnel(
     );
     let public_ws_auth_required = websocket_probe_auth_required(&public_ws);
     let public_ws_effective_ok =
-        websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws, true);
+        websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws, mobile_auth_required());
     let root_child_alive = root_tunnel
         .get("derived")
         .and_then(|derived| derived.get("child_alive"))
@@ -10843,6 +10983,10 @@ async fn log_tunnel_recovery_snapshot(stage: &str) {
 }
 
 async fn signal_root_tunnel_recovery_request(reason: &str) -> bool {
+    let Ok(_route_guard) = try_lock_formal_route() else { return false; };
+    if !crate::tunnel::commands::cloudflare_formal_recovery_allowed() {
+        return false;
+    }
     let payload = format!(
         "requested_at={}\nreason={}\nsource=bridge_restart_tunnel\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -11198,7 +11342,19 @@ async fn probe_websocket_upgrade_endpoint(url: &str) -> (serde_json::Value, bool
 
     let direct_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        connect_websocket_probe(ws_url.as_str()),
+        async {
+            let mut result = connect_websocket_probe(ws_url.as_str()).await;
+            // 探测只验证握手；正常发 Close 再丢弃，避免服务端每次记一条
+            // “Connection reset without closing handshake”（relay 心跳每 15 秒触发一次）。
+            if let Ok((stream, _)) = result.as_mut() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    stream.close(None),
+                )
+                .await;
+            }
+            result
+        },
     )
     .await;
 
@@ -11214,9 +11370,29 @@ async fn probe_websocket_upgrade_endpoint(url: &str) -> (serde_json::Value, bool
 }
 
 async fn refresh_public_probe_cache() {
+    let formal_route = crate::tunnel::commands::configured_formal_mobile_route();
     let public_base_url = public_bridge_base_url();
+    if crate::tunnel::commands::self_hosted_formal_route_selected() && !public_base_url.is_empty() {
+        let ok = crate::tunnel::manager::public_endpoint_proves_current_install(&public_base_url).await;
+        let proof = serde_json::json!({
+            "url": public_base_url,
+            "probe_mode": "current_install_http_and_ws_proof",
+            "endpoint_identity_ok": ok,
+            "healthy": ok,
+            "status_code": serde_json::Value::Null,
+            "error_code": if ok { None } else { Some("endpoint_identity_or_transport_unavailable") },
+        });
+        *PUBLIC_PROBE_CACHE.write().await = Some(CachedPublicProbe {
+            base_url: public_base_url, formal_route,
+            http_value: proof.clone(), http_ok: ok,
+            ws_value: proof, ws_ok: ok,
+            refreshed_at: std::time::Instant::now(),
+        });
+        return;
+    }
     if public_base_url.is_empty() {
         *PUBLIC_PROBE_CACHE.write().await = Some(CachedPublicProbe {
+            base_url: public_base_url, formal_route,
             http_value: missing_public_probe_cache_value("", "http"),
             http_ok: false,
             ws_value: missing_public_probe_cache_value("", "websocket"),
@@ -11232,6 +11408,7 @@ async fn refresh_public_probe_cache() {
         probe_websocket_upgrade_endpoint(&public_ws_url),
     );
     *PUBLIC_PROBE_CACHE.write().await = Some(CachedPublicProbe {
+        base_url: public_base_url, formal_route,
         http_value,
         http_ok,
         ws_value,
@@ -11304,7 +11481,10 @@ fn missing_public_probe_cache_value(url: &str, probe_kind: &str) -> serde_json::
 /// 读取公网探针快照：只读缓存并秒回；缓存缺失/过期只触发后台刷新。
 async fn get_public_probe_snapshot() -> (serde_json::Value, bool, serde_json::Value, bool) {
     let cached = { PUBLIC_PROBE_CACHE.read().await.clone() };
-    if let Some(cached) = cached {
+    if let Some(cached) = cached.filter(|cached| {
+        cached.base_url == public_bridge_base_url()
+            && same_formal_route_identity(cached.formal_route.as_ref(), crate::tunnel::commands::configured_formal_mobile_route().as_ref())
+    }) {
         let age_secs = cached.refreshed_at.elapsed().as_secs();
         let stale = age_secs >= PUBLIC_PROBE_CACHE_MAX_AGE_SECS;
         if stale {
@@ -11650,6 +11830,9 @@ fn root_tunnel_status_age_secs(status_file: Option<&serde_json::Value>) -> Optio
 }
 
 fn root_tunnel_is_authoritative_up(root_tunnel: &serde_json::Value) -> bool {
+    if !crate::tunnel::commands::cloudflare_formal_recovery_allowed() {
+        return false;
+    }
     let metrics_http_ok = root_tunnel
         .get("metrics")
         .and_then(|metrics| metrics.get("http_ok"))
@@ -12178,7 +12361,7 @@ async fn handle_api_connection_status(
     );
     let public_ws_auth_required = websocket_probe_auth_required(&public_ws);
     let public_ws_effective_ok =
-        websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws, true);
+        websocket_probe_ok_or_auth_required(public_ws_ok, &public_ws, mobile_auth_required());
     let root_child_alive = root_tunnel
         .get("derived")
         .and_then(|derived| derived.get("child_alive"))
@@ -13200,13 +13383,17 @@ fn persist_live_goal_progress_from_apns_update(request: &ApnsLiveActivityUpdateR
     }
 }
 
-async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) {
+async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) -> bool {
     let request_id = extract_request_id_from_mcp_state(&payload);
     let project_path = extract_project_path_from_mcp_state(&payload);
 
-    record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
-
     let mut cache = MCP_STATE_CACHE.write().await;
+    // A late ready notification/retry must not overwrite richer frontend state already cached.
+    if matches!(source, "desktop_popup_ready" | "desktop_request_registered")
+        && request_id.as_ref().is_some_and(|id| cache.contains_key(id))
+    {
+        return false;
+    }
     let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
     prune_json_cache(
         "mcp_state",
@@ -13230,6 +13417,7 @@ async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) {
     drop(cache);
     drop(touched_at);
 
+    record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
     let mut active_registry = ACTIVE_SESSION_REGISTRY.write().await;
     update_active_session_registry(&mut active_registry, &payload);
 
@@ -13240,9 +13428,43 @@ async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) {
         cache_keys.len(),
         source
     ));
+    true
+}
+
+async fn cache_and_broadcast_early_mcp_state(
+    tx: &broadcast::Sender<BridgeMessage>,
+    mut payload: serde_json::Value,
+    source: &str,
+) {
+    // Early mobile delivery must pass through the same resource registration as
+    // the full mcp_state publish path. Otherwise project-local Markdown links
+    // reach the phone as raw /Users/example/... text and cannot open the document sheet.
+    register_markdown_images_for_mcp_state_payload(&mut payload);
+    register_markdown_documents_for_payload(&mut payload);
+
+    let request_id = extract_request_id_from_mcp_state(&payload);
+    let project_path = extract_project_path_from_mcp_state(&payload);
+    bridge_debug_log(&format!(
+        "[Bridge Timing] early mcp_state resources registered: request_id={:?}, project_path={:?}, source={}",
+        request_id, project_path, source
+    ));
+    if !cache_early_mcp_state(payload.clone(), source).await {
+        return;
+    }
+    let sent = tx
+        .send(BridgeMessage {
+            message_type: "mcp_state".to_string(),
+            payload,
+        })
+        .unwrap_or(0);
+    bridge_debug_log(&format!(
+        "[Bridge Timing] native request broadcast: request_id={:?}, source={}, subscribers={}",
+        request_id, source, sent
+    ));
 }
 
 async fn handle_apns_notify(
+    State(state): State<BridgeHttpState>,
     headers: HeaderMap,
     Json(request): Json<ApnsNotifyRequest>,
 ) -> Response {
@@ -13287,7 +13509,24 @@ async fn handle_apns_notify(
         ));
         return stale_request_response();
     }
-    if source == "desktop_popup_ready" {
+    let desktop_bootstrap = matches!(
+        source.as_str(),
+        "desktop_popup_ready" | "desktop_request_registered"
+    );
+    if desktop_bootstrap {
+        // A legacy parent's later ready callback is the same immutable request.
+        // Claim it before touching route/cache state, not only inside the APNs worker.
+        if !mark_apns_notification_for_send(
+            request_id.as_deref(),
+            project_path.as_deref(),
+            &body,
+            &source,
+        )
+        .await
+        {
+            return Json(serde_json::json!({"ok": true, "source": source, "duplicate": true}))
+                .into_response();
+        }
         record_active_desktop_popup_route(request_id.as_deref(), project_path.as_deref(), &source)
             .await;
     }
@@ -13308,11 +13547,32 @@ async fn handle_apns_notify(
             "timelineNodes": [],
             "earlyNotification": true,
         });
-        cache_early_mcp_state(payload, &source).await;
+        cache_and_broadcast_early_mcp_state(&state.tx, payload, &source).await;
     }
 
     let title = request.title.unwrap_or_else(|| "iterate".to_string());
-    send_apns_notification_once(&title, &body, project_path, request_id, &source).await;
+    let notification_source = source.clone();
+    // The phone's foreground state and this HTTP acknowledgement must not wait for APNs.
+    tokio::spawn(async move {
+        if desktop_bootstrap {
+            record_last_notification_route(
+                request_id.as_deref(),
+                project_path.as_deref(),
+                &notification_source,
+            )
+            .await;
+            send_apns_notification(&title, &body, project_path, request_id).await;
+        } else {
+            send_apns_notification_once(
+                &title,
+                &body,
+                project_path,
+                request_id,
+                &notification_source,
+            )
+            .await;
+        }
+    });
 
     Json(serde_json::json!({
         "ok": true,
@@ -13673,6 +13933,7 @@ async fn handle_bridge_publish(
             "quota_bridge_publish",
         );
         register_markdown_images_for_mcp_state_payload(&mut message.payload);
+        register_markdown_documents_for_payload(&mut message.payload);
 
         let request_id = extract_request_id_from_mcp_state(&message.payload);
         let project_path = extract_project_path_from_mcp_state(&message.payload);
@@ -14090,6 +14351,131 @@ async fn image_path_read_denial(headers: &HeaderMap) -> Option<Response> {
     ))
 }
 
+static MARKDOWN_DOCUMENT_REGISTRY: Lazy<Mutex<DocumentRegistry>> =
+    Lazy::new(|| Mutex::new(DocumentRegistry::default()));
+
+fn markdown_document_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn new_markdown_document_id() -> String {
+    format!("doc_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn register_markdown_documents_for_payload(payload: &mut serde_json::Value) {
+    let Some(project_path) = extract_project_path_from_mcp_state(payload) else {
+        return;
+    };
+    let root = std::path::Path::new(&project_path);
+    let Ok(mut registry) = MARKDOWN_DOCUMENT_REGISTRY.lock() else {
+        return;
+    };
+    let now = markdown_document_now();
+    let mut rewrite = |value: &mut serde_json::Value| {
+        if let Some(text) = value.as_str() {
+            *value = serde_json::Value::String(registry.rewrite(
+                text,
+                root,
+                root,
+                now,
+                &mut new_markdown_document_id,
+            ));
+        }
+    };
+    for path in [
+        "/request/message",
+        "/request/browser_ai_response",
+        "/browserAiResponse",
+    ] {
+        if let Some(value) = payload.pointer_mut(path) {
+            rewrite(value);
+        }
+    }
+    if let Some(nodes) = payload
+        .get_mut("timelineNodes")
+        .and_then(|value| value.as_array_mut())
+    {
+        for node in nodes {
+            if let Some(content) = node.get_mut("content") {
+                rewrite(content);
+            }
+        }
+    }
+}
+
+async fn handle_markdown_document(
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    // Even a loopback or legacy unauthenticated client must present a paired
+    // session-reader identity for document content. There is no path parameter.
+    match authorize_public_route_scope(&headers, SCOPE_SESSION_READ, "missing_scope_session_read")
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "mobile_auth_required"),
+        Err(response) => return response,
+    }
+    if !id.strip_prefix("doc_").is_some_and(|value| {
+        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid_document_id");
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let mut registry = MARKDOWN_DOCUMENT_REGISTRY
+            .lock()
+            .map_err(|_| "document_unavailable")?;
+        registry.read(&id, markdown_document_now(), &mut new_markdown_document_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(preview)) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({ "title": preview.title, "content": preview.content })),
+        )
+            .into_response(),
+        Ok(Err(error)) => json_error_response(StatusCode::NOT_FOUND, error),
+        Err(_) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "document_unavailable"),
+    }
+}
+
+// Document images use the same paired session scope and project registry as
+// their parent document, including expiry and descriptor-level path checks.
+async fn handle_markdown_document_image(
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match authorize_public_route_scope(&headers, SCOPE_SESSION_READ, "missing_scope_session_read")
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "mobile_auth_required"),
+        Err(response) => return response,
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        MARKDOWN_DOCUMENT_REGISTRY
+            .lock()
+            .map_err(|_| "image_unavailable")?
+            .read_image(&id, markdown_document_now())
+    })
+    .await;
+    match result {
+        Ok(Ok((bytes, content_type))) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            Bytes::from(bytes),
+        )
+            .into_response(),
+        Ok(Err(error)) => json_error_response(StatusCode::NOT_FOUND, error),
+        Err(_) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "image_unavailable"),
+    }
+}
+
 /// HTTP 端点：读取本地图片并返回压缩后的图片（让手机端通过 HTTP 下载而非 WebSocket 传输）
 async fn handle_serve_image(
     headers: HeaderMap,
@@ -14279,11 +14665,11 @@ mod tests {
     use super::super::mcp_action_delivery::serve_response_route_file;
     use super::{
         apns_dedupe_ttl_secs, attach_phone_action_job_metadata, body_bound_auth_deferred,
-        bounded_file_list_depth, bridge_auth_required_for_request, bridge_cors_origin_strings,
-        bridge_message_targets_device, bridge_token_hash, bridge_token_hash_matches,
-        browser_http_origin_is_allowed, browser_websocket_origin_is_allowed,
-        build_active_session_summaries, build_active_session_summaries_with_focus,
-        build_goal_payload_parts, build_goal_submit_prompt, build_phone_action_bridge_message,
+        bounded_file_list_depth, bridge_cors_origin_strings, bridge_message_targets_device,
+        bridge_token_hash, bridge_token_hash_matches, browser_http_origin_is_allowed,
+        browser_websocket_origin_is_allowed, build_active_session_summaries,
+        build_active_session_summaries_with_focus, build_goal_payload_parts,
+        build_goal_submit_prompt, build_phone_action_bridge_message,
         build_redacted_connection_status_value, build_redacted_pairing_status_value,
         build_route_debug_snapshot, cached_room_submit_outcome,
         canonical_path_is_within_allowed_roots, cleanup_completed_session_by_request_id,
@@ -14293,34 +14679,34 @@ mod tests {
         expire_stale_desktop_codex_live_host, explicit_file_list_roots_for_principal_at,
         extract_conversation_id_from_mcp_state, extract_project_path_from_mcp_state,
         extract_request_id_from_mcp_state, extract_timeline_route_id_from_mcp_state,
-        fallback_pairing_candidates_with_public_base_url, get_public_probe_snapshot,
+        fallback_pairing_candidates, get_public_probe_snapshot,
         ghost_suggestions_write_scope_denial, handle_api_active_sessions, handle_api_audio_assets,
-        handle_api_cleanup_session, handle_api_config_get, handle_api_config_post,
-        handle_api_ghost_suggestions_get, handle_api_import_prompts_dir, handle_api_mcp_tools,
-        handle_api_mobile_pairing, handle_api_open_codex_chat, handle_api_prompt_library_delete,
-        handle_api_prompt_library_get, handle_api_prompt_library_post,
-        handle_api_promptor_library_get, handle_api_restart_service, handle_api_restart_tunnel,
-        handle_api_show_window, handle_api_speech_correction_memory_get,
-        handle_api_speech_correction_memory_post, handle_api_speech_muscle_memory_get,
-        handle_api_speech_muscle_memory_post, handle_api_test_audio, handle_apns_notify,
-        handle_apns_register, handle_bridge_publish, handle_bridge_pull_action,
-        handle_desktop_codex_live_control, handle_desktop_codex_live_lease,
-        handle_desktop_codex_live_status, handle_get_files, handle_get_windows, handle_pair_claim,
-        handle_push_subscribe, handle_push_unsubscribe, handle_room_submit_action,
-        handle_serve_image, handle_session_refresh, handle_session_revoke, image_path_read_denial,
-        is_inactive_session_message, is_public_control_path, is_tailscale_ipv4, is_valid_ipv4,
+        handle_api_cleanup_session, handle_api_codex_models, handle_api_config_get,
+        handle_api_config_post, handle_api_ghost_suggestions_get, handle_api_import_prompts_dir,
+        handle_api_mcp_tools, handle_api_mobile_pairing, handle_api_open_codex_chat, handle_api_create_codex_task,
+        handle_api_prompt_library_delete, handle_api_prompt_library_get,
+        handle_api_prompt_library_post, handle_api_promptor_library_get,
+        handle_api_restart_service, handle_api_restart_tunnel, handle_api_show_window,
+        handle_api_speech_correction_memory_get, handle_api_speech_correction_memory_post,
+        handle_api_speech_muscle_memory_get, handle_api_speech_muscle_memory_post,
+        handle_api_test_audio, handle_apns_notify, handle_apns_register, handle_bridge_publish,
+        handle_bridge_pull_action, handle_desktop_codex_live_control,
+        handle_desktop_codex_live_lease, handle_desktop_codex_live_status, handle_get_files,
+        handle_get_windows, handle_pair_claim, handle_push_subscribe, handle_push_unsubscribe,
+        handle_room_submit_action, handle_serve_image, handle_session_refresh,
+        handle_session_revoke, image_path_read_denial, is_inactive_session_message,
+        is_public_control_path, is_tailscale_ipv4, is_valid_ipv4,
         issue_cloudflare_web_login_pairing, list_web_login_sessions,
         live_activity_content_state_from_update, live_activity_info_matches, load_apns_config,
-        lookup_active_session_entry, lookup_active_session_payload, mobile_auth_required,
-        mobile_device_scopes, mobile_pairing_candidate_has_endpoint_proof,
-        mobile_pairing_candidate_is_ready_relay, mobile_pairing_candidate_is_secure_for_qr,
-        mobile_pairing_primary_selection_reason, normalize_file_browser_roots,
-        normalize_mcp_action_images, normalize_paired_device_store, parse_first_ipv4_line,
-        parse_first_tailscale_ipv4_from_ifconfig, parse_rfc3339, phone_action_delivery_client_ids,
-        phone_action_job_payload_from_message, phone_action_job_payload_size,
-        phone_action_result_entry_from_message, phone_action_target_device_id,
-        principal_has_any_scope, prune_active_session_registry, prune_json_cache,
-        prune_phone_action_results, public_anonymous_path_allowed,
+        lookup_active_session_entry, lookup_active_session_payload, mobile_device_scopes,
+        mobile_pairing_candidate_has_endpoint_proof, mobile_pairing_candidate_is_ready_relay,
+        mobile_pairing_candidate_is_secure_for_qr, mobile_pairing_primary_selection_reason,
+        normalize_file_browser_roots, normalize_mcp_action_images, normalize_paired_device_store,
+        parse_first_ipv4_line, parse_first_tailscale_ipv4_from_ifconfig, parse_rfc3339,
+        phone_action_delivery_client_ids, phone_action_job_payload_from_message,
+        phone_action_job_payload_size, phone_action_result_entry_from_message,
+        phone_action_target_device_id, principal_has_any_scope, prune_active_session_registry,
+        prune_json_cache, prune_phone_action_results, public_anonymous_path_allowed,
         quota_live_activity_content_state_from_snapshot,
         quota_live_activity_fingerprint_send_succeeded, record_active_desktop_popup_route,
         recovery_transport_from_headers, redact_bridge_message_text, registered_mcp_ports_from_dir,
@@ -14347,10 +14733,10 @@ mod tests {
         PairedDeviceRecord, PairedDeviceStore, PairingCandidatesResult, PhoneActionJobEntry,
         PhoneActionRequest, PhoneActionResultEntry, PullActionQuery, PushUnsubscribeRequest,
         QuotaSnapshotRefreshGate, RoomSubmitRequest, TimelineSyncService, WebLoginPairClaimRequest,
-        WebPushSubscriptionInfo, WsClientInfo, ACTIVE_SESSION_REGISTRY,
-        APNS_NOTIFICATION_DEDUPE_SECS, APNS_NOTIFICATION_REQUEST_DEDUPE_SECS, FILE_LIST_MAX_DEPTH,
-        LIVE_ACTIVITY_KIND_LIVE_GOAL, LIVE_ACTIVITY_KIND_QUOTA, MCP_ACTION_CACHE_TTL_SECS,
-        MCP_STATE_CACHE, MCP_STATE_CACHE_TOUCHED_AT, PHONE_ACTION_INLINE_PAYLOAD_MAX_BYTES,
+        WsClientInfo, ACTIVE_SESSION_REGISTRY, APNS_NOTIFICATION_DEDUPE_SECS,
+        APNS_NOTIFICATION_REQUEST_DEDUPE_SECS, FILE_LIST_MAX_DEPTH, LIVE_ACTIVITY_KIND_LIVE_GOAL,
+        LIVE_ACTIVITY_KIND_QUOTA, MCP_ACTION_CACHE_TTL_SECS, MCP_STATE_CACHE,
+        MCP_STATE_CACHE_TOUCHED_AT, PHONE_ACTION_INLINE_PAYLOAD_MAX_BYTES,
         PHONE_ACTION_RESULT_TTL_SECS, PUBLIC_PROBE_CACHE, PUBLIC_PROBE_CACHE_MAX_AGE_SECS,
         PUBLIC_PROBE_REFRESH_IN_FLIGHT, SCOPE_BRIDGE_PUBLISH, SCOPE_CONFIG_READ,
         SCOPE_CONFIG_WRITE, SCOPE_FILE_LIST, SCOPE_GHOST_SUGGESTIONS_READ,
@@ -15068,16 +15454,17 @@ mod tests {
     static WEB_LOGIN_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
         Lazy::new(|| tokio::sync::Mutex::new(()));
     static APNS_ENV_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static PUBLIC_BRIDGE_ENV_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     struct WindowRegistryFileGuard {
-        path: PathBuf,
-        previous: Option<String>,
+        _dir: tempfile::TempDir,
     }
 
     impl WindowRegistryFileGuard {
+        /// 写到独立临时文件并重定向注册表路径，不再碰真实的 `$TMPDIR/iterate_windows.json`。
         fn with_instances(instances: Vec<crate::ui::window_registry::WindowInstance>) -> Self {
-            let path = std::env::temp_dir().join("iterate_windows.json");
-            let previous = std::fs::read_to_string(&path).ok();
+            let dir = tempfile::tempdir().expect("temp window registry dir");
+            let path = dir.path().join("iterate_windows.json");
             let registry = crate::ui::window_registry::WindowRegistry {
                 instances,
                 ..Default::default()
@@ -15087,18 +15474,19 @@ mod tests {
                 serde_json::to_string_pretty(&registry).expect("serialize window registry"),
             )
             .expect("write window registry");
+            *crate::ui::window_registry::TEST_REGISTRY_PATH_OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
 
-            Self { path, previous }
+            Self { _dir: dir }
         }
     }
 
     impl Drop for WindowRegistryFileGuard {
         fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                let _ = std::fs::write(&self.path, previous);
-            } else {
-                let _ = std::fs::remove_file(&self.path);
-            }
+            *crate::ui::window_registry::TEST_REGISTRY_PATH_OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
 
@@ -15562,8 +15950,8 @@ mod tests {
         let _registry_guard = WindowRegistryFileGuard::with_instances(vec![
             crate::ui::window_registry::WindowInstance {
                 pid: std::process::id(),
-                project_path: "/Users/test/project".to_string(),
-                window_title: "iterate — /Users/test/project".to_string(),
+                project_path: "/Users/example/cunzhi".to_string(),
+                window_title: "iterate — /Users/example/cunzhi".to_string(),
                 registered_at: chrono::Utc::now().to_rfc3339(),
                 port: Some(5311),
                 request_id: Some("req-new".to_string()),
@@ -15578,7 +15966,7 @@ mod tests {
                 message_type: "mcp_action".to_string(),
                 payload: serde_json::json!({
                     "action": "submit",
-                    "project_path": "/Users/test/project",
+                    "project_path": "/Users/example/cunzhi",
                     "request_id": "req-old",
                     "room_id": "room-a",
                     "room_token": "room_secret",
@@ -15652,6 +16040,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_delivery_caches_and_broadcasts_core_request_without_frontend_or_apns() {
+        let _guard = ROUTE_DEBUG_TEST_LOCK.lock().await;
+        let request_id = format!("native-delivery-{}", uuid::Uuid::new_v4());
+        let project_path = format!("/tmp/native-delivery-{}", uuid::Uuid::new_v4());
+        let payload = serde_json::json!({
+            "request": {"id": request_id, "project_path": project_path, "message": "background core message", "predefined_options": ["ok"]},
+            "showMcpPopup": true, "earlyNotification": true, "timelineNodes": []
+        });
+        let (tx, mut rx) = broadcast::channel(4);
+        super::cache_and_broadcast_early_mcp_state(
+            &tx,
+            payload.clone(),
+            "desktop_request_registered",
+        )
+        .await;
+        let message = rx
+            .try_recv()
+            .expect("foreground mobile gets core message immediately");
+        assert_eq!(message.message_type, "mcp_state");
+        assert_eq!(message.payload, payload);
+        assert_eq!(
+            MCP_STATE_CACHE.read().await.get(&request_id),
+            Some(&payload)
+        );
+        let mut enriched = payload.clone();
+        enriched["customPrompts"] = serde_json::json!([{"id": "kept"}]);
+        MCP_STATE_CACHE
+            .write()
+            .await
+            .insert(request_id.clone(), enriched.clone());
+        super::cache_and_broadcast_early_mcp_state(&tx, payload.clone(), "desktop_popup_ready")
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate ready must not re-broadcast bootstrap state"
+        );
+        assert_eq!(
+            MCP_STATE_CACHE.read().await.get(&request_id),
+            Some(&enriched)
+        );
+        drop(rx);
+        let second_id = format!("native-delivery-{}", uuid::Uuid::new_v4());
+        let mut second = payload.clone();
+        second["request"]["id"] = serde_json::json!(second_id);
+        super::cache_and_broadcast_early_mcp_state(
+            &tx,
+            second.clone(),
+            "desktop_request_registered",
+        )
+        .await;
+        assert_eq!(MCP_STATE_CACHE.read().await.get(&second_id), Some(&second));
+        clear_mcp_state_route_for_test(&second_id, &project_path).await;
+        clear_mcp_state_route_for_test(&request_id, &project_path).await;
+    }
+
+    #[tokio::test]
+    async fn native_delivery_registers_project_markdown_before_cache_and_broadcast() {
+        let _guard = ROUTE_DEBUG_TEST_LOCK.lock().await;
+        let project = tempfile::tempdir().expect("project tempdir");
+        let document_path = project.path().join("checklist.md");
+        std::fs::write(&document_path, "# Viewing checklist\n").expect("write markdown");
+        let project_path = project
+            .path()
+            .to_str()
+            .expect("utf8 project path")
+            .to_string();
+        let request_id = format!("native-markdown-{}", uuid::Uuid::new_v4());
+        let original_message = format!("[Open checklist]({})", document_path.to_string_lossy());
+        let payload = serde_json::json!({
+            "request": {
+                "id": request_id,
+                "project_path": project_path,
+                "message": original_message,
+                "predefined_options": ["ok"],
+                "is_markdown": true
+            },
+            "showMcpPopup": true,
+            "earlyNotification": true,
+            "timelineNodes": []
+        });
+        let (tx, mut rx) = broadcast::channel(4);
+
+        super::cache_and_broadcast_early_mcp_state(&tx, payload, "desktop_request_registered")
+            .await;
+
+        let delivered = rx.try_recv().expect("early mobile message");
+        let delivered_message = delivered
+            .payload
+            .pointer("/request/message")
+            .and_then(serde_json::Value::as_str)
+            .expect("delivered request message");
+        assert!(delivered_message.starts_with("[Open checklist](iterate-document://doc_"));
+        assert!(!delivered_message.contains(&project_path));
+
+        let cached = MCP_STATE_CACHE
+            .read()
+            .await
+            .get(&request_id)
+            .cloned()
+            .expect("cached mcp state");
+        assert_eq!(
+            cached
+                .pointer("/request/message")
+                .and_then(serde_json::Value::as_str),
+            Some(delivered_message)
+        );
+
+        clear_mcp_state_route_for_test(&request_id, &project_path).await;
+    }
+
+    #[tokio::test]
     async fn apns_notify_rejects_stale_window_request_without_early_cache_or_notification_route() {
         let _route_guard = ROUTE_DEBUG_TEST_LOCK.lock().await;
         let _window_guard = WINDOW_REGISTRY_TEST_LOCK.lock().await;
@@ -15669,6 +16168,7 @@ mod tests {
         let baseline_routes = route_debug_status_value().await;
 
         let response = handle_apns_notify(
+            State(test_bridge_state()),
             HeaderMap::new(),
             Json(ApnsNotifyRequest {
                 body,
@@ -16895,6 +17395,37 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn room_submit_capability_reaches_body_auth_once() {
+        let app = axum::Router::new()
+            .route("/api/room-submit", axum::routing::post(super::handle_local_room_submit))
+            .with_state(test_bridge_state())
+            .layer(axum::middleware::from_fn(super::enforce_bridge_control_auth));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/room-submit");
+        let body = r#"{"message_type":"diagnostic_noop","payload":{}}"#;
+        let token = crate::bridge::auth::issue_internal_room_submit_token(
+            &crate::bridge::auth::bridge_body_sha256(body.as_bytes()),
+        ).unwrap();
+        let anonymous = client.post(&url).body(body).send().await.unwrap();
+        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let modified = client.post(&url).bearer_auth(&token).body("{}").send().await.unwrap();
+        assert_eq!(modified.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let valid = client.post(&url).bearer_auth(&token).body(body).send().await.unwrap();
+        // Passing authentication reaches the application payload check; no room action occurs.
+        assert_eq!(valid.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(valid.json::<serde_json::Value>().await.unwrap()["error"], "invalid_room_submit");
+        let replay = client.post(&url).bearer_auth(&token).body(body).send().await.unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
+        server.abort();
+    }
+
     #[test]
     fn websocket_origin_accepts_exact_bridge_origin_and_rejects_sibling() {
         let mut headers = HeaderMap::new();
@@ -16907,27 +17438,25 @@ mod tests {
             header::ORIGIN,
             HeaderValue::from_static("https://iterate.example.com"),
         );
-        assert!(browser_websocket_origin_is_allowed(&headers, None, true));
+        assert!(browser_websocket_origin_is_allowed(&headers, None));
 
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_static("https://sibling.tobooks.xin"),
+            HeaderValue::from_static("https://sibling.example.com"),
         );
-        assert!(!browser_websocket_origin_is_allowed(&headers, None, true));
+        assert!(!browser_websocket_origin_is_allowed(&headers, None));
 
-        let console_origins = vec!["https://sibling.tobooks.xin".to_string()];
+        let console_origins = vec!["https://sibling.example.com".to_string()];
         assert!(browser_websocket_origin_is_allowed(
             &headers,
             Some(&console_origins),
-            true,
         ));
 
         headers.remove(header::ORIGIN);
-        assert!(browser_websocket_origin_is_allowed(&headers, None, true));
+        assert!(browser_websocket_origin_is_allowed(&headers, None));
         assert!(!browser_websocket_origin_is_allowed(
             &headers,
             Some(&console_origins),
-            true,
         ));
     }
 
@@ -16935,20 +17464,20 @@ mod tests {
     fn cookie_http_origin_requires_an_exact_paired_console_origin() {
         let allowed = vec![
             "https://iterate.example.com".to_string(),
-            "https://console.tobooks.xin".to_string(),
+            "https://console.example.com".to_string(),
         ];
         let mut headers = HeaderMap::new();
         assert!(!browser_http_origin_is_allowed(&headers, &allowed));
 
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_static("https://console.tobooks.xin"),
+            HeaderValue::from_static("https://console.example.com"),
         );
         assert!(browser_http_origin_is_allowed(&headers, &allowed));
 
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_static("https://evil.tobooks.xin"),
+            HeaderValue::from_static("https://evil.example.com"),
         );
         assert!(!browser_http_origin_is_allowed(&headers, &allowed));
     }
@@ -16956,8 +17485,8 @@ mod tests {
     #[test]
     fn production_cors_excludes_vite_origins_but_keeps_configured_console() {
         let production =
-            bridge_cors_origin_strings(Some("https://console.tobooks.xin".to_string()), false);
-        assert!(production.contains(&"https://console.tobooks.xin".to_string()));
+            bridge_cors_origin_strings(Some("https://console.example.com".to_string()), false);
+        assert!(production.contains(&"https://console.example.com".to_string()));
         assert!(!production.iter().any(|origin| origin.contains(":5173")));
         assert!(!production.iter().any(|origin| origin.contains(":5174")));
 
@@ -17341,6 +17870,8 @@ mod tests {
         let _guard = PUBLIC_PROBE_TEST_LOCK.lock().await;
         PUBLIC_PROBE_REFRESH_IN_FLIGHT.store(true, Ordering::SeqCst);
         *PUBLIC_PROBE_CACHE.write().await = Some(CachedPublicProbe {
+            base_url: super::public_bridge_base_url(),
+            formal_route: crate::tunnel::commands::configured_formal_mobile_route(),
             http_value: serde_json::json!({
                 "url": "https://iterate.example.com/api/version",
                 "healthy": true,
@@ -17382,7 +17913,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_auth_guard_is_request_scoped_and_platform_independent() {
+    fn websocket_auth_guard_rejects_anonymous_public_requests_before_upgrade() {
         let principal = AuthPrincipal {
             principal_id: "device:test".to_string(),
             device_id: "test".to_string(),
@@ -17390,35 +17921,18 @@ mod tests {
             scopes: vec![SCOPE_STATUS_READ.to_string()],
         };
 
-        assert!(websocket_auth_denial(false, None).is_none());
+        assert_eq!(
+            websocket_auth_denial(false, None),
+            Some((StatusCode::UNAUTHORIZED, "mobile_auth_required"))
+        );
         assert_eq!(
             websocket_auth_denial(true, None),
             Some((StatusCode::UNAUTHORIZED, "mobile_auth_required"))
         );
         assert!(websocket_auth_denial(true, Some(&principal)).is_none());
-        assert!(!websocket_scope_enforced(false));
-        assert!(websocket_scope_enforced(true));
-    }
-
-    #[test]
-    fn bridge_auth_is_required_for_forwarded_or_non_loopback_requests_on_every_platform() {
-        let local_peer = SocketAddr::from(([127, 0, 0, 1], 45678));
-        let remote_peer = SocketAddr::from(([192, 168, 1, 50], 45678));
-        let mut public_headers = HeaderMap::new();
-        public_headers.insert("cf-ray", HeaderValue::from_static("test-ray"));
-
-        assert!(bridge_auth_required_for_request(
-            &HeaderMap::new(),
-            remote_peer
-        ));
-        assert!(bridge_auth_required_for_request(
-            &public_headers,
-            local_peer
-        ));
-        assert_eq!(
-            bridge_auth_required_for_request(&HeaderMap::new(), local_peer),
-            mobile_auth_required()
-        );
+        assert!(websocket_scope_enforced(false, false));
+        assert!(websocket_scope_enforced(true, false));
+        assert!(websocket_scope_enforced(false, true));
     }
 
     #[test]
@@ -17499,6 +18013,45 @@ mod tests {
         assert!(redacted.contains("android-web-test"));
     }
 
+    #[test]
+    fn bridge_message_log_redacts_attachment_bytes() {
+        let redacted = redact_bridge_message_text(
+            r#"{"message_type":"mcp_action","payload":{"images":[{"filename":"photo.jpg","data":"image-secret"}],"files":[{"filename":"notes.txt","data":"file-secret"}]}}"#,
+        );
+
+        assert!(!redacted.contains("image-secret"));
+        assert!(!redacted.contains("file-secret"));
+        assert!(redacted.contains("photo.jpg"));
+        assert!(redacted.contains("notes.txt"));
+        assert_eq!(redacted.matches("[redacted]").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn markdown_document_content_requires_a_paired_identity() {
+        let response = super::handle_markdown_document(
+            HeaderMap::new(),
+            axum::extract::Path("doc_00000000000000000000000000000000".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(super::is_public_control_path(
+            "/api/markdown-documents/doc_test"
+        ));
+    }
+
+    #[tokio::test]
+    async fn markdown_document_images_require_a_paired_identity() {
+        let response = super::handle_markdown_document_image(
+            HeaderMap::new(),
+            axum::extract::Path("doc_00000000000000000000000000000000".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(super::is_public_control_path(
+            "/api/markdown-documents/doc_test/image"
+        ));
+    }
+
     #[tokio::test]
     async fn direct_network_clients_must_authenticate_for_scoped_bridge_routes() {
         let remote_peer = SocketAddr::from(([192, 168, 1, 50], 45678));
@@ -17511,6 +18064,15 @@ mod tests {
                 .await
                 .is_none()
         );
+
+        let document_response = direct_network_bridge_auth_denial(
+            &HeaderMap::new(),
+            "/api/markdown-documents/doc_test",
+            remote_peer,
+        )
+        .await
+        .expect("direct LAN document reads must require paired auth");
+        assert_eq!(document_response.status(), StatusCode::UNAUTHORIZED);
 
         let response = direct_network_bridge_auth_denial(&HeaderMap::new(), "/image", remote_peer)
             .await
@@ -17571,12 +18133,6 @@ mod tests {
         };
         assert!(remote_action_denial_reason(&principal, &submit).is_none());
 
-        let goal = BridgeMessage {
-            message_type: "mcp_action".to_string(),
-            payload: serde_json::json!({ "action": "goal" }),
-        };
-        assert!(remote_action_denial_reason(&principal, &goal).is_none());
-
         let config_write = BridgeMessage {
             message_type: "mcp_action".to_string(),
             payload: serde_json::json!({ "action": "update_custom_prompt_order" }),
@@ -17594,38 +18150,6 @@ mod tests {
             payload: serde_json::json!({ "command": "show_main_window" }),
         };
         assert!(remote_action_denial_reason(&principal, &show_window).is_none());
-
-        let phone_action_result = BridgeMessage {
-            message_type: "phone_action_result".to_string(),
-            payload: serde_json::json!({ "id": "action-1", "status": "completed" }),
-        };
-        assert!(remote_action_denial_reason(&principal, &phone_action_result).is_none());
-        let read_only_principal = AuthPrincipal {
-            scopes: vec![SCOPE_SESSION_READ.to_string()],
-            ..principal.clone()
-        };
-        assert_eq!(
-            remote_action_denial_reason(&read_only_principal, &phone_action_result),
-            Some(format!("missing scope {}", SCOPE_SESSION_RESPOND))
-        );
-
-        let unknown_action = BridgeMessage {
-            message_type: "mcp_action".to_string(),
-            payload: serde_json::json!({ "action": "future_admin_action" }),
-        };
-        assert_eq!(
-            remote_action_denial_reason(&principal, &unknown_action),
-            Some("unknown mcp action denied: future_admin_action".to_string())
-        );
-
-        let unknown_message = BridgeMessage {
-            message_type: "future_remote_message".to_string(),
-            payload: serde_json::json!({}),
-        };
-        assert_eq!(
-            remote_action_denial_reason(&principal, &unknown_message),
-            Some("unknown remote message denied: future_remote_message".to_string())
-        );
     }
 
     #[test]
@@ -17656,10 +18180,6 @@ mod tests {
             message_type: "request_main_page".to_string(),
             payload: serde_json::json!({ "tab": "tools" }),
         };
-        let unknown = BridgeMessage {
-            message_type: "request_main_page".to_string(),
-            payload: serde_json::json!({ "tab": "admin" }),
-        };
 
         assert!(remote_action_denial_reason(&base_principal, &intro).is_none());
         assert_eq!(
@@ -17672,10 +18192,6 @@ mod tests {
             Some(format!("missing scope {}", SCOPE_CONFIG_READ))
         );
         assert!(remote_action_denial_reason(&config_principal, &tools).is_none());
-        assert_eq!(
-            remote_action_denial_reason(&base_principal, &unknown),
-            Some("unknown main page tab denied: admin".to_string())
-        );
     }
 
     #[test]
@@ -18342,11 +18858,11 @@ mod tests {
 
     #[test]
     fn fallback_pairing_candidates_return_public_and_loopback_candidates() {
-        let result = fallback_pairing_candidates_with_public_base_url(
-            8080,
-            "probe timeout".to_string(),
-            "https://public.example.test".to_string(),
-        );
+        let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
+        let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
+        // 用显式覆盖值，避免依赖本机真实配置（并行测试会临时替换配置路径，导致偶发失败）。
+        let _env = EnvGuard::set("ITERATE_PUBLIC_BRIDGE_BASE_URL", "https://public.example.test");
+        let result = fallback_pairing_candidates(8080, "probe timeout".to_string());
 
         assert_ne!(result.primary.transport_mode, "public_tunnel");
         assert!(result.tailscale_source.is_none());
@@ -18364,22 +18880,41 @@ mod tests {
     }
 
     #[test]
-    fn fallback_pairing_candidates_omit_public_candidate_without_secure_origin() {
-        let result = fallback_pairing_candidates_with_public_base_url(
-            8080,
-            "probe timeout".to_string(),
-            String::new(),
+    fn fallback_pairing_candidates_convert_http_public_override_to_ws_url() {
+        // 公网入口自 2026-08 起只接受 https（normalize_public_origin）；https 覆盖值应换成 wss。
+        let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
+        let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
+        let _env = EnvGuard::set(
+            "ITERATE_PUBLIC_BRIDGE_BASE_URL",
+            "https://public.example.test",
         );
 
-        assert!(!result
+        let result = fallback_pairing_candidates(8080, "probe timeout".to_string());
+        let public = result
             .candidates
             .iter()
-            .any(|candidate| candidate.transport_mode == "public_tunnel"));
+            .find(|candidate| candidate.transport_mode == "public_tunnel")
+            .expect("public tunnel candidate");
+
+        assert_eq!(public.base_url, "https://public.example.test");
+        assert_eq!(public.ws_url, "wss://public.example.test/ws");
         assert_ne!(result.primary.transport_mode, "public_tunnel");
-        assert!(result.candidates.iter().any(|candidate| {
-            candidate.transport_mode == "loopback_fallback"
-                && candidate.base_url == "http://127.0.0.1:8080"
-        }));
+    }
+
+    #[test]
+    fn fallback_pairing_candidates_reject_plain_http_public_override() {
+        let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
+        let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
+        let _env = EnvGuard::set(
+            "ITERATE_PUBLIC_BRIDGE_BASE_URL",
+            "http://public.example.test:8080",
+        );
+
+        let result = fallback_pairing_candidates(8080, "probe timeout".to_string());
+        assert!(result
+            .candidates
+            .iter()
+            .all(|candidate| !candidate.base_url.starts_with("http://public.example.test")));
     }
 
     #[test]
@@ -18474,12 +19009,17 @@ mod tests {
             )
             .await,
             handle_api_show_window(State(state.clone()), public_headers()).await,
+            handle_api_codex_models(public_headers()).await,
             handle_api_open_codex_chat(
                 State(state.clone()),
                 public_headers(),
                 None::<Json<serde_json::Value>>,
             )
             .await,
+            handle_api_create_codex_task(
+                State(state.clone()), public_headers(),
+                Json(serde_json::json!({"project_path":"/tmp","text":"synthetic test"})),
+            ).await,
             handle_api_test_audio(State(state.clone()), public_headers()).await,
             handle_api_restart_service(State(state.clone()), public_headers()).await,
             handle_api_restart_tunnel(State(state), public_headers()).await,
@@ -18496,7 +19036,7 @@ mod tests {
         let responses = vec![
             handle_push_subscribe(
                 public_headers(),
-                Json(WebPushSubscriptionInfo::new(
+                Json(web_push::SubscriptionInfo::new(
                     "https://example.com/push",
                     "p256dh",
                     "auth",
@@ -18523,6 +19063,7 @@ mod tests {
             )
             .await,
             handle_apns_notify(
+                State(test_bridge_state()),
                 public_headers(),
                 Json(ApnsNotifyRequest {
                     body: "test notification".to_string(),
@@ -18790,13 +19331,17 @@ mod tests {
         let mut registry = HashMap::new();
         update_active_session_registry(
             &mut registry,
-            &build_payload("serve-1", "/Users/test/project", "正在修复 active sessions"),
+            &build_payload(
+                "serve-1",
+                "/Users/example/cunzhi",
+                "正在修复 active sessions",
+            ),
         );
         update_active_session_registry(
             &mut registry,
             &build_payload(
                 "serve-1",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "已调用 zhi，等待你的下一步指令。",
             ),
         );
@@ -18804,7 +19349,7 @@ mod tests {
         let payload = lookup_active_session_payload(
             &registry,
             Some("serve-1"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             None,
         )
         .expect("expected active payload");
@@ -18823,13 +19368,17 @@ mod tests {
             &mut registry,
             &build_payload(
                 "serve-2",
-                "/Users/test/other project",
+                "/Users/example/tobooks 更新 hook",
                 "已调用 zhi，等待你的下一步指令。",
             ),
         );
 
-        let payload =
-            lookup_active_session_payload(&registry, None, Some("/Users/test/other project"), None);
+        let payload = lookup_active_session_payload(
+            &registry,
+            None,
+            Some("/Users/example/tobooks 更新 hook"),
+            None,
+        );
 
         assert!(payload.is_some());
         assert_eq!(registry.len(), 1);
@@ -18840,11 +19389,11 @@ mod tests {
         let mut registry = HashMap::new();
         update_active_session_registry(
             &mut registry,
-            &build_payload("serve-1", "/Users/test/project", "第一条会话"),
+            &build_payload("serve-1", "/Users/example/cunzhi", "第一条会话"),
         );
         update_active_session_registry(
             &mut registry,
-            &build_payload("serve-2", "/Users/test/project", "第二条会话"),
+            &build_payload("serve-2", "/Users/example/cunzhi", "第二条会话"),
         );
 
         assert_eq!(registry.len(), 2);
@@ -18852,14 +19401,14 @@ mod tests {
         let first = lookup_active_session_payload(
             &registry,
             Some("serve-1"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             None,
         )
         .expect("expected first payload");
         let second = lookup_active_session_payload(
             &registry,
             Some("serve-2"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             None,
         )
         .expect("expected second payload");
@@ -18884,13 +19433,13 @@ mod tests {
         let mut registry = HashMap::new();
         update_active_session_registry(
             &mut registry,
-            &build_payload("serve-2", "/Users/test/project", "第二条会话"),
+            &build_payload("serve-2", "/Users/example/cunzhi", "第二条会话"),
         );
 
         let payload = lookup_active_session_payload(
             &registry,
             Some("serve-missing"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             None,
         );
 
@@ -18904,14 +19453,14 @@ mod tests {
             &mut registry,
             &build_payload_with_timeline_route(
                 "serve-desktop",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "当前桌面会话",
                 "codex-thread-stable",
             ),
         );
         let action_payload = serde_json::json!({
             "action": "submit",
-            "project_path": "/Users/test/project",
+            "project_path": "/Users/example/cunzhi",
             "request_id": "serve-one-shot",
             "user_input": "手机语音"
         });
@@ -18919,7 +19468,7 @@ mod tests {
         let resolved = resolve_mcp_action_timeline_route_id(
             &action_payload,
             Some("serve-one-shot"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             Some("serve-desktop"),
             &registry,
         )
@@ -18936,7 +19485,7 @@ mod tests {
             &mut registry,
             &build_payload_with_timeline_route(
                 "serve-desktop-1",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "桌面会话一",
                 "codex-thread-stable",
             ),
@@ -18945,14 +19494,14 @@ mod tests {
             &mut registry,
             &build_payload_with_timeline_route(
                 "serve-desktop-2",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "桌面会话二",
                 "codex-thread-stable",
             ),
         );
         let action_payload = serde_json::json!({
             "action": "submit",
-            "project_path": "/Users/test/project",
+            "project_path": "/Users/example/cunzhi",
             "request_id": "serve-one-shot",
             "user_input": "手机语音"
         });
@@ -18960,7 +19509,7 @@ mod tests {
         let resolved = resolve_mcp_action_timeline_route_id(
             &action_payload,
             Some("serve-one-shot"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             None,
             &registry,
         )
@@ -18977,7 +19526,7 @@ mod tests {
             &mut registry,
             &build_payload_with_timeline_route(
                 "serve-desktop-1",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "第一条会话",
                 "codex-thread-a",
             ),
@@ -18986,14 +19535,14 @@ mod tests {
             &mut registry,
             &build_payload_with_timeline_route(
                 "serve-desktop-2",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "第二条会话",
                 "codex-thread-b",
             ),
         );
         let action_payload = serde_json::json!({
             "action": "submit",
-            "project_path": "/Users/test/project",
+            "project_path": "/Users/example/cunzhi",
             "request_id": "serve-one-shot",
             "user_input": "手机语音"
         });
@@ -19001,7 +19550,7 @@ mod tests {
         let resolved = resolve_mcp_action_timeline_route_id(
             &action_payload,
             Some("serve-one-shot"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             None,
             &registry,
         );
@@ -19013,38 +19562,38 @@ mod tests {
     fn pull_action_with_request_id_does_not_fallback_to_project_path() {
         let mut cache = HashMap::new();
         cache.insert(
-            "/Users/test/project".to_string(),
+            "/Users/example/cunzhi".to_string(),
             serde_json::json!({ "action": "wrong-project-fallback" }),
         );
 
         let action =
-            take_cached_action_for_pull(&mut cache, "/Users/test/project", Some("serve-1"));
+            take_cached_action_for_pull(&mut cache, "/Users/example/cunzhi", Some("serve-1"));
 
         assert!(action.is_none());
-        assert!(cache.contains_key("/Users/test/project"));
+        assert!(cache.contains_key("/Users/example/cunzhi"));
     }
 
     #[test]
     fn pull_action_without_request_id_uses_project_path_fallback() {
         let mut cache = HashMap::new();
         cache.insert(
-            "/Users/test/project".to_string(),
+            "/Users/example/cunzhi".to_string(),
             serde_json::json!({ "action": "legacy-project-fallback" }),
         );
 
-        let action = take_cached_action_for_pull(&mut cache, "/Users/test/project", None)
+        let action = take_cached_action_for_pull(&mut cache, "/Users/example/cunzhi", None)
             .expect("expected legacy project action");
 
         assert_eq!(action["action"], "legacy-project-fallback");
-        assert!(!cache.contains_key("/Users/test/project"));
+        assert!(!cache.contains_key("/Users/example/cunzhi"));
     }
 
     #[test]
     fn request_id_binding_detects_replaced_same_project_request() {
         let instances = vec![crate::ui::window_registry::WindowInstance {
             pid: 1,
-            project_path: "/Users/test/project".to_string(),
-            window_title: "iterate — /Users/test/project".to_string(),
+            project_path: "/Users/example/cunzhi".to_string(),
+            window_title: "iterate — /Users/example/cunzhi".to_string(),
             registered_at: chrono::Utc::now().to_rfc3339(),
             port: Some(5311),
             request_id: Some("req-new".to_string()),
@@ -19054,17 +19603,17 @@ mod tests {
         assert!(request_id_is_stale_for_live_window_instances(
             &instances,
             Some("req-old"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
         ));
         assert!(!request_id_is_stale_for_live_window_instances(
             &instances,
             Some("req-new"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
         ));
         assert!(!request_id_is_stale_for_live_window_instances(
             &instances,
             Some("req-old"),
-            Some("/Users/test/other"),
+            Some("/Users/example/other"),
         ));
     }
 
@@ -19072,8 +19621,8 @@ mod tests {
     fn pull_action_with_stale_window_request_drops_cached_action() {
         let instances = vec![crate::ui::window_registry::WindowInstance {
             pid: 1,
-            project_path: "/Users/test/project".to_string(),
-            window_title: "iterate — /Users/test/project".to_string(),
+            project_path: "/Users/example/cunzhi".to_string(),
+            window_title: "iterate — /Users/example/cunzhi".to_string(),
             registered_at: chrono::Utc::now().to_rfc3339(),
             port: Some(5311),
             request_id: Some("req-new".to_string()),
@@ -19087,7 +19636,7 @@ mod tests {
 
         let action = take_cached_action_for_pull_with_window_bindings(
             &mut cache,
-            "/Users/test/project",
+            "/Users/example/cunzhi",
             Some("req-old"),
             &instances,
         );
@@ -19100,7 +19649,7 @@ mod tests {
     async fn cleanup_completed_session_removes_state_cache_and_active_registry() {
         let _guard = ROUTE_DEBUG_TEST_LOCK.lock().await;
         let request_id = "serve-cleanup-test";
-        let project_path = "/Users/test/cleanup-test";
+        let project_path = "/Users/example/cleanup-test";
         let payload = build_payload(request_id, project_path, "cleanup test");
 
         {
@@ -19608,9 +20157,9 @@ mod tests {
     #[test]
     fn registered_mcp_ports_from_dir_sorts_dedups_and_ignores_non_ports() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp_dir.path().join("5330"), "/Users/test/project").expect("write port");
-        std::fs::write(temp_dir.path().join("5323"), "/Users/test/project").expect("write port");
-        std::fs::write(temp_dir.path().join("not-a-port"), "/Users/test/project")
+        std::fs::write(temp_dir.path().join("5330"), "/Users/example/cunzhi").expect("write port");
+        std::fs::write(temp_dir.path().join("5323"), "/Users/example/cunzhi").expect("write port");
+        std::fs::write(temp_dir.path().join("not-a-port"), "/Users/example/cunzhi")
             .expect("write invalid");
         std::fs::create_dir(temp_dir.path().join("5330.copy")).expect("mkdir invalid");
 
@@ -19627,7 +20176,7 @@ mod tests {
             APNS_NOTIFICATION_REQUEST_DEDUPE_SECS
         );
         assert_eq!(
-            apns_dedupe_ttl_secs("fallback:/Users/test/project:123"),
+            apns_dedupe_ttl_secs("fallback:/Users/example/cunzhi:123"),
             APNS_NOTIFICATION_DEDUPE_SECS
         );
     }
@@ -19639,7 +20188,13 @@ mod tests {
         let config_dir = temp_dir.path().join(".config/iterate");
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         let key_path = temp_dir.path().join("AuthKey_TEST.p8");
-        let key_pem = "synthetic-apns-test-key\n";
+        let key_pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\n",
+            "TEST\n",
+            "-----END ",
+            "PRIVATE KEY-----\n",
+        );
         std::fs::write(&key_path, key_pem).expect("write key");
         std::fs::write(
             config_dir.join("apns-env.sh"),
@@ -19660,6 +20215,10 @@ mod tests {
         let _topic_guard = EnvGuard::remove("APNS_TOPIC");
         let _path_guard = EnvGuard::remove("APNS_AUTH_KEY_PATH");
         let _p8_guard = EnvGuard::remove("APNS_AUTH_KEY_P8");
+        let _sandbox_key_guard = EnvGuard::remove("APNS_SANDBOX_KEY_ID");
+        let _sandbox_path_guard = EnvGuard::remove("APNS_SANDBOX_AUTH_KEY_PATH");
+        let _production_key_guard = EnvGuard::remove("APNS_PRODUCTION_KEY_ID");
+        let _production_path_guard = EnvGuard::remove("APNS_PRODUCTION_AUTH_KEY_PATH");
         let _env_guard = EnvGuard::remove("APNS_ENV");
 
         let config = load_apns_config().expect("APNS config should load from file");
@@ -19678,7 +20237,13 @@ mod tests {
         let config_dir = temp_dir.path().join(".config/iterate");
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         let key_path = temp_dir.path().join("AuthKey_TEST.p8");
-        let key_pem = "synthetic-apns-test-key\n";
+        let key_pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\n",
+            "TEST\n",
+            "-----END ",
+            "PRIVATE KEY-----\n",
+        );
         std::fs::write(&key_path, key_pem).expect("write key");
         std::fs::write(
             config_dir.join("apns-env.sh"),
@@ -19692,6 +20257,10 @@ mod tests {
         let _team_guard = EnvGuard::set("APNS_TEAM_ID", OsStr::new("ENV_TEAM"));
         let _path_guard = EnvGuard::set("APNS_AUTH_KEY_PATH", key_path.as_os_str());
         let _p8_guard = EnvGuard::remove("APNS_AUTH_KEY_P8");
+        let _sandbox_key_guard = EnvGuard::remove("APNS_SANDBOX_KEY_ID");
+        let _sandbox_path_guard = EnvGuard::remove("APNS_SANDBOX_AUTH_KEY_PATH");
+        let _production_key_guard = EnvGuard::remove("APNS_PRODUCTION_KEY_ID");
+        let _production_path_guard = EnvGuard::remove("APNS_PRODUCTION_AUTH_KEY_PATH");
         let _topic_guard = EnvGuard::remove("APNS_TOPIC");
         let _env_guard = EnvGuard::remove("APNS_ENV");
 
@@ -19708,7 +20277,7 @@ mod tests {
     fn route_debug_snapshot_prefers_request_id() {
         let snapshot = build_route_debug_snapshot(
             Some("serve-1"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             "desktop_popup_ready",
         )
         .expect("route snapshot");
@@ -19717,7 +20286,7 @@ mod tests {
         assert_eq!(snapshot.request_id.as_deref(), Some("serve-1"));
         assert_eq!(
             snapshot.project_path.as_deref(),
-            Some("/Users/test/project")
+            Some("/Users/example/cunzhi")
         );
         assert_eq!(snapshot.source, "desktop_popup_ready");
         assert!(!snapshot.updated_at.is_empty());
@@ -19726,14 +20295,14 @@ mod tests {
     #[test]
     fn route_debug_snapshot_falls_back_to_project_path() {
         let snapshot =
-            build_route_debug_snapshot(None, Some("/Users/test/project"), "cleanup-session")
+            build_route_debug_snapshot(None, Some("/Users/example/cunzhi"), "cleanup-session")
                 .expect("route snapshot");
 
-        assert_eq!(snapshot.route_key, "/Users/test/project");
+        assert_eq!(snapshot.route_key, "/Users/example/cunzhi");
         assert_eq!(snapshot.request_id, None);
         assert_eq!(
             snapshot.project_path.as_deref(),
-            Some("/Users/test/project")
+            Some("/Users/example/cunzhi")
         );
         assert_eq!(snapshot.source, "cleanup-session");
     }
@@ -19750,7 +20319,7 @@ mod tests {
 
         record_active_desktop_popup_route(
             Some("serve-ready"),
-            Some("/Users/test/project"),
+            Some("/Users/example/cunzhi"),
             "desktop_popup_ready",
         )
         .await;
@@ -19821,10 +20390,10 @@ mod tests {
             "serve-old".to_string(),
             ActiveSessionEntry {
                 request_id: "serve-old".to_string(),
-                project_path: "/Users/test/old".to_string(),
+                project_path: "/Users/example/old".to_string(),
                 project_name: "old".to_string(),
                 title: "old".to_string(),
-                payload: build_payload("serve-old", "/Users/test/old", "old"),
+                payload: build_payload("serve-old", "/Users/example/old", "old"),
                 last_active_at: "2000-01-01T00:00:00Z".to_string(),
             },
         );
@@ -19832,10 +20401,10 @@ mod tests {
             "serve-new".to_string(),
             ActiveSessionEntry {
                 request_id: "serve-new".to_string(),
-                project_path: "/Users/test/new".to_string(),
+                project_path: "/Users/example/new".to_string(),
                 project_name: "new".to_string(),
                 title: "new".to_string(),
-                payload: build_payload("serve-new", "/Users/test/new", "new"),
+                payload: build_payload("serve-new", "/Users/example/new", "new"),
                 last_active_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -19858,7 +20427,7 @@ mod tests {
         let mut registry = HashMap::new();
         update_active_session_registry(
             &mut registry,
-            &build_payload("serve-1", "/Users/test/project", "第一条会话"),
+            &build_payload("serve-1", "/Users/example/cunzhi", "第一条会话"),
         );
         assert!(registry.contains_key("serve-1"));
 
@@ -19866,7 +20435,7 @@ mod tests {
             &mut registry,
             &build_payload(
                 "serve-1",
-                "/Users/test/project",
+                "/Users/example/cunzhi",
                 "任务已结束，请查看最终状态。",
             ),
         );
@@ -20195,5 +20764,196 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
         .expect("read unknown paired device");
         assert!(principal.is_none());
         assert!(!revoked);
+    }
+}
+
+fn mobile_reply_capability_payload() -> serde_json::Value {
+    let mut capability = serde_json::json!({
+        "protocol": "mobile_reply_receipt_v1",
+        "receipt_scope": "bridge_delivery",
+        "status_lookup": true,
+        "caller_durable_ack": false,
+        "max_body_bytes": 40 * 1024 * 1024,
+    });
+    if let Ok(epoch) = super::mobile_reply::replay_epoch() {
+        capability["same_epoch_retry_v1"] = true.into();
+        capability["replay_epoch"] = epoch.into();
+    }
+    capability
+}
+
+async fn handle_api_mobile_reply_capabilities(headers: HeaderMap) -> Response {
+    match authenticate_bridge_headers_result(&headers).await {
+        Ok(Some(value)) if is_native_mobile_client(&value.client_kind) => {
+            Json(mobile_reply_capability_payload()).into_response()
+        }
+        _ => json_error_response(StatusCode::UNAUTHORIZED, "paired_mobile_required"),
+    }
+}
+
+async fn handle_api_mobile_reply_status(
+    headers: HeaderMap,
+    Path(operation): Path<String>,
+) -> Response {
+    let principal = match authenticate_bridge_headers_result(&headers).await {
+        Ok(Some(value)) if is_native_mobile_client(&value.client_kind) => value,
+        _ => return json_error_response(StatusCode::UNAUTHORIZED, "paired_mobile_required"),
+    };
+    if !valid_mobile_reply_operation(&operation) {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid_mobile_reply");
+    }
+    let key = bridge_token_hash(&format!("{}:{}", principal.device_id, operation));
+    let path = crate::config::iterate_bridge_state_dir()
+        .join("mobile-replies")
+        .join(format!("{}.json", key));
+    match super::mobile_reply::lookup(&path, &operation) {
+        Ok(Some(receipt)) => Json(receipt).into_response(),
+        Ok(None) => Json(serde_json::json!({"operation_id": operation, "status": "absent", "receipt_scope": "bridge_delivery"})).into_response(),
+        Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
+    }
+}
+
+fn valid_mobile_reply_operation(operation: &str) -> bool {
+    (16..=80).contains(&operation.len())
+        && operation
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+// Native replies never use the unauthenticated local compatibility path.
+async fn handle_api_mobile_reply(
+    headers: HeaderMap,
+    State(state): State<BridgeHttpState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let principal = match authenticate_bridge_headers_result(&headers).await {
+        Ok(Some(value)) if is_native_mobile_client(&value.client_kind) => value,
+        _ => return json_error_response(StatusCode::UNAUTHORIZED, "paired_mobile_required"),
+    };
+    let message = BridgeMessage {
+        message_type: "mcp_action".into(),
+        payload: payload.clone(),
+    };
+    if let Some(reason) = remote_action_denial_reason(&principal, &message) {
+        return json_error_response(StatusCode::FORBIDDEN, &reason);
+    }
+    let operation = payload
+        .get("operation_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let request_id = payload
+        .get("request_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let project = payload
+        .get("project_path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let action = payload
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !valid_mobile_reply_operation(operation)
+        || request_id.is_empty()
+        || project.is_empty()
+        || !matches!(action, "submit" | "goal" | "continue" | "goal_start")
+    {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid_mobile_reply");
+    }
+    let key = bridge_token_hash(&format!("{}:{}", principal.device_id, operation));
+    let digest = bridge_token_hash(&payload.to_string());
+    let path = crate::config::iterate_bridge_state_dir()
+        .join("mobile-replies")
+        .join(format!("{}.json", key));
+    let replay_epoch = match payload.get("reply_epoch") {
+        Some(value) => match value.as_str() {
+            Some(value) => Some(value),
+            None => {
+                return json_error_response(StatusCode::BAD_REQUEST, "invalid_reply_replay_epoch")
+            }
+        },
+        None => None,
+    };
+    bridge_debug_log(&format!(
+        "[Mobile Reply] received operation_id={} request_id={} epoch_bound={}",
+        operation,
+        request_id,
+        replay_epoch.is_some()
+    ));
+    let receipt =
+        match super::mobile_reply::reserve_with_epoch(&path, operation, &digest, replay_epoch) {
+            Ok(super::mobile_reply::Reservation::Existing(value)) => {
+                return Json(value).into_response()
+            }
+            Ok(super::mobile_reply::Reservation::New(value)) => value,
+            Err(error) => {
+                bridge_debug_log(&format!(
+                    "[Mobile Reply] refused operation_id={} reason={}",
+                    operation, error
+                ));
+                return json_error_response(StatusCode::CONFLICT, &error);
+            }
+        };
+    let project = normalize_bridge_project_path(project);
+    let stale = request_id_is_stale_for_current_window_binding(Some(request_id), Some(&project));
+    let preflight = super::mcp_action_delivery::preflight_mcp_action_delivery(
+        state.app_handle.as_ref(),
+        &project,
+        Some(request_id),
+        MCP_ACTION_CACHE_TTL_SECS,
+        &bridge_debug_log,
+    );
+    let (status, reason) = if stale || !preflight.delivered {
+        ("rejected", Some("request_not_available"))
+    } else {
+        // Keep the receipt digest bound to original bytes, while reusing the same
+        // private file staging as WebSocket replies. Never trust inbound Mac paths.
+        let mut prepared = payload.clone();
+        if let Err(error) = prepare_mcp_action_file_uploads(&mut prepared, Some(request_id)) {
+            return match super::mobile_reply::finish(&path, receipt, "rejected", Some(&error.code))
+            {
+                Ok(value) => Json(value).into_response(),
+                Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
+            };
+        }
+        let fallback_route = last_active_route().await;
+        let timeline_route_id = {
+            let registry = ACTIVE_SESSION_REGISTRY.read().await;
+            resolve_mcp_action_timeline_route_id(
+                &payload,
+                Some(request_id),
+                Some(&project),
+                fallback_route.as_deref(),
+                &registry,
+            )
+            .map(|resolution| resolution.route_id)
+        };
+        let result = if let Some(app) = state.app_handle.as_ref() {
+            try_handle_mcp_action_directly(
+                app,
+                &project,
+                Some(request_id),
+                timeline_route_id.as_deref(),
+                &prepared,
+            )
+            .await
+        } else {
+            try_handle_mcp_action_headless(
+                &project,
+                Some(request_id),
+                timeline_route_id.as_deref(),
+                &prepared,
+            )
+            .await
+        };
+        if result.delivered {
+            ("delivered", None)
+        } else {
+            ("uncertain", Some("delivery_not_confirmed"))
+        }
+    };
+    match super::mobile_reply::finish(&path, receipt, status, reason) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
     }
 }

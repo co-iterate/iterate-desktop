@@ -49,12 +49,15 @@ impl WebFetchTool {
             .to_string();
 
         if !status.is_success() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "HTTP 请求失败: {} {}\nURL: {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or("Unknown"),
-                request.url
-            ))]));
+            return Ok(CallToolResult {
+                content: vec![Content::text(format!(
+                    "HTTP 请求失败: {} {}\nURL: {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Unknown"),
+                    request.url
+                ))],
+                is_error: Some(true),
+            });
         }
 
         let body = response
@@ -91,9 +94,10 @@ impl WebFetchTool {
 
         log_debug!("[WebFetch] 抓取完成: {} 字符", truncated.len());
 
-        Ok(CallToolResult::success(vec![Content::text(
-            result_json.to_string(),
-        )]))
+        Ok(CallToolResult {
+            content: vec![Content::text(result_json.to_string())],
+            is_error: None,
+        })
     }
 }
 

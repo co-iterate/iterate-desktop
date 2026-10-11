@@ -16,10 +16,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const AUTHOR: &str = "imhuso";
 
 /// 应用程序主页
-pub const HOMEPAGE: &str = "https://github.com/kexin94yyds/iterate";
+pub const HOMEPAGE: &str = "https://github.com/co-iterate/iterate-desktop";
 
 /// 应用程序仓库
-pub const REPOSITORY: &str = "https://github.com/kexin94yyds/iterate";
+pub const REPOSITORY: &str = "https://github.com/co-iterate/iterate-desktop";
 
 /// 应用程序许可证
 pub const LICENSE: &str = "MIT";

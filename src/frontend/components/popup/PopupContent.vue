@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { McpRequest, PopupArtifact, PopupFileAttachment, PopupTextSelection, PopupTextSelectionSource } from '../../types/popup'
+import type { MarkdownLinkToken } from '../../utils/externalMarkdownLinks'
 import { invoke } from '@tauri-apps/api/core'
 import hljs from 'highlight.js'
 import githubDarkHighlightStyleUrl from 'highlight.js/styles/github-dark.css?url'
@@ -8,6 +9,7 @@ import MarkdownIt from 'markdown-it'
 import mermaid from 'mermaid'
 import { NImagePreview, useDialog, useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref, shallowRef, watch } from 'vue'
+import { decorateExternalMarkdownLink, handleExternalMarkdownLinkClick } from '../../utils/externalMarkdownLinks'
 import { buildOpenLocalPathInvokeArgs, isOutsideCurrentProject, isPotentialLocalMarkdownHref, resolveLocalMarkdownHref } from '../../utils/localMarkdownLinks'
 import { normalizePopupSelectionFragments, normalizePopupSelectionText } from '../../utils/popupSelectionQuote'
 import HtmlArtifactRenderer from './HtmlArtifactRenderer.vue'
@@ -457,16 +459,6 @@ function normalizeLocalImagePath(src: string): string {
   return path
 }
 
-function isAllowedExternalUrl(url: string): boolean {
-  try {
-    const parsedUrl = new URL(url)
-    return ['http:', 'https:', 'mailto:'].includes(parsedUrl.protocol)
-  }
-  catch {
-    return false
-  }
-}
-
 async function openExternalUrl(url: string) {
   try {
     await invoke('open_external_url', { url })
@@ -555,16 +547,13 @@ function handleMarkdownContentClick(event: MouseEvent) {
     return
   }
 
-  if (!isAllowedExternalUrl(href)) {
-    if (!href.startsWith('#')) {
-      event.preventDefault()
-      message.warning('不支持打开此链接')
-    }
+  if (handleExternalMarkdownLinkClick(href, event, openExternalUrl))
     return
-  }
 
-  event.preventDefault()
-  void openExternalUrl(href)
+  if (!href.startsWith('#')) {
+    event.preventDefault()
+    message.warning('不支持打开此链接')
+  }
 }
 
 // 创建 Markdown 实例 - 保持代码高亮功能
@@ -644,23 +633,7 @@ md.renderer.rules.image = function (tokens, idx) {
   return `<img src="${escapedSrc}" alt="${escapedAlt}"${titleAttr} style="${imgStyle}" />`
 }
 
-interface MarkdownTokenWithAttrs {
-  attrGet: (name: string) => string | null
-  attrSet: (name: string, value: string) => void
-}
-
-function addExternalLinkAttrs(token: MarkdownTokenWithAttrs) {
-  const href = token.attrGet('href')
-  if (!href || !isAllowedExternalUrl(href))
-    return
-
-  token.attrSet('target', '_blank')
-  token.attrSet('rel', 'noopener noreferrer')
-  token.attrSet('data-external-url', href)
-  token.attrSet('title', `打开链接: ${href}`)
-}
-
-function addLocalLinkAttrs(token: MarkdownTokenWithAttrs) {
+function addLocalLinkAttrs(token: MarkdownLinkToken) {
   const href = token.attrGet('href')
   if (!href || !isPotentialLocalMarkdownHref(href))
     return
@@ -672,7 +645,7 @@ function addLocalLinkAttrs(token: MarkdownTokenWithAttrs) {
 // 自定义链接渲染器 - 外链保留 href，由外层点击处理交给系统浏览器打开
 md.renderer.rules.link_open = function (tokens, idx, options, env, renderer) {
   const token = tokens[idx]
-  addExternalLinkAttrs(token)
+  decorateExternalMarkdownLink(token)
   addLocalLinkAttrs(token)
   return renderer.renderToken(tokens, idx, options)
 }
@@ -680,7 +653,7 @@ md.renderer.rules.link_open = function (tokens, idx, options, env, renderer) {
 // 自定义自动链接渲染器 - 处理 linkify 生成的链接
 md.renderer.rules.autolink_open = function (tokens, idx, options, env, renderer) {
   const token = tokens[idx]
-  addExternalLinkAttrs(token)
+  decorateExternalMarkdownLink(token)
   addLocalLinkAttrs(token)
   return renderer.renderToken(tokens, idx, options)
 }

@@ -864,9 +864,9 @@ async function loadSettings() {
   try {
     const res = requireOk(await homeFetch('/api/config'));
     const data = await res.json();
+    const sections = ['ui_config', 'audio_config', 'reply_config', 'custom_prompt_config', 'shortcut_config'];
     if (!data || typeof data !== 'object' || Array.isArray(data)
-      || !data.ui_config || !data.audio_config || !data.reply_config
-      || !data.custom_prompt_config || !data.shortcut_config) {
+      || sections.some(key => !data[key] || typeof data[key] !== 'object' || Array.isArray(data[key]))) {
       throw new Error('invalid_config_payload');
     }
     appConfig = data;
@@ -935,6 +935,7 @@ function openGhostSuggestionSettings() {
 function getSettingContent(id) {
   const cfg = appConfig || {};
   const ui = cfg.ui_config || {};
+  const theme = ui.theme === 'light' ? 'light' : 'dark';
   const fontCfg = ui.font_config || {};
   const winCfg = ui.window_config || {};
   const audio = cfg.audio_config || {};
@@ -945,10 +946,10 @@ function getSettingContent(id) {
   switch(id) {
     case 'theme':
       return `<div class="sub-section">
-        <div class="toggle-row"><span class="toggle-label">当前主题</span><span style="font-size:12px;color:var(--accent);">${ui.theme || 'dark'}</span></div>
+        <div class="toggle-row"><span class="toggle-label">当前主题</span><span style="font-size:12px;color:var(--accent);">${theme}</span></div>
         <select onchange="handleSetTheme(this.value)">
-          <option value="dark" ${ui.theme==='dark'?'selected':''}>深色</option>
-          <option value="light" ${ui.theme==='light'?'selected':''}>浅色</option>
+          <option value="dark" ${theme==='dark'?'selected':''}>深色</option>
+          <option value="light" ${theme==='light'?'selected':''}>浅色</option>
         </select>
       </div>`;
     case 'font': {
@@ -985,8 +986,8 @@ function getSettingContent(id) {
           <input type="text" value="${escapeHtml(reply.continue_prompt||'请按照最佳实践继续')}" placeholder="继续提示词" onchange="handleReplyPrompt(this.value)">
         </div>
         <div style="margin-top:10px;">
-          <div class="toggle-row"><span class="toggle-label">自动继续阈值</span><span style="font-size:12px;color:var(--accent);">${reply.auto_continue_threshold||1000} 字</span></div>
-          <input type="range" min="500" max="5000" step="100" value="${reply.auto_continue_threshold||1000}" style="width:100%;" oninput="this.previousElementSibling.querySelector('span:last-child').textContent=this.value+' 字'" onchange="handleReplyThreshold(parseInt(this.value))">
+          <div class="toggle-row"><span class="toggle-label">自动继续阈值</span><span style="font-size:12px;color:var(--accent);">${settingNumber(reply.auto_continue_threshold, 1000)} 字</span></div>
+          <input type="range" min="500" max="5000" step="100" value="${settingNumber(reply.auto_continue_threshold, 1000)}" style="width:100%;" oninput="this.previousElementSibling.querySelector('span:last-child').textContent=this.value+' 字'" onchange="handleReplyThreshold(parseInt(this.value))">
         </div>
       </div>`;
     case 'speech-muscle-memory': {
@@ -1062,8 +1063,8 @@ function getSettingContent(id) {
             <button class="btn ${winCfg.fixed?'btn-primary':'btn-secondary'}" style="flex:1;" onclick="handleWindowMode(true)">固定大小</button>
           </div>
         </div>
-        <div class="info-text" style="margin-top:8px;">当前尺寸：${winCfg.fixed ? (winCfg.fixed_width||600) : (winCfg.free_width||600)} × ${winCfg.fixed ? (winCfg.fixed_height||800) : (winCfg.free_height||800)} px</div>
-        <div class="info-text">限制：宽 ${winCfg.min_width||600}-${winCfg.max_width||1500}，高 ${winCfg.min_height||400}-${winCfg.max_height||1000}</div>
+        <div class="info-text" style="margin-top:8px;">当前尺寸：${settingNumber(winCfg.fixed ? winCfg.fixed_width : winCfg.free_width, 600)} × ${settingNumber(winCfg.fixed ? winCfg.fixed_height : winCfg.free_height, 800)} px</div>
+        <div class="info-text">限制：宽 ${settingNumber(winCfg.min_width, 600)}-${settingNumber(winCfg.max_width, 1500)}，高 ${settingNumber(winCfg.min_height, 400)}-${settingNumber(winCfg.max_height, 1000)}</div>
       </div>`;
     case 'audio':
       return `<div class="sub-section">
@@ -1094,7 +1095,9 @@ function getSettingContent(id) {
         <button class="btn btn-primary" style="width:100%;margin-top:8px;" onclick="handleShowWindow()">打开桌面主窗口</button>
       </div>`;
     case 'custom-prompt': {
-      const allPrompts = customPrompts.prompts || [];
+      const allPrompts = Array.isArray(customPrompts.prompts)
+        ? customPrompts.prompts.filter(prompt => prompt && typeof prompt === 'object' && !Array.isArray(prompt))
+        : [];
       const promptList = allPrompts.length > 0
         ? allPrompts.map(p => {
             const typeLabel = p.type === 'conditional' ? '上下文追加' : '快捷模板';
@@ -1251,6 +1254,9 @@ function handleResetFont() {
 }
 function handleReplyPrompt(v) {
   updateConfig('reply_config', {continue_prompt:v});
+}
+function settingNumber(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 function escapeHtml(value) {
   return String(value || '')

@@ -30,6 +30,57 @@ pub fn get_config_path(_app: &AppHandle) -> Result<PathBuf> {
     get_standalone_config_path()
 }
 
+/// Save a popup preference against the latest file, not a window's old snapshot.
+/// A single switch click may enable the item and change its state together.
+pub fn patch_conditional_prompt_settings(
+    path: &std::path::Path,
+    prompt_id: &str,
+    current_state: Option<bool>,
+    is_active: Option<bool>,
+) -> Result<AppConfig> {
+    anyhow::ensure!(
+        current_state.is_some() || is_active.is_some(),
+        "未提供上下文追加设置"
+    );
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("配置路径缺少父目录"))?;
+    fs::create_dir_all(parent)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("context-prompts.lock"))?;
+    lock.lock()?;
+    let mut value: serde_json::Value = if path.exists() {
+        serde_json::from_slice(&fs::read(path)?)?
+    } else {
+        serde_json::to_value(AppConfig::default())?
+    };
+    let prompt = value
+        .get_mut("custom_prompt_config")
+        .and_then(|config| config.get_mut("prompts"))
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|prompts| prompts.iter_mut().find(|prompt| prompt["id"] == prompt_id))
+        .ok_or_else(|| anyhow::anyhow!("未找到ID为 {} 的prompt", prompt_id))?;
+    anyhow::ensure!(
+        prompt["type"] == "conditional",
+        "该prompt不是上下文追加选项"
+    );
+    if let Some(value) = current_state {
+        prompt["current_state"] = value.into();
+    }
+    if let Some(value) = is_active {
+        prompt["is_active"] = value.into();
+    }
+    prompt["updated_at"] = chrono::Utc::now().to_rfc3339().into();
+    // Validate before writing; preserve unrelated and unknown JSON fields.
+    let config: AppConfig = serde_json::from_value(value.clone())?;
+    atomic_write_config(path, &serde_json::to_vec_pretty(&value)?)?;
+    Ok(config)
+}
+
 pub async fn save_config(state: &State<'_, AppState>, app: &AppHandle) -> Result<()> {
     let config_path = get_config_path(app)?;
 
@@ -38,10 +89,16 @@ pub async fn save_config(state: &State<'_, AppState>, app: &AppHandle) -> Result
         fs::create_dir_all(parent)?;
     }
 
-    let config = state
+    // The CLI owns formal-route registration. Ordinary GUI settings must not
+    // restore an older route from this window's cached AppState.
+    let _route_guard = crate::tunnel::formal_transport::try_lock_formal_route()
+        .map_err(anyhow::Error::msg)?;
+    let latest_route = load_standalone_config()?.mobile_config.formal_route;
+    let mut config = state
         .config
         .lock()
         .map_err(|e| anyhow::anyhow!("获取配置失败: {}", e))?;
+    config.mobile_config.formal_route = latest_route;
     let config_json = serde_json::to_string_pretty(&*config)?;
 
     atomic_write_config(&config_path, config_json.as_bytes())?;
@@ -224,5 +281,76 @@ fn merge_default_shortcuts(config: &mut AppConfig) {
                     .insert(key, default_binding);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod context_prompt_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value["custom_prompt_config"]["prompts"] = json!([
+            {"id":"a", "name":"A", "content":"", "sort_order":0,
+             "created_at":"old", "updated_at":"old", "type":"conditional",
+             "current_state":false, "is_active":false},
+            {"id":"b", "name":"B", "content":"", "sort_order":1,
+             "created_at":"old", "updated_at":"old", "type":"conditional",
+             "current_state":false, "is_active":false}
+        ]);
+        value["unrelated_future_setting"] = json!({"keep":true});
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn fresh_reads_keep_enabled_and_disabled_preferences_and_other_settings() {
+        let (_dir, path) = fixture();
+        let mut expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        patch_conditional_prompt_settings(&path, "a", Some(true), Some(true)).unwrap();
+        let fresh: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(fresh.custom_prompt_config.prompts[0].current_state);
+        assert!(fresh.custom_prompt_config.prompts[0].is_active);
+        patch_conditional_prompt_settings(&path, "a", None, Some(false)).unwrap();
+        let mut actual: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        expected["custom_prompt_config"]["prompts"][0]["current_state"] = true.into();
+        actual["custom_prompt_config"]["prompts"][0]["updated_at"] = "old".into();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn independent_window_writers_do_not_drop_each_others_changes() {
+        let (_dir, path) = fixture();
+        std::thread::scope(|scope| {
+            for id in ["a", "b"] {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        patch_conditional_prompt_settings(path, id, Some(true), Some(true))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let fresh: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(fresh
+            .custom_prompt_config
+            .prompts
+            .iter()
+            .all(|p| p.current_state && p.is_active));
+    }
+
+    #[test]
+    fn invalid_preference_does_not_change_the_file() {
+        let (_dir, path) = fixture();
+        let before = fs::read(&path).unwrap();
+        assert!(patch_conditional_prompt_settings(&path, "missing", Some(true), None).is_err());
+        assert!(patch_conditional_prompt_settings(&path, "a", None, None).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }

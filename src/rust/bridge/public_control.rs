@@ -25,11 +25,14 @@ fn public_bridge_base_url_override() -> Option<String> {
 fn configured_public_bridge_base_url() -> Option<String> {
     let config = crate::config::load_standalone_config().ok()?;
     if let Some(route) = config.mobile_config.formal_route.as_ref() {
-        if route.schema_version == 1 && route.transport == "cloudflare_named_tunnel" {
+        if route.schema_version == 1
+            && crate::tunnel::formal_transport::is_supported_formal_transport(&route.transport)
+        {
             if let Some(base_url) = normalize_public_origin(&route.base_url) {
                 return Some(base_url);
             }
         }
+        return None;
     }
     config
         .cloudflare_config
@@ -39,6 +42,9 @@ fn configured_public_bridge_base_url() -> Option<String> {
 }
 
 pub(super) fn public_bridge_base_url() -> String {
+    if crate::tunnel::commands::self_hosted_formal_route_selected() {
+        return configured_public_bridge_base_url().unwrap_or_default();
+    }
     public_bridge_base_url_override()
         .or_else(configured_public_bridge_base_url)
         .unwrap_or_default()
@@ -127,6 +133,7 @@ pub(super) fn is_public_control_path(path: &str) -> bool {
         || path.starts_with("/bridge/")
         || path.starts_with("/api/ghost-suggestions/")
         || path.starts_with("/api/phone-action-jobs/")
+        || path.starts_with("/api/markdown-documents/")
         || matches!(
             path,
             "/api/active-sessions"
@@ -146,11 +153,13 @@ pub(super) fn is_public_control_path(path: &str) -> bool {
                 | "/api/ghost-suggestion-learning"
                 | "/api/import-prompts-dir"
                 | "/api/mcp-tools"
+                | "/api/mobile/reply"
                 | "/api/mobile/pairing"
                 | "/api/mobile/pairing/claim"
                 | "/api/mobile/pairing/status"
                 | "/api/mobile/paired-device-file-roots"
                 | "/api/open-codex-chat"
+                | "/api/create-codex-task"
                 | "/api/phone-action"
                 | "/api/phone-action-result"
                 | "/api/prompt-library"

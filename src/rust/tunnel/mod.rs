@@ -1,5 +1,7 @@
 pub mod commands;
+pub mod formal_transport;
 pub mod manager;
+pub mod managed;
 pub mod secret;
 
 pub use commands::{
