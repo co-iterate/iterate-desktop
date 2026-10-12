@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_PATH="${WORKSPACE_PATH:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+WORKSPACE_PATH="${WORKSPACE_PATH:-${HOME}/cunzhi}"
 APP_PATH="${APP_PATH:-/Applications/iterate.app}"
 PUBLIC_RELEASES_PAGE_URL="${PUBLIC_RELEASES_PAGE_URL:-https://github.com/kexin94yyds/iterate-releases/releases/latest}"
 PRIMARY_RELEASES_PAGE_URL="${PRIMARY_RELEASES_PAGE_URL:-https://github.com/kexin94yyds/iterate/releases/latest}"

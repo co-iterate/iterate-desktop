@@ -4071,7 +4071,7 @@ mod tests {
     fn relay_bridge_message_accepts_scoped_mcp_action() {
         let message = relay_bridge_message_from_payload(&json!({
             "action": "submit",
-            "project_path": "/Users/test/project",
+            "project_path": "/Users/example/cunzhi",
             "request_id": "serve-1",
             "user_input": "hello",
             "selected_options": [],
@@ -4086,7 +4086,7 @@ mod tests {
             "message_type": "mcp_action",
             "payload": {
                 "action": "update_window_conditional_state",
-                "project_path": "/Users/test/project",
+                "project_path": "/Users/example/cunzhi",
                 "request_id": "serve-1",
                 "promptId": "prompt-1",
                 "newState": true
@@ -4105,7 +4105,7 @@ mod tests {
             &json!({
                 "message_type": "request_sync",
                 "payload": {
-                    "project_path": "/Users/test/project"
+                    "project_path": "/Users/example/cunzhi"
                 }
             })
             .to_string(),
@@ -4162,7 +4162,7 @@ mod tests {
             "message_type": "mcp_action",
             "payload": {
                 "action": "send_to_browser_ai",
-                "project_path": "/Users/test/project",
+                "project_path": "/Users/example/cunzhi",
                 "user_input": "hello"
             }
         }))
@@ -4198,7 +4198,7 @@ mod tests {
             &config,
             &json!({
                 "action": "update_window_conditional_state",
-                "project_path": "/Users/test/project",
+                "project_path": "/Users/example/cunzhi",
                 "request_id": "relay-no-content-test",
                 "promptId": "prompt-1",
                 "newState": true

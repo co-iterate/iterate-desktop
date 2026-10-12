@@ -113,7 +113,7 @@ message: string (可选) — 提交信息，默认 "checkpoint: YYYY-MM-DD HH:MM
 
 ### 流程
 ```
-checkpoint(project_path="/Users/example/project")
+checkpoint(project_path="/Users/example/cunzhi")
   ↓
 验证路径存在
   ↓

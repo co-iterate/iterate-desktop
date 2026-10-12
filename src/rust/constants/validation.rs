@@ -140,8 +140,8 @@ pub fn validate_window_config(
 pub fn validate_audio_config(url: &str, volume: f32, enabled: bool) -> ValidationResult {
     let mut result = ValidationResult::new();
 
-    if enabled && !crate::constants::audio::is_safe_audio_config_reference(url) {
-        result.add_error("无效的音频来源".to_string());
+    if enabled && !url.is_empty() && !is_valid_url(url) {
+        result.add_error(format!("无效的音频 URL: {}", url));
     }
 
     if !is_valid_volume(volume) {

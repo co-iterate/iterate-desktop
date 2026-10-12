@@ -10,7 +10,9 @@ import {
   auditPackageScriptFiles,
   auditPackageScripts,
   auditSourceAssetPolicy,
+  auditPackageScriptRuns,
   auditWorkflowActionPins,
+  prunePackageScripts,
   scanTextFindings,
   selectIncludedPaths,
   validateExportDestination,
@@ -327,4 +329,49 @@ test('export destination must stay outside the real source worktree', async () =
   finally {
     await rm(fixtureRoot, { recursive: true })
   }
+})
+
+test('export prunes scripts that reference unexported files and rewrites run-only aggregates', () => {
+  const source = {
+    name: 'iterate',
+    version: '1.0.0',
+    dependencies: { vue: '^3' },
+    scripts: {
+      'test:kept': 'node --test scripts/desktop-kept.test.mjs',
+      'test:excluded-but-present': 'node --test scripts/private-only.test.mjs',
+      'test:multi': 'node --test scripts/desktop-kept.test.mjs scripts/missing.test.mjs',
+      'test:private-dir': 'node ios-app/build.mjs',
+      'test:all': 'pnpm run test:kept && pnpm run test:multi && pnpm run test:private-dir',
+      'test:only-gone': 'pnpm run test:multi && pnpm run test:excluded-but-present',
+      'test:outer': 'pnpm run test:only-gone',
+      'mixed': 'cd tools && pnpm run test:multi',
+    },
+  }
+  const text = `${JSON.stringify(source, null, 2)}\n`
+  const selected = ['package.json', 'scripts/desktop-kept.test.mjs']
+  const result = prunePackageScripts(text, selected, ['ios-app/'])
+  const output = JSON.parse(result.text)
+
+  assert.deepEqual(Object.keys(output.scripts).sort(), ['mixed', 'test:all', 'test:kept'])
+  assert.equal(output.scripts['test:all'], 'pnpm run test:kept')
+  assert.equal(output.scripts.mixed, source.scripts.mixed, 'mixed shell scripts are never rewritten')
+  assert.deepEqual(result.removed.map(item => item.script).sort(), [
+    'test:excluded-but-present', 'test:multi', 'test:only-gone', 'test:outer', 'test:private-dir',
+  ])
+  const { scripts: _ignored, ...rest } = output
+  const { scripts: _source, ...sourceRest } = source
+  assert.deepEqual(rest, sourceRest)
+  assert.deepEqual(source.scripts['test:all'].length > 0, true, 'input object is not mutated')
+
+  assert.deepEqual(auditPackageScriptRuns('package.json', result.text), [
+    { code: 'dangling-script-reference', path: 'package.json', script: 'mixed->test:multi' },
+  ])
+  assert.deepEqual(prunePackageScripts(result.text, selected, ['ios-app/']).removed, [], 'idempotent')
+})
+
+test('export pruning leaves clean packages byte-identical and rejects invalid JSON', () => {
+  const text = '{\n  "scripts": { "a": "node scripts/desktop-a.mjs" }\n}\n'
+  assert.equal(prunePackageScripts(text, ['scripts/desktop-a.mjs'], []).text, text)
+  assert.throws(() => prunePackageScripts('{', [], []))
+  assert.throws(() => prunePackageScripts('{"scripts":[]}', [], []))
 })

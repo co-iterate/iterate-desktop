@@ -225,6 +225,8 @@ export function initialMobileConnectionState(): MobileConnectionState {
 }
 
 export function mobileConnectionFailureText(state: MobileConnectionState, transientError: string): string {
+  if (state.error?.code.startsWith('managed_'))
+    return state.error.message
   if (state.error)
     return `[${state.error.code}] ${state.error.message}`
   return transientError.trim()

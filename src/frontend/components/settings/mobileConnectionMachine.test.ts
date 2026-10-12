@@ -12,6 +12,7 @@ import {
   resolveMobileConnectionBootstrap,
   singleFlight,
 } from './mobileConnectionMachine.ts'
+import { buildFormalRouteRepairPrompt, buildFormalRouteSetupPrompt } from './mobileConnectionPrompts.ts'
 
 const healthyPublic = {
   transport_mode: 'public_tunnel',
@@ -224,15 +225,17 @@ test('singleFlight coalesces duplicate pairing issue requests', async () => {
 
 test('production wizard exposes formal setup and repair prompts without Quick or Relay fallback', async () => {
   const setup = await readFile(new URL('./useMobileConnectionSetup.ts', import.meta.url), 'utf8')
+  const prompt = await readFile(new URL('./mobileConnectionPrompts.ts', import.meta.url), 'utf8')
   const wizard = await readFile(new URL('./MobileConnectionWizard.vue', import.meta.url), 'utf8')
 
   assert.doesNotMatch(setup, /cloudflareApiToken|zoneName|subdomain|create_cloudflare_web_login_auto_setup/)
   assert.doesNotMatch(setup, /start_quick_tunnel|stop_quick_tunnel|get_quick_tunnel_status/)
-  assert.doesNotMatch(setup, /trycloudflare\.com|免费临时通道/)
+  assert.match(setup, /from '\.\/mobileConnectionPrompts\.ts'/)
   assert.match(setup, /buildFormalRouteSetupPrompt/)
   assert.match(setup, /buildFormalRouteRepairPrompt/)
-  assert.match(setup, /登录 Cloudflare[\s\S]*必须暂停/)
-  assert.match(setup, /禁止[\s\S]*token/)
+  assert.match(prompt, /登录 Cloudflare[\s\S]*等待我明确确认/)
+  assert.match(prompt, /禁止[\s\S]*token/)
+  assert.match(prompt, /禁止使用 Quick Tunnel、随机 trycloudflare\.com、Relay、LAN/)
   assert.match(wizard, /复制 AI 配置提示词/)
   assert.match(wizard, /修复现有配置/)
   assert.match(wizard, /state\.stage === 'setup_required'/)
@@ -249,15 +252,59 @@ test('production wizard exposes formal setup and repair prompts without Quick or
 })
 
 test('formal AI prompts are redacted, route-scoped, and contain no developer hostname', async () => {
-  const prompt = await readFile(new URL('./useMobileConnectionSetup.ts', import.meta.url), 'utf8')
+  const prompt = await readFile(new URL('./mobileConnectionPrompts.ts', import.meta.url), 'utf8')
+  const setupPrompt = buildFormalRouteSetupPrompt()
+  const repairPrompt = buildFormalRouteRepairPrompt('https://user-owned.example.com', 'probe timeout / raw detail')
 
   assert.match(prompt, /buildFormalRouteSetupPrompt/)
   assert.match(prompt, /buildFormalRouteRepairPrompt/)
   assert.match(prompt, /\$\{safeBaseUrl\}/)
   assert.doesNotMatch(prompt, /iterate\.tobooks\.xin/)
-  assert.match(prompt, /禁止[\s\S]*读取、打印、复制或上传/)
-  assert.match(prompt, /禁止[\s\S]*Quick Tunnel/)
-  assert.match(prompt, /禁止[\s\S]*Relay/)
+  assert.match(setupPrompt, /--mobile-route-status[\s\S]*--mobile-route-verify/)
+  assert.match(setupPrompt, /configured=true 且 healthy/)
+  assert.match(setupPrompt, /configured=true 但不健康/)
+  assert.match(setupPrompt, /configured=false/)
+  assert.match(setupPrompt, /正式路线只支持 cloudflare_named_tunnel/)
+  assert.match(setupPrompt, /当前版本无法完成长期稳定的正式二维码公网路线/)
+  assert.match(setupPrompt, /禁止读取、打印、复制或上传凭据内容/)
+  assert.match(setupPrompt, /禁止使用 Quick Tunnel、随机 trycloudflare\.com、Relay、LAN/)
+  assert.doesNotMatch(setupPrompt, /iterate\.tobooks\.xin/)
+  assert.match(repairPrompt, /已配置地址：https:\/\/user-owned\.example\.com/)
+  assert.match(repairPrompt, /脱敏错误码：probe_timeout___raw_detail/)
+  assert.doesNotMatch(repairPrompt, /probe timeout \/ raw detail/)
+})
+
+test('the handbook keeps the approved tab name, card order, and shared QR prompt', async () => {
+  const layout = await readFile(new URL('../layout/MainLayout.vue', import.meta.url), 'utf8')
+  const source = await readFile(new URL('../tabs/PromptsTab.vue', import.meta.url), 'utf8')
+
+  assert.match(layout, /<n-tab-pane name="prompts" tab="使用说明书">/)
+  assert.doesNotMatch(layout, /<n-tab-pane name="prompts" tab="参考提示词">/)
+  assert.match(source, /import \{ buildFormalRouteSetupPrompt \} from '\.\.\/settings\/mobileConnectionPrompts'/)
+  assert.match(source, /const mobilePromptContent = buildFormalRouteSetupPrompt\(\)/)
+  const handbookIndex = source.indexOf('<!-- 使用说明书卡片 -->')
+  const installIndex = source.indexOf('<!-- iterate 安装卡片 -->')
+  const iphoneIndex = source.indexOf('<!-- iPhone 二维码配置提示词卡片 -->')
+  const systemPromptIndex = source.indexOf('<!-- 核心系统提示词卡片 -->')
+  assert.ok(handbookIndex >= 0)
+  assert.ok(installIndex > handbookIndex)
+  assert.ok(iphoneIndex > installIndex)
+  assert.ok(systemPromptIndex > iphoneIndex)
+  assert.equal((source.match(/>\s*使用说明书\s*</g) || []).length, 1)
+  assert.equal((source.match(/>\s*iterate 安装\s*</g) || []).length, 1)
+  assert.equal((source.match(/>\s*启用 iPhone 二维码\s*</g) || []).length, 1)
+  assert.equal((source.match(/>\s*核心系统提示词\s*</g) || []).length, 1)
+  assert.match(source, /启用 iPhone 二维码/)
+  assert.match(source, /iPhone 远程连接/)
+  assert.match(source, /复制配置提示词/)
+  assert.match(source, /查看完整提示词/)
+  assert.match(source, /n-collapse-transition :show="mobilePromptExpanded"/)
+  assert.match(source, /配置提示词已复制/)
+  assert.match(source, /其中 \{\{ enabledPromptToolCount \}\} 个模块已纳入下方核心系统提示词/)
+  assert.doesNotMatch(source, />\s*安装提示词\s*</)
+  assert.doesNotMatch(source, />\s*使用说明\s*</)
+  assert.doesNotMatch(source, /--mobile-route-register/)
+  assert.doesNotMatch(source, /重新检测/)
 })
 
 test('bootstrap branches only on persisted formal route status', async () => {

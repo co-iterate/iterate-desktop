@@ -125,10 +125,10 @@ impl BrowserProxy {
     ) -> Result<CallToolResult, McpError> {
         log_debug!("[Browser] 透传调用: {}", name);
         let client = Self::get_or_create_client().await?;
-        let mut call_request = CallToolRequestParam::new(name);
-        if let Some(arguments) = arguments {
-            call_request = call_request.with_arguments(arguments);
-        }
+        let call_request = CallToolRequestParam {
+            name: name.into(),
+            arguments,
+        };
         let result = client.call_tool(call_request).await.map_err(|e| {
             log_important!(error, "[Browser] 调用失败: {}", e);
             McpError::internal_error(format!("浏览器工具调用失败: {}", e), None)

@@ -18,7 +18,6 @@ const showControls = ref(props.showControls !== false)
 const currentTheme = ref('dark')
 const showPopup = ref(true)
 const isMuted = ref(false)
-const shortcutEnabled = ref(true)
 
 const mockAppConfig = computed(() => ({
   theme: currentTheme.value,
@@ -597,14 +596,14 @@ ${htmlArtifactDemo}
     name: 'Markdown 本地文件链接',
     request: {
       id: 'test-local-file-links',
-      project_path: '/Users/test/project',
+      project_path: '/Users/example/cunzhi',
       message: `# 本地文件链接点击测试
 
 请点击下面几个项目内文件链接，验证弹窗会调用本地打开命令：
 
 1. [README.md](README.md)
 2. [后端命令实现](src/rust/ui/commands.rs:1610)
-3. [package.json](file:///Users/test/project/package.json)
+3. [package.json](file:///Users/example/cunzhi/package.json)
 
 外部链接仍应走系统浏览器：[OpenAI](https://openai.com/)`,
       predefined_options: ['本地链接正常', '项目外路径被拦截', '继续真实弹窗验证'],
@@ -822,15 +821,6 @@ function handleNewChat() {
 function handleToggleTerminal() {
   console.log('切换终端')
 }
-
-function handleToggleShortcut(enabled: boolean) {
-  shortcutEnabled.value = enabled
-  console.log('切换快捷键:', enabled)
-}
-
-function handleMinimizeWindow() {
-  console.log('最小化窗口')
-}
 </script>
 
 <template>
@@ -914,17 +904,14 @@ function handleMinimizeWindow() {
                     :show-main-layout="false"
                     :always-on-top="mockAppConfig.window.alwaysOnTop"
                     :is-muted="isMuted"
-                    :shortcut-enabled="shortcutEnabled"
                     :quota-providers="usageProviders"
-                    project-path="/Users/test/project"
+                    project-path="/Users/example/cunzhi"
                     @theme-change="handleThemeChange"
                     @open-main-layout="handleOpenMainLayout"
                     @toggle-always-on-top="handleToggleAlwaysOnTop"
                     @toggle-mute="handleToggleMute"
                     @new-chat="handleNewChat"
                     @toggle-terminal="handleToggleTerminal"
-                    @toggle-shortcut="handleToggleShortcut"
-                    @minimize-window="handleMinimizeWindow"
                   />
                 </div>
                 <McpPopup
@@ -991,17 +978,14 @@ function handleMinimizeWindow() {
             :show-main-layout="false"
             :always-on-top="mockAppConfig.window.alwaysOnTop"
             :is-muted="isMuted"
-            :shortcut-enabled="shortcutEnabled"
             :quota-providers="usageProviders"
-            project-path="/Users/test/project"
+            project-path="/Users/example/cunzhi"
             @theme-change="handleThemeChange"
             @open-main-layout="handleOpenMainLayout"
             @toggle-always-on-top="handleToggleAlwaysOnTop"
             @toggle-mute="handleToggleMute"
             @new-chat="handleNewChat"
             @toggle-terminal="handleToggleTerminal"
-            @toggle-shortcut="handleToggleShortcut"
-            @minimize-window="handleMinimizeWindow"
           />
         </div>
         <McpPopup

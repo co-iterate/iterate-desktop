@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useNotification } from '../../composables/useNotification'
 import { SETUP_PROMPT_CONTENT } from '../../constants/setupPrompt'
+import McpClientSettings from '../settings/McpClientSettings.vue'
 
 const props = defineProps<{
   trialDays?: number
@@ -179,10 +180,23 @@ onMounted(() => {
               </div>
             </div>
 
+            <div class="setup-copy-card setup-connect-card">
+              <div class="setup-copy-copy">
+                <p class="setup-copy-title">
+                  把 iterate 接入你正在用的 AI 客户端
+                </p>
+                <p class="setup-copy-description">
+                  已勾选本机检测到的客户端，确认后点一次即可，之后 iterate 会自动维护这份配置。
+                </p>
+              </div>
+
+              <McpClientSettings compact />
+            </div>
+
             <div class="setup-copy-card">
               <div class="setup-copy-copy">
                 <p class="setup-copy-title">
-                  如果你要把 iterate 接到当前 IDE 或 CLI
+                  用的是其他 IDE 或 CLI？
                 </p>
                 <p class="setup-copy-description">
                   把安装提示词发给你当前正在使用的 AI。它会继续帮你配置 MCP、刷新当前 IDE 或 CLI，并做最小验证。
@@ -586,6 +600,11 @@ onMounted(() => {
   border-radius: 18px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.04);
+}
+
+.setup-connect-card {
+  flex-direction: column;
+  align-items: stretch;
 }
 
 .setup-copy-copy {

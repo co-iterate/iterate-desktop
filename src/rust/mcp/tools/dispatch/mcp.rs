@@ -154,6 +154,7 @@ pnpm codex-room wait --room <room> --project <project_path> --after <target_subm
             link_url: None,
             link_title: None,
             browser_ai_response: None,
+            browser_tab_id: None,
         };
 
         match create_tauri_popup(&popup_request) {
@@ -219,7 +220,7 @@ mod tests {
         let request = PaiRequest {
             task_type: "代码审查".to_string(),
             items: vec!["scripts/codex-room.mjs".to_string()],
-            project_path: Some("/Users/test/project".to_string()),
+            project_path: Some("/Users/example/cunzhi".to_string()),
             source_file: None,
             target_file: None,
             output_format: None,

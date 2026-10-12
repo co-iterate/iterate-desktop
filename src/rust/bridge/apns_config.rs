@@ -1,6 +1,7 @@
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use once_cell::sync::Lazy;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
@@ -13,7 +14,8 @@ struct CachedApnsBearer {
     token: String,
 }
 
-static APNS_BEARER_CACHE: Lazy<Mutex<Option<CachedApnsBearer>>> = Lazy::new(|| Mutex::new(None));
+static APNS_BEARER_CACHE: Lazy<Mutex<HashMap<u64, CachedApnsBearer>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ApnsEnvironment {
@@ -31,6 +33,12 @@ impl ApnsEnvironment {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct ApnsProviderCredentials {
+    pub(super) key_id: String,
+    pub(super) key_pem: String,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ApnsConfig {
     pub(super) key_id: String,
     pub(super) team_id: String,
@@ -38,6 +46,37 @@ pub(super) struct ApnsConfig {
     pub(super) key_pem: String,
     pub(super) default_environment: ApnsEnvironment,
     pub(super) endpoint: String,
+    pub(super) sandbox_credentials: Option<ApnsProviderCredentials>,
+    pub(super) production_credentials: Option<ApnsProviderCredentials>,
+}
+
+impl ApnsConfig {
+    pub(super) fn provider_credentials(
+        &self,
+        environment: ApnsEnvironment,
+    ) -> Result<ApnsProviderCredentials, String> {
+        let scoped = match environment {
+            ApnsEnvironment::Sandbox => self.sandbox_credentials.as_ref(),
+            ApnsEnvironment::Production => self.production_credentials.as_ref(),
+        };
+        if let Some(credentials) = scoped {
+            return Ok(credentials.clone());
+        }
+
+        let scoped_mode =
+            self.sandbox_credentials.is_some() || self.production_credentials.is_some();
+        if !scoped_mode || environment == self.default_environment {
+            return Ok(ApnsProviderCredentials {
+                key_id: self.key_id.clone(),
+                key_pem: self.key_pem.clone(),
+            });
+        }
+
+        Err(format!(
+            "APNs {} provider key is not configured",
+            environment.as_str()
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -72,13 +111,27 @@ fn load_apns_config_from_env() -> Option<ApnsConfig> {
     let key_pem = load_apns_key_pem_from_env()?;
     let default_environment = configured_apns_environment();
     let endpoint = apns_endpoint(default_environment).to_string();
+    let sandbox_credentials = match load_scoped_apns_credentials("SANDBOX") {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            log::warn!("[APNs] sandbox provider 配置无效: {}", error);
+            return None;
+        }
+    };
+    let production_credentials = match load_scoped_apns_credentials("PRODUCTION") {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            log::warn!("[APNs] production provider 配置无效: {}", error);
+            return None;
+        }
+    };
 
     log::info!(
-        "[APNs] 配置加载成功: key_id={}, team_id={}, topic={}, endpoint={}",
-        key_id,
-        team_id,
+        "[APNs] 配置加载成功: topic={}, endpoint={}, sandbox_scoped={}, production_scoped={}",
         topic,
-        endpoint
+        endpoint,
+        sandbox_credentials.is_some(),
+        production_credentials.is_some()
     );
 
     Some(ApnsConfig {
@@ -88,6 +141,8 @@ fn load_apns_config_from_env() -> Option<ApnsConfig> {
         key_pem,
         default_environment,
         endpoint,
+        sandbox_credentials,
+        production_credentials,
     })
 }
 
@@ -142,6 +197,36 @@ fn load_apns_key_pem_from_env() -> Option<String> {
     std::env::var("APNS_AUTH_KEY_P8").ok()
 }
 
+fn load_scoped_apns_credentials(
+    environment_prefix: &str,
+) -> Result<Option<ApnsProviderCredentials>, String> {
+    let key_id_name = format!("APNS_{}_KEY_ID", environment_prefix);
+    let key_path_name = format!("APNS_{}_AUTH_KEY_PATH", environment_prefix);
+    let key_p8_name = format!("APNS_{}_AUTH_KEY_P8", environment_prefix);
+    let key_id = std::env::var(&key_id_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let key_path = std::env::var(&key_path_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let inline_key = std::env::var(&key_p8_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    if key_id.is_none() && key_path.is_none() && inline_key.is_none() {
+        return Ok(None);
+    }
+    let key_id = key_id.ok_or_else(|| format!("{} is required", key_id_name))?;
+    let key_pem = if let Some(path) = key_path {
+        std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {}", key_path_name, error))?
+    } else {
+        inline_key.ok_or_else(|| format!("{} or {} is required", key_path_name, key_p8_name))?
+    };
+
+    Ok(Some(ApnsProviderCredentials { key_id, key_pem }))
+}
+
 /// 从 ~/.config/iterate/apns-env.sh 解析 export KEY=VALUE 并设置到环境变量。
 /// 当必需项已经来自 launchd 环境时，只补缺失项，避免文件覆盖显式运行时配置。
 fn load_apns_env_from_file(overwrite_existing: bool) {
@@ -169,46 +254,53 @@ fn load_apns_env_from_file(overwrite_existing: bool) {
     log::info!("[APNs] 从文件加载环境变量: {:?}", path);
 }
 
-pub(super) fn build_apns_bearer_token(config: &ApnsConfig) -> Result<String, String> {
+pub(super) fn build_apns_bearer_token(
+    config: &ApnsConfig,
+    environment: ApnsEnvironment,
+) -> Result<String, String> {
     let now = chrono::Utc::now().timestamp();
-    let config_fingerprint = apns_bearer_config_fingerprint(config);
+    let credentials = config.provider_credentials(environment)?;
+    let config_fingerprint = apns_bearer_config_fingerprint(&config.team_id, &credentials);
     let mut cache = APNS_BEARER_CACHE
         .lock()
         .map_err(|_| "APNs JWT 缓存锁不可用".to_string())?;
-    if let Some(cached) = cache.as_ref() {
+    if let Some(cached) = cache.get(&config_fingerprint) {
         if cached_apns_bearer_is_fresh(cached, config_fingerprint, now) {
             return Ok(cached.token.clone());
         }
     }
 
     let mut header = Header::new(Algorithm::ES256);
-    header.kid = Some(config.key_id.clone());
+    header.kid = Some(credentials.key_id.clone());
 
     let claims = ApnsClaims {
         iss: config.team_id.clone(),
         iat: now as usize,
     };
 
-    let encoding_key = EncodingKey::from_ec_pem(config.key_pem.as_bytes())
+    let encoding_key = EncodingKey::from_ec_pem(credentials.key_pem.as_bytes())
         .map_err(|err| format!("APNs 私钥加载失败: {}", err))?;
 
     let token = jsonwebtoken::encode(&header, &claims, &encoding_key)
         .map_err(|err| format!("APNs JWT 生成失败: {}", err))?;
 
-    *cache = Some(CachedApnsBearer {
+    cache.insert(
         config_fingerprint,
-        issued_at: now,
-        token: token.clone(),
-    });
+        CachedApnsBearer {
+            config_fingerprint,
+            issued_at: now,
+            token: token.clone(),
+        },
+    );
 
     Ok(token)
 }
 
-fn apns_bearer_config_fingerprint(config: &ApnsConfig) -> u64 {
+fn apns_bearer_config_fingerprint(team_id: &str, credentials: &ApnsProviderCredentials) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.key_id.hash(&mut hasher);
-    config.team_id.hash(&mut hasher);
-    config.key_pem.hash(&mut hasher);
+    credentials.key_id.hash(&mut hasher);
+    team_id.hash(&mut hasher);
+    credentials.key_pem.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -295,6 +387,76 @@ mod tests {
         );
         assert!(
             resolve_apns_environment(Some("custom-endpoint"), ApnsEnvironment::Production).is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_provider_credentials_select_production_and_keep_legacy_sandbox_default() {
+        let config = ApnsConfig {
+            key_id: "SANDBOX_LEGACY".to_string(),
+            team_id: "TEAM".to_string(),
+            topic: "com.iterate.notify".to_string(),
+            key_pem: "SANDBOX_PEM".to_string(),
+            default_environment: ApnsEnvironment::Sandbox,
+            endpoint: apns_endpoint(ApnsEnvironment::Sandbox).to_string(),
+            sandbox_credentials: None,
+            production_credentials: Some(ApnsProviderCredentials {
+                key_id: "PRODUCTION_KEY".to_string(),
+                key_pem: "PRODUCTION_PEM".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            config
+                .provider_credentials(ApnsEnvironment::Sandbox)
+                .expect("sandbox credentials")
+                .key_id,
+            "SANDBOX_LEGACY"
+        );
+        assert_eq!(
+            config
+                .provider_credentials(ApnsEnvironment::Production)
+                .expect("production credentials")
+                .key_id,
+            "PRODUCTION_KEY"
+        );
+    }
+
+    #[test]
+    fn scoped_provider_mode_refuses_cross_environment_legacy_fallback() {
+        let config = ApnsConfig {
+            key_id: "SANDBOX_LEGACY".to_string(),
+            team_id: "TEAM".to_string(),
+            topic: "com.iterate.notify".to_string(),
+            key_pem: "SANDBOX_PEM".to_string(),
+            default_environment: ApnsEnvironment::Sandbox,
+            endpoint: apns_endpoint(ApnsEnvironment::Sandbox).to_string(),
+            sandbox_credentials: Some(ApnsProviderCredentials {
+                key_id: "SANDBOX_SCOPED".to_string(),
+                key_pem: "SANDBOX_SCOPED_PEM".to_string(),
+            }),
+            production_credentials: None,
+        };
+
+        assert!(config
+            .provider_credentials(ApnsEnvironment::Production)
+            .is_err());
+    }
+
+    #[test]
+    fn bearer_fingerprint_separates_environment_specific_keys() {
+        let sandbox = ApnsProviderCredentials {
+            key_id: "SANDBOX_KEY".to_string(),
+            key_pem: "SANDBOX_PEM".to_string(),
+        };
+        let production = ApnsProviderCredentials {
+            key_id: "PRODUCTION_KEY".to_string(),
+            key_pem: "PRODUCTION_PEM".to_string(),
+        };
+
+        assert_ne!(
+            apns_bearer_config_fingerprint("TEAM", &sandbox),
+            apns_bearer_config_fingerprint("TEAM", &production)
         );
     }
 }

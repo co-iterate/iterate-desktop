@@ -78,6 +78,7 @@ export const DEFAULT_GHOST_SUGGESTIONS: DefaultGhostSuggestion[] = [
 
 const STORAGE_KEY = 'iterate:ghost-suggestions:v1'
 const STORAGE_EVENT_NAME = 'iterate:ghost-suggestions-updated'
+const LEGACY_UNTRUSTED_TYPED_DESCRIPTION = '自动学习 / 手动输入高频候选'
 export const GHOST_SUGGESTIONS_ENABLED_STORAGE_KEY = 'iterate:ghost-suggestions:enabled'
 const GHOST_SUGGESTIONS_ENABLED_EVENT_NAME = 'iterate:ghost-suggestions-enabled-changed'
 const DEFAULT_SEED_VERSION = 6
@@ -90,6 +91,7 @@ const ghostSuggestionsEnabled = ref(true)
 let loaded = false
 let syncListenerReady = false
 let tauriSyncListenerReady = false
+let authoritativeLearningV2CleanupApplied = false
 let sharedFileSyncTimer: number | null = null
 let sharedFileSyncInFlight = false
 
@@ -159,6 +161,21 @@ function shouldProtectSharedStore(candidateStore: GhostSuggestionStore | null, b
   return shouldPreventCacheRollback(candidateStore, baselineStore, {
     defaultKeys: getDefaultKeys(),
   })
+}
+
+function containsLegacyUntrustedTypedSuggestions(store: GhostSuggestionStore | null): boolean {
+  return store?.suggestions.some(suggestion =>
+    suggestion.description.trim() === LEGACY_UNTRUSTED_TYPED_DESCRIPTION,
+  ) ?? false
+}
+
+function shouldIgnorePreCleanupStore(
+  candidateStore: GhostSuggestionStore | null,
+  currentStore: GhostSuggestionStore | null,
+): boolean {
+  return authoritativeLearningV2CleanupApplied
+    && containsLegacyUntrustedTypedSuggestions(candidateStore)
+    && !containsLegacyUntrustedTypedSuggestions(currentStore)
 }
 
 function isDefaultSuggestionId(id: string): boolean {
@@ -280,8 +297,13 @@ async function syncFromSharedFile(options: { writeBackIfLocalNewer?: boolean } =
 
     const localStore = readStoreFromStorage()
 
+    if (shouldIgnorePreCleanupStore(sharedStore, localStore))
+      return
+
     if (shouldApplyIncomingStore(sharedStore, localStore)) {
-      if (shouldProtectSharedStore(sharedStore, localStore)) {
+      const isAuthoritativeCleanStore = authoritativeLearningV2CleanupApplied
+        && !containsLegacyUntrustedTypedSuggestions(sharedStore)
+      if (!isAuthoritativeCleanStore && shouldProtectSharedStore(sharedStore, localStore)) {
         console.warn('[GhostSuggestions] ignored incoming store because it would drop multiple user suggestions')
         return
       }
@@ -402,8 +424,13 @@ function setupTauriSyncListener() {
       return
 
     const localStore = readStoreFromStorage()
+    if (shouldIgnorePreCleanupStore(sharedStore, localStore))
+      return
+
     if (shouldApplyIncomingStore(sharedStore, localStore)) {
-      if (shouldProtectSharedStore(sharedStore, localStore)) {
+      const isAuthoritativeCleanStore = authoritativeLearningV2CleanupApplied
+        && !containsLegacyUntrustedTypedSuggestions(sharedStore)
+      if (!isAuthoritativeCleanStore && shouldProtectSharedStore(sharedStore, localStore)) {
         console.warn('[GhostSuggestions] ignored backend event because it would drop multiple user suggestions')
         return
       }
@@ -412,6 +439,17 @@ function setupTauriSyncListener() {
     }
   }).catch((error: unknown) => {
     console.warn('[GhostSuggestions] backend sync listener failed:', error)
+  })
+
+  listen<Partial<GhostSuggestionStore>>('ghost-suggestions-authoritative-learning-v2', (event) => {
+    const sharedStore = normalizeStore(event.payload)
+    if (!sharedStore)
+      return
+
+    authoritativeLearningV2CleanupApplied = true
+    applySharedStore(sharedStore)
+  }).catch((error: unknown) => {
+    console.warn('[GhostSuggestions] authoritative learning cleanup listener failed:', error)
   })
 }
 

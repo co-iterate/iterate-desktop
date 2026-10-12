@@ -55,11 +55,11 @@ mod tests {
 
     #[test]
     fn parses_codex_home_from_ps_environment() {
-        let output = "123 ?? S /Applications/Codex\\ Clone.app CODEX_HOME=/Users/test/.codex-clone PATH=/bin";
+        let output = "123 ?? S /Applications/Codex\\ Clone.app CODEX_HOME=/Users/example/.codex-clone PATH=/bin";
 
         assert_eq!(
             parse_codex_home_from_process_env(output).as_deref(),
-            Some("/Users/test/.codex-clone")
+            Some("/Users/example/.codex-clone")
         );
     }
 

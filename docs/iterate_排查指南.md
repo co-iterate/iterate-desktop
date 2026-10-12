@@ -3,7 +3,7 @@
 这份文档只覆盖当前主方案下最常见的排查路径。
 
 如果你是普通用户，优先看：
-- [INSTALLATION.md](INSTALLATION.md)
+- [docs/iterate_安装指南.md](docs/iterate_安装指南.md)
 - 安装包里的 `INSTALLATION.md`
 
 如果你正在调试客户端接入、发布物或本地构建，再继续看下面。

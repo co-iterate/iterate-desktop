@@ -253,6 +253,23 @@ pub fn remove_ghost_suggestion(
     store_to_value(&store)
 }
 
+pub fn remove_ghost_suggestions_by_description(description: &str) -> Result<Value, String> {
+    let target = description.trim();
+    let mut store = load_store()?;
+    let original_len = store.suggestions.len();
+    store
+        .suggestions
+        .retain(|suggestion| suggestion.description.trim() != target);
+
+    if store.suggestions.len() != original_len {
+        store.updated_at = Utc::now().to_rfc3339();
+        store.suggestions = normalize_sort(store.suggestions);
+        write_store(&store)?;
+    }
+
+    store_to_value(&store)
+}
+
 pub fn reorder_ghost_suggestions(request: ReorderGhostSuggestionsRequest) -> Result<Value, String> {
     let mut store = load_store()?;
     ensure_expected_updated_at(&store, request.expected_updated_at.as_deref())?;
@@ -688,6 +705,35 @@ mod tests {
             assert_eq!(updated_store.suggestions[0].sort_order, 1);
 
             assert_eq!(read_store_file().suggestions[0].key, "Activity");
+        });
+    }
+
+    #[test]
+    fn removes_only_suggestions_with_the_legacy_auto_typed_description() {
+        with_temp_home(|| {
+            upsert_ghost_suggestion(UpsertGhostSuggestionRequest {
+                key: "ai-rule-term".to_string(),
+                description: Some("自动学习 / 手动输入高频候选".to_string()),
+                enabled: Some(true),
+                sort_order: None,
+                expected_updated_at: None,
+            })
+            .expect("insert legacy typed suggestion");
+            upsert_ghost_suggestion(UpsertGhostSuggestionRequest {
+                key: "accepted-term".to_string(),
+                description: Some("自动学习 / 当前项目高频".to_string()),
+                enabled: Some(true),
+                sort_order: None,
+                expected_updated_at: None,
+            })
+            .expect("insert accepted suggestion");
+
+            let cleaned = store_from_value(
+                remove_ghost_suggestions_by_description("自动学习 / 手动输入高频候选")
+                    .expect("remove legacy typed suggestions"),
+            );
+            assert_eq!(cleaned.suggestions.len(), 1);
+            assert_eq!(cleaned.suggestions[0].key, "accepted-term");
         });
     }
 

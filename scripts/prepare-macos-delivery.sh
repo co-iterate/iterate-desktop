@@ -4,6 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/macos-release-identity.sh"
+export CUNZHI_MACOS_ALLOW_DIRTY_SOURCE=0
 
 resolve_repo_path() {
   local path="$1"
@@ -41,12 +43,11 @@ resolve_cargo_target_dir() {
 }
 
 CARGO_TARGET_DIR_RESOLVED="$(resolve_cargo_target_dir)"
-PROMPT_SOURCE="${REPO_ROOT}/docs/INSTALL_PROMPT.md"
-SYSTEM_PROMPT_SOURCE="${REPO_ROOT}/docs/SYSTEM_PROMPT.md"
-INSTALLATION_SOURCE="${REPO_ROOT}/docs/INSTALLATION.md"
+PROMPT_SOURCE="${REPO_ROOT}/docs/release/INSTALL_PROMPT.md"
+INSTALLATION_SOURCE="${REPO_ROOT}/docs/release/INSTALLATION.md"
 BUNDLE_MACOS_DIR="${CARGO_TARGET_DIR_RESOLVED}/release/bundle/macos"
 BUNDLE_DMG_DIR="${CARGO_TARGET_DIR_RESOLVED}/release/bundle/dmg"
-DELIVERY_DIR="${REPO_ROOT}/target/release/delivery/macos"
+DELIVERY_DIR="$(resolve_repo_path "${CUNZHI_MACOS_DELIVERY_DIR:-${CARGO_TARGET_DIR_RESOLVED}/release/delivery/macos}")"
 APP_PATH="${BUNDLE_MACOS_DIR}/iterate.app"
 RELEASE_ITERATE_BIN="${CARGO_TARGET_DIR_RESOLVED}/release/iterate"
 ENTITLEMENTS_PATH="${REPO_ROOT}/Entitlements.plist"
@@ -56,14 +57,7 @@ SIGN_TIMESTAMP="${CUNZHI_MACOS_CODESIGN_TIMESTAMP:-}"
 ALLOWED_RELEASE_BIN_NAMES=("iterate" "mcp-server")
 
 detect_sign_identity() {
-  if [[ -n "${SIGN_IDENTITY}" ]]; then
-    printf '%s\n' "${SIGN_IDENTITY}"
-    return 0
-  fi
-
-  security find-identity -v -p codesigning \
-    | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' \
-    | head -n 1
+  resolve_macos_release_sign_identity "${SIGN_IDENTITY}"
 }
 
 is_allowed_release_bin() {
@@ -128,7 +122,9 @@ sign_app_bundle() {
     exit 1
   fi
 
-  for binary_path in "${APP_PATH}/Contents/MacOS"/*; do
+  for binary_path in "${APP_PATH}/Contents/MacOS"/* \
+    "${APP_PATH}/Contents/Resources/managed-frpc" \
+    "${APP_PATH}/Contents/Resources/managed-proxy"; do
     [[ -f "${binary_path}" ]] || continue
     if [[ "$(basename "${binary_path}")" == "mcp-server" ]]; then
       codesign --force --options runtime "${timestamp_args[@]}" \
@@ -147,6 +143,7 @@ sign_app_bundle() {
     --sign "${identity}" \
     "${APP_PATH}"
   codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
+  verify_macos_release_identity "${APP_PATH}"
   assert_required_app_entitlements
 
   if spctl --assess --type execute -vv "${APP_PATH}"; then
@@ -171,7 +168,8 @@ assert_app_entitlement() {
   entitlements_dump="$(plutil -p "${entitlements_file}" 2>/dev/null || true)"
   rm -f "${entitlements_file}"
 
-  if ! grep -Fq "\"${entitlement_key}\" => true" <<<"${entitlements_dump}"; then
+  # 不同 macOS 版本的 plutil -p 把布尔值打印成 true 或 1（CI 的 macos-14 是 1）。
+  if ! grep -Eq "\"${entitlement_key//./\\.}\" => (true|1)\$" <<<"${entitlements_dump}"; then
     echo "Missing required app entitlement: ${entitlement_key}" >&2
     echo "${entitlements_dump}" >&2
     exit 1
@@ -199,10 +197,6 @@ create_delivery_dmg() {
 
   if [[ -f "${PROMPT_SOURCE}" ]]; then
     cp "${PROMPT_SOURCE}" "${stage_dir}/INSTALL_PROMPT.md"
-  fi
-
-  if [[ -f "${SYSTEM_PROMPT_SOURCE}" ]]; then
-    cp "${SYSTEM_PROMPT_SOURCE}" "${stage_dir}/SYSTEM_PROMPT.md"
   fi
 
   rm -f "${output_dmg_path}"
@@ -238,6 +232,15 @@ prune_release_bundle() {
 }
 
 cd "${REPO_ROOT}"
+# 官方签名交付必须带托管服务配置；在清理产物目录之前检查。
+# shellcheck source=scripts/managed-build-env.sh
+source "${REPO_ROOT}/scripts/managed-build-env.sh"
+load_managed_build_env --require || exit 1
+SIGN_IDENTITY="$(detect_sign_identity || true)"
+if [[ -z "${SIGN_IDENTITY}" ]]; then
+  echo "No Developer ID identity for Team UM3Z9G5DNH; refusing release packaging." >&2
+  exit 1
+fi
 mkdir -p "${BUNDLE_DMG_DIR}" "${DELIVERY_DIR}"
 find "${BUNDLE_DMG_DIR}" -maxdepth 1 -type f -name '*.dmg' -delete
 find "${DELIVERY_DIR}" -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' \) -delete
@@ -253,11 +256,6 @@ if [[ ! -f "${INSTALLATION_SOURCE}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${SYSTEM_PROMPT_SOURCE}" ]]; then
-  echo "Missing system prompt source: ${SYSTEM_PROMPT_SOURCE}" >&2
-  exit 1
-fi
-
 if [[ ! -d "${APP_PATH}" ]]; then
   echo "Missing built app: ${APP_PATH}" >&2
   exit 1
@@ -265,12 +263,6 @@ fi
 
 if [[ ! -x "${RELEASE_ITERATE_BIN}" ]]; then
   echo "Missing built iterate binary: ${RELEASE_ITERATE_BIN}" >&2
-  exit 1
-fi
-
-ACTIVATION_GATE_STATUS="$("${RELEASE_ITERATE_BIN}" --activation-gate-status)"
-if [[ "${ACTIVATION_GATE_STATUS}" != "activation_gate_required=false" ]]; then
-  echo "Community macOS artifact unexpectedly requires activation: ${ACTIVATION_GATE_STATUS}" >&2
   exit 1
 fi
 
@@ -289,13 +281,8 @@ assert_release_bundle_contents
 printf 'Writing clean source receipt before final signing.\n'
 node "${SOURCE_RECEIPT_TOOL}" --repo-root "${REPO_ROOT}" --app "${APP_PATH}"
 
-SIGN_IDENTITY="$(detect_sign_identity || true)"
-if [[ -n "${SIGN_IDENTITY}" ]]; then
-  printf 'Signing app with Developer ID identity: %s\n' "${SIGN_IDENTITY}"
-  sign_app_bundle "${SIGN_IDENTITY}"
-else
-  printf 'No Developer ID identity found, skipping app signing.\n'
-fi
+printf 'Signing app with Developer ID identity: %s\n' "${SIGN_IDENTITY}"
+sign_app_bundle "${SIGN_IDENTITY}"
 
 printf 'Verifying source receipt after final signing.\n'
 node "${SOURCE_RECEIPT_TOOL}" --verify --repo-root "${REPO_ROOT}" --app "${APP_PATH}"
@@ -305,9 +292,6 @@ mkdir -p "${DELIVERY_DIR}"
 cp "${PROMPT_SOURCE}" "${DELIVERY_DIR}/INSTALL_PROMPT.md"
 cp "${PROMPT_SOURCE}" "${BUNDLE_MACOS_DIR}/INSTALL_PROMPT.md"
 cp "${PROMPT_SOURCE}" "${BUNDLE_DMG_DIR}/INSTALL_PROMPT.md"
-cp "${SYSTEM_PROMPT_SOURCE}" "${DELIVERY_DIR}/SYSTEM_PROMPT.md"
-cp "${SYSTEM_PROMPT_SOURCE}" "${BUNDLE_MACOS_DIR}/SYSTEM_PROMPT.md"
-cp "${SYSTEM_PROMPT_SOURCE}" "${BUNDLE_DMG_DIR}/SYSTEM_PROMPT.md"
 cp "${INSTALLATION_SOURCE}" "${DELIVERY_DIR}/INSTALLATION.md"
 cp "${INSTALLATION_SOURCE}" "${BUNDLE_MACOS_DIR}/INSTALLATION.md"
 cp "${INSTALLATION_SOURCE}" "${BUNDLE_DMG_DIR}/INSTALLATION.md"
@@ -319,7 +303,6 @@ printf 'Prepared macOS delivery files:\n'
 printf ' - %s\n' "${DELIVERY_DIR}/iterate.app.zip"
 printf ' - %s\n' "${DELIVERY_DIR}/INSTALLATION.md"
 printf ' - %s\n' "${DELIVERY_DIR}/INSTALL_PROMPT.md"
-printf ' - %s\n' "${DELIVERY_DIR}/SYSTEM_PROMPT.md"
 printf ' - %s\n' "${DELIVERY_DIR}/$(basename "${DMG_PATH}")"
 printf '\n'
 printf 'Note: the app zip and DMG are prepared from the current app bundle after cleanup/signing.\n'

@@ -12,7 +12,7 @@ const showAddDialog = ref(false)
 const showEditDialog = ref(false)
 const showImportDirDialog = ref(false)
 const fileInputRef = ref<HTMLInputElement | null>(null)
-const importDirPath = ref('')
+const importDirPath = ref('~/手机:提示词')
 
 // 新建表单
 const newItem = ref({ name: '', content: '', category: '' })

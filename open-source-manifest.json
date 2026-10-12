@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "project": "iterate",
   "distribution": "desktop-source",
-  "sourceBaseCommit": "d1123c27cad50b069d6cf6f46e97b43c2982f7ef",
+  "sourceBaseCommit": "35583318a9f4abe7c0dfd595d02d1fa3b10a7823",
   "includePrefixes": [
     "icons/",
     "scripts/desktop-",
@@ -136,7 +136,19 @@
     "tauri.conf.json",
     "uno.config.ts",
     "version.json",
-    "vite.config.js"
+    "vite.config.js",
+    "scripts/check-release-lineage.sh",
+    "scripts/check-release-lineage.test.mjs",
+    "scripts/macos-recovery.mjs",
+    "scripts/managed-build-env.sh",
+    "scripts/retire-stale-serves.sh",
+    "assets/community-qq-group.png",
+    "assets/community-wechat-group.png",
+    "assets/iterate-desktop-hero-zh.png",
+    "assets/iterate-desktop-interceptor-zh.png",
+    "assets/iterate-mobile-interceptor-zh.png",
+    "scripts/windows-runtime-stress.ps1",
+    "scripts/windows-watchdog-smoke.ps1"
   ],
   "excludePrefixes": [
     ".antigravitycli/",
@@ -257,12 +269,18 @@
     "scripts/export-desktop-oss.mjs",
     "src/bin/mcp-server.rs",
     "src/frontend/main.ts",
-    "src/rust/lib.rs"
+    "src/rust/lib.rs",
+    "assets/community-qq-group.png",
+    "assets/community-wechat-group.png",
+    "assets/iterate-desktop-hero-zh.png",
+    "assets/iterate-desktop-interceptor-zh.png",
+    "assets/iterate-mobile-interceptor-zh.png"
   ],
   "binaryAllowPrefixes": [
     "icons/",
     "screenshots/",
-    "src/frontend/public/"
+    "src/frontend/public/",
+    "assets/"
   ],
   "binaryAllowExtensions": [
     ".gif",

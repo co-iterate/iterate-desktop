@@ -28,10 +28,13 @@ impl CronManageTool {
             "list" => Self::list_jobs().await,
             "add" => Self::add_job(request).await,
             "remove" => Self::remove_job(request).await,
-            _ => Ok(CallToolResult::error(vec![Content::text(format!(
-                "未知操作: {}。支持的操作: list, add, remove",
-                request.action
-            ))])),
+            _ => Ok(CallToolResult {
+                content: vec![Content::text(format!(
+                    "未知操作: {}。支持的操作: list, add, remove",
+                    request.action
+                ))],
+                is_error: Some(true),
+            }),
         }
     }
 
@@ -45,9 +48,12 @@ impl CronManageTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() && stderr.contains("no crontab") {
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::json!({ "jobs": [], "message": "当前没有定时任务" }).to_string(),
-            )]));
+            return Ok(CallToolResult {
+                content: vec![Content::text(
+                    serde_json::json!({ "jobs": [], "message": "当前没有定时任务" }).to_string(),
+                )],
+                is_error: None,
+            });
         }
 
         let jobs: Vec<serde_json::Value> = stdout
@@ -68,9 +74,12 @@ impl CronManageTool {
             })
             .collect();
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::json!({ "jobs": jobs, "count": jobs.len() }).to_string(),
-        )]))
+        Ok(CallToolResult {
+            content: vec![Content::text(
+                serde_json::json!({ "jobs": jobs, "count": jobs.len() }).to_string(),
+            )],
+            is_error: None,
+        })
     }
 
     async fn add_job(request: CronManageRequest) -> Result<CallToolResult, McpError> {
@@ -120,14 +129,17 @@ impl CronManageTool {
 
         log_important!(info, "[Cron] 添加定时任务: {}", new_entry);
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::json!({
-                "success": true,
-                "entry": new_entry,
-                "message": format!("已添加定时任务: {}", label)
-            })
-            .to_string(),
-        )]))
+        Ok(CallToolResult {
+            content: vec![Content::text(
+                serde_json::json!({
+                    "success": true,
+                    "entry": new_entry,
+                    "message": format!("已添加定时任务: {}", label)
+                })
+                .to_string(),
+            )],
+            is_error: None,
+        })
     }
 
     async fn remove_job(request: CronManageRequest) -> Result<CallToolResult, McpError> {
@@ -152,13 +164,16 @@ impl CronManageTool {
         let removed = count_before - entries_after.len();
 
         if removed == 0 {
-            return Ok(CallToolResult::error(vec![Content::text(
-                serde_json::json!({
-                    "success": false,
-                    "message": format!("未找到标签为 '{}' 的定时任务", label)
-                })
-                .to_string(),
-            )]));
+            return Ok(CallToolResult {
+                content: vec![Content::text(
+                    serde_json::json!({
+                        "success": false,
+                        "message": format!("未找到标签为 '{}' 的定时任务", label)
+                    })
+                    .to_string(),
+                )],
+                is_error: Some(true),
+            });
         }
 
         let joined = if entries_after.is_empty() {
@@ -187,13 +202,16 @@ impl CronManageTool {
 
         log_important!(info, "[Cron] 移除定时任务: {} ({}条)", label, removed);
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::json!({
-                "success": true,
-                "removed": removed,
-                "message": format!("已移除 {} 条标签为 '{}' 的定时任务", removed, label)
-            })
-            .to_string(),
-        )]))
+        Ok(CallToolResult {
+            content: vec![Content::text(
+                serde_json::json!({
+                    "success": true,
+                    "removed": removed,
+                    "message": format!("已移除 {} 条标签为 '{}' 的定时任务", removed, label)
+                })
+                .to_string(),
+            )],
+            is_error: None,
+        })
     }
 }

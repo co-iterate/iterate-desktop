@@ -1,6 +1,7 @@
 use super::mcp_action_delivery::try_write_serve_response_file;
 use super::mcp_action_payload::{
-    build_goal_payload_parts, build_goal_submit_prompt, normalize_mcp_action_images,
+    build_goal_payload_parts, build_goal_submit_prompt, normalize_mcp_action_file_paths,
+    normalize_mcp_action_images,
 };
 use super::mcp_action_recording::{
     broadcast_latest_timeline_node, record_mcp_action_response_node,
@@ -41,11 +42,14 @@ pub(super) async fn try_handle_mcp_action_directly(
                 .cloned()
                 .unwrap_or(serde_json::json!([]));
             let normalized_images = normalize_mcp_action_images(payload);
+            let normalized_file_paths = normalize_mcp_action_file_paths(payload);
 
             serde_json::json!({
                 "user_input": user_input,
                 "selected_options": selected_options,
                 "images": normalized_images,
+                "file_paths": normalized_file_paths,
+                "image_paths": [],
                 "project_path": project_path,
                 "metadata": {
                     "timestamp": chrono::Local::now().to_rfc3339(),
@@ -74,6 +78,7 @@ pub(super) async fn try_handle_mcp_action_directly(
         "goal" | "goal_start" => {
             let (goal_text, goal_title, selected_options) = build_goal_payload_parts(payload);
             let normalized_images = normalize_mcp_action_images(payload);
+            let normalized_file_paths = normalize_mcp_action_file_paths(payload);
             if goal_text.is_empty() {
                 log::warn!("[Bridge] goal action missing input and selected options");
                 return RoomDeliveryResult::rejected(RoomDeliveryAttempt::internal(
@@ -89,6 +94,8 @@ pub(super) async fn try_handle_mcp_action_directly(
                 "user_input": build_goal_submit_prompt(&goal_text),
                 "selected_options": selected_options,
                 "images": normalized_images,
+                "file_paths": normalized_file_paths,
+                "image_paths": [],
                 "project_path": project_path,
                 "metadata": {
                     "timestamp": chrono::Local::now().to_rfc3339(),
@@ -162,7 +169,7 @@ pub(super) async fn try_handle_mcp_action_directly(
                 ));
             }
 
-            match crate::browser::send_to_browser(message).await {
+            match crate::browser::send_to_browser(message, None, None).await {
                 Ok(_) => log::info!("[Bridge] send_to_browser_ai sent to browser extension"),
                 Err(err) => log::error!("[Bridge] send_to_browser_ai failed: {}", err),
             }
@@ -329,6 +336,23 @@ pub(super) async fn try_handle_mcp_action_directly(
                 ));
             }
 
+            // The response has already crossed the authoritative request channel.
+            // Tell the resident desktop UI immediately so a phone reply can close
+            // the matching popup without waiting for timeline persistence/cleanup.
+            if let Err(e) = app_handle.emit(
+                "bridge-mcp-action-handled",
+                serde_json::json!({
+                    "project_path": project_path,
+                    "request_id": request_id,
+                    "action": action,
+                }),
+            ) {
+                log::debug!(
+                    "[Bridge] 通知前端 action 已处理失败（可能窗口未打开）: {}",
+                    e
+                );
+            }
+
             bridge_debug_log(&format!(
                 "✅ 响应已发送 (request_id: {:?}, project: {})",
                 request_id, project_path
@@ -357,18 +381,6 @@ pub(super) async fn try_handle_mcp_action_directly(
             }
             if let Some(rid) = request_id {
                 cleanup_completed_session_by_request_id(rid, "mcp-action-direct-cleanup").await;
-            }
-            if let Err(e) = app_handle.emit(
-                "bridge-mcp-action-handled",
-                serde_json::json!({
-                    "project_path": project_path,
-                    "action": action,
-                }),
-            ) {
-                log::debug!(
-                    "[Bridge] 通知前端 action 已处理失败（可能窗口未打开）: {}",
-                    e
-                );
             }
             RoomDeliveryResult::delivered(RoomDeliveryAttempt::response_channel(
                 project_path,
@@ -400,6 +412,19 @@ pub(super) async fn try_handle_mcp_action_directly(
                 &bridge_debug_log,
             );
             if serve_attempt.delivered {
+                if let Err(e) = app_handle.emit(
+                    "bridge-mcp-action-handled",
+                    serde_json::json!({
+                        "project_path": project_path,
+                        "request_id": request_id,
+                        "action": action,
+                    }),
+                ) {
+                    log::debug!(
+                        "[Bridge] 通知前端 action 已处理失败（可能窗口未打开）: {}",
+                        e
+                    );
+                }
                 if let Err(err) = record_mcp_action_response_node(
                     app_handle,
                     action,
@@ -423,18 +448,6 @@ pub(super) async fn try_handle_mcp_action_directly(
                 if let Some(rid) = request_id {
                     cleanup_completed_session_by_request_id(rid, "mcp-action-serve-file-cleanup")
                         .await;
-                }
-                if let Err(e) = app_handle.emit(
-                    "bridge-mcp-action-handled",
-                    serde_json::json!({
-                        "project_path": project_path,
-                        "action": action,
-                    }),
-                ) {
-                    log::debug!(
-                        "[Bridge] 通知前端 action 已处理失败（可能窗口未打开）: {}",
-                        e
-                    );
                 }
                 return RoomDeliveryResult::from_attempts(vec![channel_attempt, serve_attempt]);
             }
@@ -476,11 +489,14 @@ pub(super) async fn try_handle_mcp_action_headless(
                 .cloned()
                 .unwrap_or(serde_json::json!([]));
             let normalized_images = normalize_mcp_action_images(payload);
+            let normalized_file_paths = normalize_mcp_action_file_paths(payload);
 
             serde_json::json!({
                 "user_input": user_input,
                 "selected_options": selected_options,
                 "images": normalized_images,
+                "file_paths": normalized_file_paths,
+                "image_paths": [],
                 "project_path": project_path,
                     "metadata": {
                         "timestamp": chrono::Local::now().to_rfc3339(),
@@ -507,6 +523,7 @@ pub(super) async fn try_handle_mcp_action_headless(
         "goal" | "goal_start" => {
             let (goal_text, goal_title, selected_options) = build_goal_payload_parts(payload);
             let normalized_images = normalize_mcp_action_images(payload);
+            let normalized_file_paths = normalize_mcp_action_file_paths(payload);
             if goal_text.is_empty() {
                 log::warn!("[Bridge] bridge-only goal action missing input and selected options");
                 return RoomDeliveryResult::rejected(RoomDeliveryAttempt::internal(
@@ -522,6 +539,8 @@ pub(super) async fn try_handle_mcp_action_headless(
                 "user_input": build_goal_submit_prompt(&goal_text),
                 "selected_options": selected_options,
                 "images": normalized_images,
+                "file_paths": normalized_file_paths,
+                "image_paths": [],
                 "project_path": project_path,
                     "metadata": {
                         "timestamp": chrono::Local::now().to_rfc3339(),

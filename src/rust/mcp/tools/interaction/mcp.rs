@@ -87,6 +87,7 @@ impl InteractionTool {
             link_url: None,
             link_title: None,
             browser_ai_response: None,
+            browser_tab_id: None,
         };
 
         mark_live_goal_waiting_for_user(project_path.as_deref(), &request_id);
@@ -337,7 +338,7 @@ mod tests {
                 "filename": null
             }],
             "file_paths": ["/tmp/spec.md"],
-            "image_paths": ["/Users/test/.cunzhi/images/image_123_0.png"],
+            "image_paths": ["/Users/example/.cunzhi/images/image_123_0.png"],
             "metadata": {
                 "timestamp": "2026-06-17T00:00:00Z",
                 "request_id": "req-1",
@@ -354,7 +355,7 @@ mod tests {
         assert_eq!(parsed.file_paths, vec!["/tmp/spec.md".to_string()]);
         assert_eq!(
             parsed.image_paths,
-            vec!["/Users/test/.cunzhi/images/image_123_0.png".to_string()]
+            vec!["/Users/example/.cunzhi/images/image_123_0.png".to_string()]
         );
         assert_eq!(parsed.metadata.request_id.as_deref(), Some("req-1"));
     }

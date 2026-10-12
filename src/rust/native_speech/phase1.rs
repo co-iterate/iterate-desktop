@@ -472,6 +472,7 @@ fn run_owner_supervisor(app: AppHandle, role: SpeechProcessRole) {
             return;
         }
     };
+    super::debug_log("[phase1-owner-path]", path.display().to_string());
     let executable = std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .map(|path| path.display().to_string())
@@ -498,6 +499,10 @@ fn run_owner_supervisor(app: AppHandle, role: SpeechProcessRole) {
             _ => None,
         });
         if let Some(epoch) = acquired {
+            super::debug_log(
+                "[phase1-owner-acquired]",
+                format!("epoch={}", epoch.to_canonical_string()),
+            );
             if initialize_runtime(&app, role, epoch).is_ok() {
                 run_fn_transport(&mut supervisor);
                 return;
@@ -564,6 +569,10 @@ where
                 FnListenerEvent::Pressed {
                     observed_monotonic_us,
                 } => {
+                    super::debug_log(
+                        "[fn-edge]",
+                        format!("edge=down observed_us={observed_monotonic_us}"),
+                    );
                     let drain = fn_listener::drain_observed_presses_after(consumed_sequence);
                     if drain.press_count > 0 {
                         gesture.press(observed_monotonic_us);
@@ -592,6 +601,7 @@ where
                     }
                 }
                 FnListenerEvent::TapDisabled { .. } | FnListenerEvent::TapEnded => {
+                    super::debug_log("[fn-transport-rebuild]", format!("event={event:?}"));
                     gesture.reset();
                     break;
                 }
@@ -628,6 +638,7 @@ fn receive_fn_gesture_event(
 }
 
 fn dispatch_desktop_codex_live_fn_action(action: &'static str) {
+    super::debug_log("[fn-action-dispatch]", format!("action={action}"));
     if let Some(sender) = desktop_codex_live_fn_dispatcher() {
         if sender.send(action).is_ok() {
             return;
@@ -737,7 +748,11 @@ fn process_desktop_codex_live_fn_action(action: &'static str) {
     match result {
         Ok(true) => super::debug_log("[desktop-codex-live-fn-action]", format!("action={action}")),
         Ok(false) => {
-            let _ = send_control_input(SpeechControlInput::FnPressed);
+            if let Err(error) = send_control_input(SpeechControlInput::FnPressed) {
+                super::debug_log("[fn-action-control-failed]", error);
+            } else {
+                super::debug_log("[fn-action-route]", "route=dictation bridge_status=204");
+            }
         }
         Err(failure) => {
             super::debug_log(

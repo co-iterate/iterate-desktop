@@ -133,9 +133,8 @@ onUnmounted(() => {
         </div>
         <div class="text-xs opacity-60 leading-relaxed">
           1. 点击「开始监控」启动 WebSocket 服务器（端口 9333）<br>
-          2. 浏览器扩展由官方单独分发，不包含在本 desktop-source 仓库<br>
-          3. 已取得官方扩展时，在扩展设置中填入下方连接密钥<br>
-          4. 打开 ChatGPT/Gemini 等网页，AI 完成后会收到通知
+          2. 安装 Chrome 扩展：<code class="bg-black-100 px-1 rounded">browser-extension</code> 目录<br>
+          3. 打开 ChatGPT/Gemini 等网页，AI 完成后会收到通知
         </div>
       </div>
     </div>

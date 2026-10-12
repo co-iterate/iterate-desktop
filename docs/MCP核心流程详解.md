@@ -78,7 +78,7 @@
     "arguments": {
       "message": "## 任务完成\n\n请确认是否继续",
       "predefined_options": ["继续", "取消"],
-      "project_path": "/Users/example/project"
+      "project_path": "/Users/example/cunzhi"
     }
   }
 }
@@ -103,7 +103,7 @@
   "message": "## 任务完成\n\n请确认是否继续",
   "predefined_options": ["继续", "取消"],
   "is_markdown": true,
-  "project_path": "/Users/example/project"
+  "project_path": "/Users/example/cunzhi"
 }
 ```
 
@@ -222,7 +222,7 @@ let output = Command::new("iterate")
 │                      iterate GUI 弹窗                            │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │ ┌─────────────────────────────────────────────────────────┐ ││
-│  │ │ 📁 /Users/example/project                               │ ││
+│  │ │ 📁 /Users/example/cunzhi                                  │ ││
 │  │ └─────────────────────────────────────────────────────────┘ ││
 │  │ ┌─────────────────────────────────────────────────────────┐ ││
 │  │ │ ## 任务完成                                             │ ││

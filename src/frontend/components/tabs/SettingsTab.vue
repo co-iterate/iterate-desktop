@@ -11,6 +11,7 @@ import FontSettings from '../settings/FontSettings.vue'
 import GhostSuggestionSettings from '../settings/GhostSuggestionSettings.vue'
 import GlobalSpeechSettings from '../settings/GlobalSpeechSettings.vue'
 import IterateSettings from '../settings/IterateSettings.vue'
+import McpClientSettings from '../settings/McpClientSettings.vue'
 import PromptLibrarySettings from '../settings/PromptLibrarySettings.vue'
 import ReplySettings from '../settings/ReplySettings.vue'
 import ShortcutSettings from '../settings/ShortcutSettings.vue'
@@ -114,6 +115,30 @@ function handleWindowSizeUpdate(size: { width: number, height: number, fixed: bo
 <template>
   <div class="max-w-3xl mx-auto tab-content">
     <n-collapse size="large" :default-expanded-names="[]" arrow-placement="right">
+      <!-- AI 客户端接入 -->
+      <n-collapse-item name="mcp-clients">
+        <template #header>
+          <div class="flex items-center justify-between w-full">
+            <div class="flex items-center">
+              <div class="w-10 h-10 rounded-lg bg-indigo-100 dark:bg-indigo-900 flex items-center justify-center mr-4">
+                <div class="i-carbon-plug text-lg text-indigo-600 dark:text-indigo-400" />
+              </div>
+              <div>
+                <div class="text-lg font-medium tracking-tight mb-1">
+                  AI 客户端
+                </div>
+                <div class="text-sm opacity-60 font-normal">
+                  把 iterate 接入 Claude Code、Codex、Cursor
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+        <div class="setting-content">
+          <McpClientSettings />
+        </div>
+      </n-collapse-item>
+
       <!-- 主题设置 -->
       <n-collapse-item name="theme">
         <template #header>

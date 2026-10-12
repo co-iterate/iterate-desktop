@@ -1,96 +1,210 @@
-# Rust and Tauri build output
+# Rust
 target/
-src-tauri/target/
+# Keep the root Cargo.lock tracked for reproducible Tauri builds while ignoring
+# lockfiles from local helper crates unless explicitly promoted.
+Cargo.lock
+!/Cargo.lock
 
 # Node.js
-node_modules/
-dist/
-dist-test/
-build/
-coverage/
-*.tsbuildinfo
+node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+package-lock.json
 
-# Generated and temporary output
-.cache/
-artifacts/
-cache/
-deliverables/
-gen/
+# Build outputs
+dist/
+build/
+gen/*
+!gen/android/
+!gen/android/**
 outputs/
-temp/
-tmp/
-*.tmp
-*.temp
-*.pid
-*.pid.lock
-*.seed
-*.log
+/bin/cunzhi-go
+cunzhi.exe
+libcurl-x64.dll
+*.class
 
-# Runtime state and private local knowledge
-.cunzhi-memory/
-.cunzhi-knowledge/
-.cunzhi/
-config.json
-
-# Local agent and editor state
-.antigravitycli/
-.claude/settings.local.json
-.codex/
-.cursor/
+# IDE
 .idea/
-.kiro/
 .vscode/
-.windsurf/
 *.swp
 *.swo
 *~
 
-# Credentials and signing material
-.env
-.env.*
-!.env.example
-*.cer
-*.crt
-*.key
-*.mobileprovision
-*.p12
-*.p8
-*.pem
-*.provisionprofile
-*.xcarchive/
-
-# Generated packages and installers
-*.app/
-*.dll
-*.dmg
-*.exe
-*.ipa
-*.tar.gz
-*.vsix
-*.zip
-
-# macOS, Windows, and Xcode user state
+# OS
 .DS_Store
+.DS_Store?
 ._*
 .Spotlight-V100
 .Trashes
-Thumbs.db
 ehthumbs.db
-**/xcuserdata/
-*.xcuserstate
-.xcode-derived-data/
-.build/
+Thumbs.db
 
-# Local deployment tools
-.netlify/
-qrcode-generator.html
+# Logs
+*.log
+logs/
 
-# Theos and platform caches
-jailbreak/**/.theos/
-jailbreak/**/packages/
+# Runtime
+*.pid
+*.seed
+*.pid.lock
+
+# Test files
+test_client.py
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Memory files (user-specific)
+.cunzhi-memory/
+
+# Configuration files (user-specific)
+config.json
+
+# Archive files
+*.zip
+*.dmg
+*.tar.gz
+
+# Tauri specific
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# macOS specific
+*.app/
+
+# scripts
+temp/
+tmp/
+dist-test/
+!scripts/
+!scripts/**
+# Keep script sources visible without versioning installed dependencies.
+scripts/**/node_modules/
+*.exe
+*.md
+!Makefile
+!README.md
+!ACEMCP.md
+!TROUBLESHOOTING.md
+!MCP_SERVER.md
+!MCP_INSTALL.md
+!WINDOWS_BUILD.md
+!WINDOWS_SETUP_FOR_AI.md
+!global_rules.md
+!docs/
+!docs/**
+!docs/**/*.md
+!cunzhimemory/
+!.cunzhi-knowledge/
+!.cunzhi-knowledge/rules/00-global.md
+
+# ===========================================
+# cunzhi 知识库保护规则
+# ===========================================
+# 说明：如果项目使用了 *.md 等通配符忽略规则，
+# 必须添加以下例外以保护 .cunzhi-knowledge/ 目录
+
+# 保护 cunzhi 知识库（独立 git 仓库）
+!.cunzhi-knowledge/
+!.cunzhi-knowledge/**
+!.cunzhi-knowledge/**/*.md
+
+# 保护 .windsurf 配置（workflows/skills）
+!.windsurf/
+!.windsurf/**
+!.windsurf/**/*.md
+
+# Keep only explicitly promoted durable memory files visible to Git.
+!.cunzhi-memory/
+.cunzhi-memory/**
+!.cunzhi-memory/context.md
+!.cunzhi-memory/metadata.json
+!.cunzhi-memory/monitor-verify.md
+!.cunzhi-memory/notes.md
+!.cunzhi-memory/preferences.md
+!.cunzhi-memory/rules.md
+!.cunzhi-memory/sessions.md
+
+# 如果项目有 *.json 忽略规则，也需要保护配置文件
+!.cunzhi-knowledge/**/*.json
+
+# Ignore large generated workflow raw line snapshots.
+.cunzhi-memory/app-workflow-runs/**/pain-signals.user-lines
+
+# Ignore generated local app workflow run artifacts. Durable findings belong in
+# .cunzhi-knowledge; the run directories remain available locally for debugging.
+.cunzhi-memory/app-workflow-runs/**
+
+# Ignore volatile local run artifacts. Durable summaries should be promoted into
+# tracked memory or .cunzhi-knowledge explicitly instead of committed wholesale.
+.cunzhi-memory/runtime-logs/**
+.cunzhi-memory/codex-room/**
+.cunzhi-memory/auto-transport-runs/**
+.cunzhi-memory/cpu-guard/**
+.cunzhi-memory/mcp-response-channel-smoke-runs/**
+.cunzhi-memory/public-stability-runs/**
+.cunzhi-memory/release-parity-runs/**
+.cunzhi-memory/**/*.pid
+.cunzhi-memory/**/*.raw
+.cunzhi-memory/**/*.err
+.cunzhi-memory/**/*.log
+
+# ===========================================
+# 使用方式
+# ===========================================
+# 1. 检查项目 .gitignore 是否有 *.md 规则
+# 2. 如果有，将上述规则添加到 .gitignore 末尾
+# 3. 执行 git status 验证 .cunzhi-knowledge/ 文件可见
+#
+# 快速应用（在项目根目录执行）：
+# cat .cunzhi-knowledge/templates/gitignore-cunzhi.txt >> .gitignore
+#
+# 验证：
+# git status .cunzhi-knowledge/
+# 应该显示文件变更，而不是被忽略
+ios-bridge-dev/
+
+# Local Netlify folder
+.netlify
+.env.vapid
+
+# Java compiled
+*.class
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+
+# Xcode user-specific
+**/xcuserdata/
+*.xcuserstate
+
+# Local tools
+qrcode-generator.html
+.xcode-derived-data/
+.build/
+
+# Theos jailbreak build artifacts
+jailbreak/**/.theos/
+jailbreak/**/packages/
+
+# Keep generated OS/cache files ignored even inside unignored source trees.
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+
+# Built managed connector; produced and verified during packaging.
+/bin/managed-frpc
+/bin/managed-proxy
+/bin/managed-resources.json

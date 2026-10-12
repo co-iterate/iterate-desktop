@@ -37,6 +37,39 @@ test('ordinary CRUD input performs no DOM measurement or ghost scheduling', () =
   assert.doesNotMatch(watcher, /scrollHeight|clientHeight|getComputedStyle|getBoundingClientRect/)
 })
 
+test('ordinary typing does not append automatic context on every keystroke', () => {
+  const emitUpdate = popupInputSource.match(/function emitUpdate\(\) \{[\s\S]*?\n\}/)?.[0] ?? ''
+  const finalInput = popupInputSource.match(/function getFinalUserInput\(\) \{[\s\S]*?\n\}/)?.[0] ?? ''
+
+  assert.match(emitUpdate, /userInput: userInput\.value/)
+  assert.doesNotMatch(emitUpdate, /generateConditionalContent|conditionalContent/)
+  assert.match(finalInput, /generateConditionalContent\(\)/)
+  assert.match(mcpPopupSource, /inputRef\.value\?\.getFinalUserInput\(\) \?\? userInput\.value/)
+})
+
+test('automatic learning is fed only by direct text input event types and committed IME text', () => {
+  assert.match(popupInputSource, /@input="handleDirectUserInputForLearning"/)
+  assert.match(popupInputSource, /directUserLearningChunkFromInputEvent\(event\)/)
+  assert.match(popupInputSource, /directUserLearningChunkFromCompositionEvent\(event\)/)
+  assert.match(popupInputSource, /extractDirectUserAuthoredPromotionTerms\(/)
+  assert.match(popupInputSource, /provenance: event === 'typed' \? 'direct-user-input-v2' : undefined/)
+})
+
+test('learning v2 cleanup bypasses only the legacy rollback guard event', () => {
+  assert.match(ghostSuggestionsSource, /ghost-suggestions-authoritative-learning-v2/)
+  assert.match(ghostSuggestionsSource, /authoritativeLearningV2CleanupApplied = true/)
+  assert.match(ghostSuggestionsSource, /shouldIgnorePreCleanupStore\(sharedStore, localStore\)/)
+  assert.match(
+    ghostSuggestionsSource,
+    /listen<Partial<GhostSuggestionStore>>\('ghost-suggestions-authoritative-learning-v2',[\s\S]*?applySharedStore\(sharedStore\)/,
+  )
+})
+
+test('long prompts skip the mirrored ghost overlay', () => {
+  assert.match(popupInputSource, /const MAX_GHOST_RENDER_INPUT_LENGTH = 320/)
+  assert.match(popupInputSource, /userInput\.value\.length <= MAX_GHOST_RENDER_INPUT_LENGTH/)
+})
+
 test('main editor is a native textarea without Naive UI or field-sizing', () => {
   const mainInputClassIndex = popupInputSource.indexOf('class="popup-main-input"')
   const mainInputStart = popupInputSource.lastIndexOf('<textarea', mainInputClassIndex)

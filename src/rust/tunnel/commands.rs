@@ -1,3 +1,4 @@
+use super::formal_transport::{same_formal_route_identity, try_lock_formal_route};
 use super::manager::{self, TunnelStatus};
 use crate::config::{
     load_standalone_config, save_config, save_standalone_config, AppConfig, AppState,
@@ -1006,6 +1007,10 @@ async fn probe_websocket(public_hostname: &str) -> bool {
 /// 启动远程隧道
 #[tauri::command]
 pub async fn start_remote_tunnel() -> Result<String, String> {
+    let _route_guard = try_lock_formal_route()?;
+    if self_hosted_formal_route_selected() {
+        return Err("self_hosted_transport_managed_externally".to_string());
+    }
     log::info!("启动远程隧道...");
     manager::start_tunnel().await
 }
@@ -1097,15 +1102,39 @@ pub async fn check_origin_health() -> Result<bool, String> {
     manager::check_origin_health().await
 }
 
+pub fn selected_formal_transport() -> Option<String> {
+    load_standalone_config().ok()?.mobile_config.formal_route.map(|route| route.transport)
+}
+
+pub fn self_hosted_formal_route_selected() -> bool {
+    selected_formal_transport().as_deref() == Some("self_hosted_frp")
+}
+
+pub fn cloudflare_formal_recovery_allowed() -> bool {
+    let Ok(config) = load_standalone_config() else { return false; };
+    match config.mobile_config.formal_route {
+        None => true, // Preserve the pre-formal-route legacy startup behavior.
+        Some(route) => route.schema_version == 1
+            && route.transport == "cloudflare_named_tunnel"
+            && manager::normalize_public_hostname(&route.base_url).is_ok(),
+    }
+}
+
 pub fn configured_formal_mobile_route() -> Option<FormalMobileRouteConfig> {
-    let config = load_standalone_config().ok()?;
+    effective_formal_mobile_route(load_standalone_config().ok()?)
+}
+
+fn effective_formal_mobile_route(config: AppConfig) -> Option<FormalMobileRouteConfig> {
     if let Some(route) = config.mobile_config.formal_route {
         if route.schema_version == 1
-            && route.transport == "cloudflare_named_tunnel"
+            && super::formal_transport::is_supported_formal_transport(&route.transport)
             && manager::normalize_public_hostname(&route.base_url).is_ok()
         {
             return Some(route);
         }
+        // An explicit invalid route is an error, not consent to select a
+        // different legacy provider. Legacy migration applies only if absent.
+        return None;
     }
 
     if !config.cloudflare_config.guided_setup_enabled {
@@ -1198,7 +1227,23 @@ pub async fn register_formal_mobile_route(
     base_url: &str,
     source: &str,
 ) -> Result<FormalMobileRouteStatus, String> {
-    if transport != "cloudflare_named_tunnel" {
+    register_formal_mobile_route_guarded(transport, base_url, source, None).await
+}
+
+pub(crate) async fn register_managed_mobile_route(
+    base_url: &str,
+    expected: &FormalMobileRouteStatus,
+) -> Result<FormalMobileRouteStatus, String> {
+    register_formal_mobile_route_guarded("self_hosted_frp", base_url, "ai_configured", Some(expected)).await
+}
+
+async fn register_formal_mobile_route_guarded(
+    transport: &str,
+    base_url: &str,
+    source: &str,
+    expected: Option<&FormalMobileRouteStatus>,
+) -> Result<FormalMobileRouteStatus, String> {
+    if !super::formal_transport::is_supported_formal_transport(transport) {
         return Err("formal_route_transport_not_supported".to_string());
     }
     let source = match source.trim() {
@@ -1208,6 +1253,22 @@ pub async fn register_formal_mobile_route(
         _ => return Err("formal_route_source_invalid".to_string()),
     };
     let base_url = manager::normalize_public_hostname(base_url)?;
+    let initial_config = load_standalone_config().map_err(|error| error.to_string())?;
+    let previous_effective = effective_formal_mobile_route(initial_config.clone());
+    let previous_route = initial_config.mobile_config.formal_route;
+    if let Some(expected) = expected {
+        if previous_route.is_some() && previous_effective.is_none() {
+            return Err("formal_route_changed".into());
+        }
+        let matches = match previous_effective.as_ref() {
+            Some(route) => expected.configured
+                && expected.transport.as_deref() == Some(route.transport.as_str())
+                && expected.base_url.as_deref() == Some(route.base_url.as_str())
+                && expected.formal_route_generation == Some(route.formal_route_generation.max(1)),
+            None => !expected.configured,
+        };
+        if !matches { return Err("formal_route_changed".into()); }
+    }
     if !manager::check_origin_health().await? {
         return Err("bridge_unhealthy".to_string());
     }
@@ -1216,7 +1277,12 @@ pub async fn register_formal_mobile_route(
     }
 
     let checked_at = chrono::Utc::now().to_rfc3339();
+    let _route_guard = try_lock_formal_route()?;
     let mut config = load_standalone_config().map_err(|error| error.to_string())?;
+    if !same_formal_route_identity(config.mobile_config.formal_route.as_ref(), previous_route.as_ref())
+        || !same_formal_route_identity(effective_formal_mobile_route(config.clone()).as_ref(), previous_effective.as_ref()) {
+        return Err("formal_route_changed".to_string());
+    }
     let previous = config.mobile_config.formal_route.as_ref();
     let generation = previous
         .map(|route| {
@@ -1272,8 +1338,12 @@ pub async fn verify_formal_mobile_route() -> Result<FormalMobileRouteStatus, Str
         .health_checked_at
         .clone()
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let _route_guard = try_lock_formal_route()?;
     let mut config = load_standalone_config().map_err(|error| error.to_string())?;
     if let Some(stored) = config.mobile_config.formal_route.as_mut() {
+        if !same_formal_route_identity(Some(stored), Some(&route)) {
+            return Err("formal_route_changed".to_string());
+        }
         if status.endpoint_identity_ok {
             stored.last_verified_at = Some(checked_at.clone());
         }
@@ -1438,6 +1508,7 @@ pub async fn create_cloudflare_web_login_auto_setup_headless(
     request: CloudflareWebLoginAutoSetupCoreRequest,
 ) -> Result<CloudflareWebLoginHeadlessSmokeResponse, String> {
     let result = create_cloudflare_web_login_auto_setup_core(request).await?;
+    let _route_guard = try_lock_formal_route()?;
     let mut config = load_standalone_config()
         .map_err(|error| format!("读取 Cloudflare standalone 配置失败: {error}"))?;
     apply_cloudflare_auto_setup_result(&mut config, &result);

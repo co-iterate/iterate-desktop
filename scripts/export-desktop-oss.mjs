@@ -205,6 +205,104 @@ export function auditPackageScriptFiles(filePath, text, selectedPaths) {
   })
 }
 
+const SCRIPT_FILE_REFERENCE = /(?:^|[\s"'=])((?:\.\/)?(?:scripts|src|tests)\/[^\s"'|;&]+?\.(?:bat|cjs|js|mjs|ps1|py|sh|ts|tsx))/g
+const RUN_CLAUSE = /^(?:pnpm|npm)\s+(?:run\s+)?([\w:.-]+)$/
+const RUN_REFERENCE = /(?:^|[\s;&|(])(?:pnpm|npm)\s+run\s+([\w:.-]+)/g
+
+function commandReferencesForbiddenPath(command, forbiddenFragments) {
+  return forbiddenFragments.some((fragment) => {
+    const escaped = fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`(^|[\\s"'=])(?:\\./)?${escaped}`).test(command)
+  })
+}
+
+function missingScriptFileReferences(command, selected) {
+  return [...command.matchAll(SCRIPT_FILE_REFERENCE)]
+    .map(match => normalizeRepositoryPath(match[1]))
+    .filter(referencedPath => referencedPath.startsWith('scripts/') && !selected.has(referencedPath))
+}
+
+/**
+ * 导出时剔除引用了不导出文件的 package.json 脚本，只改 scripts，其余字段原样保留。
+ * - 命令引用了未导出的 scripts/ 文件或禁用路径：删除整条脚本（不删参数，避免测试范围悄悄缩水）
+ * - 仅由 `pnpm run <name>` 与 `&&` 组成的聚合脚本：移除指向已删除脚本的子句，空了就删除，迭代到稳定
+ * - 混合 shell 的脚本不自动改写；悬空的 `pnpm run` 由 auditPackageScriptRuns 报告
+ */
+export function prunePackageScripts(text, selectedPaths, forbiddenFragments = PRIVATE_SCRIPT_PATH_FRAGMENTS) {
+  const packageJson = JSON.parse(text)
+  const scripts = packageJson.scripts
+  if (scripts === undefined)
+    return { text, removed: [] }
+  if (scripts === null || typeof scripts !== 'object' || Array.isArray(scripts))
+    throw new Error('package.json scripts must be an object')
+
+  const selected = new Set(selectedPaths)
+  const next = { ...scripts }
+  const removed = []
+  for (const [script, command] of Object.entries(scripts)) {
+    if (typeof command !== 'string')
+      continue
+    if (commandReferencesForbiddenPath(command, forbiddenFragments)) {
+      removed.push({ script, reason: 'excluded-path-reference' })
+      delete next[script]
+      continue
+    }
+    const missing = missingScriptFileReferences(command, selected)
+    if (missing.length > 0) {
+      removed.push({ script, reason: `missing-script-file:${missing.join(',')}` })
+      delete next[script]
+    }
+  }
+
+  let changed = removed.length > 0
+  while (changed) {
+    changed = false
+    for (const [script, command] of Object.entries(next)) {
+      if (typeof command !== 'string')
+        continue
+      const clauses = command.split('&&').map(clause => clause.trim())
+      const targets = clauses.map(clause => clause.match(RUN_CLAUSE)?.[1])
+      if (targets.some(target => !target))
+        continue
+      const kept = clauses.filter((_, index) => Object.hasOwn(next, targets[index]))
+      if (kept.length === clauses.length)
+        continue
+      changed = true
+      if (kept.length === 0) {
+        removed.push({ script, reason: 'empty-aggregate' })
+        delete next[script]
+      }
+      else {
+        next[script] = kept.join(' && ')
+      }
+    }
+  }
+
+  if (removed.length === 0 && Object.keys(next).length === Object.keys(scripts).length
+    && Object.entries(next).every(([key, value]) => scripts[key] === value)) {
+    return { text, removed: [] }
+  }
+  return {
+    text: `${JSON.stringify({ ...packageJson, scripts: next }, null, 2)}\n`,
+    removed,
+  }
+}
+
+export function auditPackageScriptRuns(filePath, text) {
+  const packageJson = JSON.parse(text)
+  const scripts = packageJson.scripts ?? {}
+  const findings = []
+  for (const [script, command] of Object.entries(scripts)) {
+    if (typeof command !== 'string')
+      continue
+    for (const match of command.matchAll(RUN_REFERENCE)) {
+      if (!Object.hasOwn(scripts, match[1]))
+        findings.push({ code: 'dangling-script-reference', path: filePath, script: `${script}->${match[1]}` })
+    }
+  }
+  return findings
+}
+
 export function auditSourceAssetPolicy(filePath) {
   if (filePath.startsWith('src/rust/assets/resources/')
     && FORBIDDEN_AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
@@ -250,7 +348,21 @@ function binaryIsAllowed(manifest, filePath) {
     && manifest.binaryAllowPrefixes.some(prefix => matchesPrefix(filePath, prefix))
 }
 
-function auditSelectedFiles(sourceRoot, manifest, selectedPaths) {
+function planTransforms(sourceRoot, manifest, selectedPaths) {
+  const transforms = new Map()
+  if (selectedPaths.includes('package.json')) {
+    const original = readFileSync(path.join(sourceRoot, 'package.json'), 'utf8')
+    try {
+      transforms.set('package.json', prunePackageScripts(original, selectedPaths, manifest.forbiddenScriptPathFragments))
+    }
+    catch {
+      // 非法 JSON 交给后面的审计报告 invalid-package-json，不生成看似正常的产物
+    }
+  }
+  return transforms
+}
+
+function auditSelectedFiles(sourceRoot, manifest, selectedPaths, transforms = new Map()) {
   const findings = []
 
   for (const requiredFile of manifest.requiredFiles) {
@@ -287,7 +399,8 @@ function auditSelectedFiles(sourceRoot, manifest, selectedPaths) {
       continue
     }
 
-    const bytes = readFileSync(absolutePath)
+    const transformed = transforms.get(filePath)
+    const bytes = transformed ? Buffer.from(transformed.text, 'utf8') : readFileSync(absolutePath)
     findings.push(...auditLicenseDigest(
       filePath,
       bytes,
@@ -311,6 +424,10 @@ function auditSelectedFiles(sourceRoot, manifest, selectedPaths) {
         manifest.forbiddenScriptPathFragments,
       ))
       findings.push(...auditPackageScriptFiles(filePath, text, selectedPaths))
+      try {
+        findings.push(...auditPackageScriptRuns(filePath, text))
+      }
+      catch {}
     }
     if (filePath === 'LICENSE') {
       for (const notice of manifest.requiredLicenseNotices) {
@@ -356,7 +473,8 @@ function auditSource(sourceRoot) {
   const manifest = loadManifest(sourceRoot)
   const candidateFiles = collectCandidateFiles(sourceRoot)
   const selectedPaths = selectIncludedPaths(manifest, candidateFiles)
-  const findings = auditSelectedFiles(sourceRoot, manifest, selectedPaths)
+  const transforms = planTransforms(sourceRoot, manifest, selectedPaths)
+  const findings = auditSelectedFiles(sourceRoot, manifest, selectedPaths, transforms)
   try {
     execFileSync(
       'git',
@@ -367,7 +485,7 @@ function auditSource(sourceRoot) {
   catch {
     findings.push({ code: 'source-base-mismatch', path: manifest.sourceBaseCommit })
   }
-  return { manifest, selectedPaths, findings }
+  return { manifest, selectedPaths, transforms, findings }
 }
 
 export function validateExportDestination(sourceRoot, destinationRoot) {
@@ -385,7 +503,7 @@ export function validateExportDestination(sourceRoot, destinationRoot) {
     throw new Error('export destination must be outside the source worktree')
 }
 
-function copySelectedFiles(sourceRoot, destinationRoot, selectedPaths) {
+function copySelectedFiles(sourceRoot, destinationRoot, selectedPaths, transforms = new Map()) {
   validateExportDestination(sourceRoot, destinationRoot)
   if (existsSync(destinationRoot))
     throw new Error(`destination already exists: ${destinationRoot}`)
@@ -395,7 +513,11 @@ function copySelectedFiles(sourceRoot, destinationRoot, selectedPaths) {
     const sourcePath = path.join(sourceRoot, filePath)
     const destinationPath = path.join(destinationRoot, filePath)
     mkdirSync(path.dirname(destinationPath), { recursive: true })
-    copyFileSync(sourcePath, destinationPath)
+    const transformed = transforms.get(filePath)
+    if (transformed)
+      writeFileSync(destinationPath, transformed.text)
+    else
+      copyFileSync(sourcePath, destinationPath)
     chmodSync(destinationPath, lstatSync(sourcePath).mode & 0o777)
   }
 }
@@ -411,17 +533,20 @@ function isDirty(sourceRoot) {
 }
 
 function runCheck(sourceRoot) {
-  const { selectedPaths, findings } = auditSource(sourceRoot)
+  const { selectedPaths, transforms, findings } = auditSource(sourceRoot)
   if (findings.length > 0) {
     printFindings(findings)
     process.exitCode = 1
     return
   }
+  const removed = transforms.get('package.json')?.removed ?? []
   console.log(`desktop OSS readiness passed: ${selectedPaths.length} file(s)`)
+  if (removed.length > 0)
+    console.log(`package.json scripts pruned for export: ${removed.map(item => item.script).join(', ')}`)
 }
 
 function runExport(sourceRoot, destinationRoot, allowDirty) {
-  const { manifest, selectedPaths, findings } = auditSource(sourceRoot)
+  const { manifest, selectedPaths, transforms, findings } = auditSource(sourceRoot)
   if (findings.length > 0) {
     printFindings(findings)
     process.exitCode = 1
@@ -432,7 +557,7 @@ function runExport(sourceRoot, destinationRoot, allowDirty) {
   if (dirty && !allowDirty)
     throw new Error('source worktree is dirty; pass --allow-dirty only for local previews')
 
-  copySelectedFiles(sourceRoot, destinationRoot, selectedPaths)
+  copySelectedFiles(sourceRoot, destinationRoot, selectedPaths, transforms)
   const receipt = {
     schemaVersion: 1,
     project: manifest.project,
@@ -441,6 +566,7 @@ function runExport(sourceRoot, destinationRoot, allowDirty) {
     dirty,
     manifestSha256: manifestDigest(sourceRoot),
     fileCount: selectedPaths.length,
+    prunedPackageScripts: (transforms.get('package.json')?.removed ?? []).map(item => item.script),
   }
   writeFileSync(
     path.join(destinationRoot, 'SOURCE_RECEIPT.json'),

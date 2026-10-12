@@ -2,13 +2,13 @@
 import type { DesktopCodexLiveSnapshot, GlobalCodexLivePhase } from '../services/desktopCodexLiveControl'
 import type { PopupArtifact, PopupInputData } from '../types/popup'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { emit as emitTauri, listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
 import { useMessage } from 'naive-ui'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { setupExitWarningListener } from '../composables/useExitWarning'
 import { useKeyboard } from '../composables/useKeyboard'
+import { resolveMcpLaunchContext } from '../composables/useMcpHandler'
 import { useVersionCheck } from '../composables/useVersionCheck'
 import { bridgeFetch } from '../services/bridgeFetch'
 import {
@@ -16,6 +16,7 @@ import {
   toggleDesktopCodexLive,
   toggleDesktopCodexLiveMicrophone,
 } from '../services/desktopCodexLiveControl'
+import { isDesktopMuteToggle } from '../utils/desktopMuteShortcut'
 import { stripAutoPrompt } from '../utils/textUtils'
 import UpdateModal from './common/UpdateModal.vue'
 import TimelineView from './conversation/TimelineView.vue'
@@ -323,45 +324,41 @@ const popupContextKey = computed(() => {
     return `${currentWindowLabel}:${effectiveProjectPath.value}`
   return `${currentWindowLabel}:${normalizeRequestId(props.mcpRequest) || 'unknown-request'}`
 })
-const promptContextStateByKey = ref<Record<string, Record<string, { current_state?: boolean, is_active?: boolean }>>>({})
-const currentPromptContextState = computed(() => promptContextStateByKey.value[popupContextKey.value] || {})
-
-function applyPromptContextState(config: any) {
-  const prompts = Array.isArray(config?.prompts) ? config.prompts : null
-  if (!prompts)
-    return config
-
-  const contextState = promptContextStateByKey.value[popupContextKey.value]
-  if (!contextState)
-    return config
-
-  return {
-    ...config,
-    prompts: prompts.map((prompt: any) => {
-      const localState = contextState[prompt.id]
-      if (!localState)
-        return prompt
-      return {
-        ...prompt,
-        current_state: localState.current_state ?? prompt.current_state,
-        is_active: localState.is_active ?? prompt.is_active,
-      }
-    }),
-  }
-}
+let conditionalPromptSaveQueue = Promise.resolve()
 
 function handlePopupConditionalStateChange(payload: { promptId: string, current_state?: boolean, is_active?: boolean }) {
-  const key = popupContextKey.value
-  const nextByKey = { ...promptContextStateByKey.value }
-  const nextContext = { ...(nextByKey[key] || {}) }
-  nextContext[payload.promptId] = {
-    ...(nextContext[payload.promptId] || {}),
-    ...(payload.current_state !== undefined ? { current_state: payload.current_state } : {}),
-    ...(payload.is_active !== undefined ? { is_active: payload.is_active } : {}),
-  }
-  nextByKey[key] = nextContext
-  promptContextStateByKey.value = nextByKey
-  triggerBridgePush?.()
+  // Keep rapid clicks in order, and finish saving before the popup process exits.
+  conditionalPromptSaveQueue = conditionalPromptSaveQueue.then(async () => {
+    if (payload.current_state !== undefined) {
+      await invoke('update_conditional_prompt_state', {
+        promptId: payload.promptId,
+        newState: payload.current_state,
+        isActive: payload.is_active ?? null,
+      })
+    }
+    else if (payload.is_active !== undefined) {
+      await invoke('update_conditional_prompt_active', {
+        promptId: payload.promptId,
+        isActive: payload.is_active,
+      })
+    }
+    triggerBridgePush?.()
+  }).catch(async (error) => {
+    console.error('保存上下文追加设置失败:', error)
+    message.error('上下文追加设置未保存，请重试')
+    await emitTauri('custom-prompt-config-changed').catch(() => {})
+  })
+  return conditionalPromptSaveQueue
+}
+
+async function handlePopupResponse(response: any) {
+  await conditionalPromptSaveQueue
+  emit('mcpResponse', response)
+}
+
+async function handlePopupCancel() {
+  await conditionalPromptSaveQueue
+  emit('mcpCancel')
 }
 
 function handleWindowConditionalAction(action: any): boolean {
@@ -384,17 +381,16 @@ function handleWindowConditionalAction(action: any): boolean {
 }
 
 async function syncWindowRegistration(projectPath?: string | null, request?: any) {
-  const resolvedProjectPath = projectPath || await invoke<string>('get_default_window_registration_label')
+  // Initial empty Vue props must not erase the request already registered by native startup.
+  request ??= (await resolveMcpLaunchContext()).request
+  const resolvedProjectPath = resolveDisplayProjectPath(request) || projectPath || await invoke<string>('get_default_window_registration_label')
   await invoke('register_window_instance', {
     projectPath: resolvedProjectPath,
     requestId: normalizeRequestId(request),
     title: resolveRequestMessage(request),
   })
   const window = getCurrentWindow()
-  const title = navigator.platform.toUpperCase().includes('WIN')
-    ? 'iterate'
-    : `iterate - ${resolvedProjectPath}`
-  await window.setTitle(title)
+  await window.setTitle(`iterate - ${resolvedProjectPath}`)
 }
 
 function normalizeRequestId(request: any): string | null {
@@ -915,23 +911,12 @@ async function handleOpenArtifactInBrowser() {
 // 窗口最小化功能
 async function minimizeWindow() {
   try {
-    const window = getCurrentWindow()
-    await window.minimize()
+    await syncWindowShortcuts()
+    await invoke('minimize_popup_window')
   }
   catch (error) {
     console.error('最小化窗口失败:', error)
-  }
-}
-
-// 窗口恢复功能
-async function restoreWindow() {
-  try {
-    const window = getCurrentWindow()
-    await window.unminimize()
-    await window.setFocus()
-  }
-  catch (error) {
-    console.error('恢复窗口失败:', error)
+    message.error(String(error))
   }
 }
 
@@ -940,9 +925,6 @@ let shiftKeyAlone = false
 
 // 键盘快捷键处理
 const { handleExitShortcut } = useKeyboard()
-
-// 快捷键启用状态（窗口级别，不再是全局）
-const localShortcutEnabled = ref(true)
 
 // 400ms balances phone-action latency (<0.4s) against bridge churn:
 // at 120ms a single popup generated ~8 lookups/sec with ~0% hit rate (P-2026 CPU batch).
@@ -985,28 +967,6 @@ async function pullCachedBridgeAction(reason: string) {
   }
   finally {
     actionPollInFlight = false
-  }
-}
-
-// 处理快捷键切换（窗口级别）
-async function handleToggleShortcut(enabled: boolean) {
-  localShortcutEnabled.value = enabled
-  // 同时注册/注销全局快捷键
-  if (enabled && props.showMcpPopup) {
-    await registerShortcuts()
-  }
-  else {
-    await unregisterShortcuts()
-  }
-}
-
-async function triggerShortcutToggle() {
-  const nextEnabled = !localShortcutEnabled.value
-  await handleToggleShortcut(nextEnabled)
-  message.success(nextEnabled ? '快捷键已启用' : '快捷键已禁用')
-
-  if (!nextEnabled) {
-    await minimizeWindow()
   }
 }
 
@@ -1053,21 +1013,14 @@ watch(() => props.mcpRequest, async (newRequest) => {
 
 // 全局键盘事件处理器
 function handleGlobalKeydown(event: KeyboardEvent) {
-  if (
-    event.key === 'Escape'
-    && !event.metaKey
-    && !event.ctrlKey
-    && !event.altKey
-    && !event.shiftKey
-    && props.showMcpPopup
-  ) {
+  if (isDesktopMuteToggle(event, props.showMcpPopup)) {
     event.preventDefault()
-    void triggerShortcutToggle()
+    emit('toggleMute')
     return
   }
 
   // 如果快捷键被禁用，不处理任何快捷键逻辑
-  if (!localShortcutEnabled.value) {
+  if (props.isMuted) {
     return
   }
 
@@ -1085,19 +1038,12 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   // 如果按下其他键，说明不是单独按下
   shiftKeyAlone = false
 
-  // Shift+Tab 恢复窗口 - 仅在 MCP 弹窗显示时生效
-  // 排除 Cmd/Ctrl/Alt 等系统组合键
-  if (event.key === 'Tab' && event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && props.showMcpPopup) {
-    event.preventDefault()
-    restoreWindow()
-    return
-  }
-
   // Tab 键最小化当前弹窗 - 仅在 MCP 弹窗显示时生效
   // 排除 Cmd/Ctrl/Alt 等系统组合键
   if (event.key === 'Tab' && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && props.showMcpPopup) {
     event.preventDefault()
-    minimizeWindow()
+    if (!event.repeat)
+      void minimizeWindow()
     return
   }
 
@@ -1107,7 +1053,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
 // 键释放处理器
 function handleGlobalKeyup(event: KeyboardEvent) {
   // 如果快捷键被禁用，不处理任何快捷键逻辑
-  if (!localShortcutEnabled.value) {
+  if (props.isMuted) {
     return
   }
 
@@ -1194,56 +1140,39 @@ async function handleToggleCodexLiveMute() {
   }
 }
 
-// 注册/注销快捷键的状态
+// Native registration follows the shared bell; it is not another user setting.
 const isShortcutsRegistered = ref(false)
+let shortcutLifecycleDisposed = false
+let shortcutRegistrationTask = Promise.resolve()
 
-// 注册全局快捷键
-async function registerShortcuts() {
-  if (isShortcutsRegistered.value)
-    return
-
-  try {
-    const enabled = await invoke('get_global_shortcut_enabled')
-    if (!enabled) {
-      console.log('快捷键已全局禁用，跳过注册')
-      return
+function syncWindowShortcuts(): Promise<void> {
+  shortcutRegistrationTask = shortcutRegistrationTask.then(async () => {
+    let enabled = !shortcutLifecycleDisposed && props.showMcpPopup && !props.isMuted
+    if (enabled) {
+      enabled = Boolean(await invoke('get_global_shortcut_enabled'))
+        && !shortcutLifecycleDisposed && props.showMcpPopup && !props.isMuted
     }
-
-    await register('Shift+Tab', async () => {
-      await restoreWindow()
-    })
-    isShortcutsRegistered.value = true
-    console.log('全局快捷键已注册')
-  }
-  catch (error) {
-    console.error('注册全局快捷键失败:', error)
-  }
+    isShortcutsRegistered.value = await invoke<boolean>('set_popup_restore_enabled', { enabled })
+  }).catch((error) => {
+    console.error('同步窗口快捷键失败:', error)
+  })
+  return shortcutRegistrationTask
 }
 
-// 注销全局快捷键
-async function unregisterShortcuts() {
-  if (!isShortcutsRegistered.value)
-    return
-
-  try {
-    await unregister('Shift+Tab')
-    isShortcutsRegistered.value = false
-    console.log('全局快捷键已注销')
-  }
-  catch (error) {
-    console.error('注销全局快捷键失败:', error)
-  }
-}
+watch(() => props.isMuted, () => {
+  shiftKeyAlone = false
+  void syncWindowShortcuts()
+})
 
 // 监听 MCP 弹窗显示状态变化，动态注册/注销快捷键
 watch(() => props.showMcpPopup, async (newValue) => {
   if (newValue) {
-    await registerShortcuts()
+    await syncWindowShortcuts()
     void refreshUsageQuotaProviders()
   }
   else {
     showTimelineDrawer.value = false
-    await unregisterShortcuts()
+    await syncWindowShortcuts()
   }
 })
 
@@ -1261,7 +1190,7 @@ onMounted(async () => {
 
   // 只在 MCP 弹窗显示时才注册快捷键（避免后台运行时干扰其他应用）
   if (props.showMcpPopup) {
-    await registerShortcuts()
+    await syncWindowShortcuts()
     void refreshUsageQuotaProviders()
   }
 
@@ -1374,7 +1303,7 @@ onMounted(async () => {
             suppress_remote_notification: true,
             request: processedRequest,
             showMcpPopup: props.showMcpPopup,
-            customPrompts: applyPromptContextState(customPromptConfigCache),
+            customPrompts: customPromptConfigCache,
             live_goal: liveGoal,
           },
         },
@@ -1545,7 +1474,7 @@ onMounted(async () => {
           payload: {
             request: processedRequest,
             showMcpPopup: props.showMcpPopup,
-            customPrompts: applyPromptContextState(customPromptConfigCache),
+            customPrompts: customPromptConfigCache,
             conversation_id: conversationTreeId.value,
             timeline_route_id: activeConversationRouteKey.value,
             timelineNodes,
@@ -1629,6 +1558,7 @@ onMounted(async () => {
 })
 
 onUnmounted(async () => {
+  shortcutLifecycleDisposed = true
   if (desktopCodexLivePollTimer !== null) {
     window.clearInterval(desktopCodexLivePollTimer)
     desktopCodexLivePollTimer = null
@@ -1651,7 +1581,7 @@ onUnmounted(async () => {
   document.removeEventListener('keyup', handleGlobalKeyup)
 
   // 注销全局快捷键
-  await unregisterShortcuts()
+  await syncWindowShortcuts()
 
   if (unlistenConversationNodeRecorded) {
     unlistenConversationNodeRecorded()
@@ -1683,7 +1613,6 @@ onUnmounted(async () => {
           :show-main-layout="showPopupSettings"
           :always-on-top="props.appConfig.window.alwaysOnTop"
           :is-muted="props.isMuted"
-          :shortcut-enabled="localShortcutEnabled"
           :project-path="effectiveProjectPath"
           :codex-thread-id="props.mcpRequest?.codex_thread_id"
           :link-url="props.mcpRequest?.link_url"
@@ -1700,8 +1629,6 @@ onUnmounted(async () => {
           @open-iterate-pairing="showIteratePairingModal = true"
           @toggle-codex-live="handleToggleCodexLive"
           @toggle-codex-live-mute="handleToggleCodexLiveMute"
-          @toggle-shortcut="handleToggleShortcut"
-          @minimize-window="minimizeWindow"
         />
       </div>
 
@@ -1757,14 +1684,13 @@ onUnmounted(async () => {
           ref="mcpPopupRef"
           :request="props.mcpRequest"
           :context-key="popupContextKey"
-          :context-prompt-state="currentPromptContextState"
           :app-config="props.appConfig"
           :is-muted="props.isMuted"
           :timeline-tree-id="conversationTreeId"
           :timeline-current-node-id="currentConversationNodeId"
           class="flex-1 flex flex-col overflow-hidden min-h-0"
-          @response="$emit('mcpResponse', $event)"
-          @cancel="$emit('mcpCancel')"
+          @response="handlePopupResponse"
+          @cancel="handlePopupCancel"
           @theme-change="$emit('themeChange', $event)"
           @toggle-mute="$emit('toggleMute')"
           @open-artifact="handleOpenArtifact"

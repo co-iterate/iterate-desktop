@@ -42,7 +42,7 @@ def tool_header_for_server(server_header: str) -> str:
     return server_header[:-1] + ".tools.call_zhi]"
 
 
-def append_default_tool_prompt(text: str, server_header: str, insertion: int) -> str:
+def append_default_tool_approval(text: str, server_header: str, insertion: int) -> str:
     tool_match = TOOL_HEADER_PATTERN.search(text)
     if tool_match:
         next_header = re.search(r"(?m)^\[", text[tool_match.end() :])
@@ -50,14 +50,14 @@ def append_default_tool_prompt(text: str, server_header: str, insertion: int) ->
         block = text[tool_match.start() : end]
         if re.search(r"(?m)^\s*approval_mode\s*=", block):
             return text
-        block = block.rstrip("\n") + '\napproval_mode = "prompt"\n'
+        block = block.rstrip("\n") + '\napproval_mode = "approve"\n'
         return text[: tool_match.start()] + block + text[end:]
 
     before = text[:insertion].rstrip("\n")
     after = text[insertion:].lstrip("\n")
     tool_block = (
         f'{tool_header_for_server(server_header)}\n'
-        'approval_mode = "prompt"\n'
+        'approval_mode = "approve"\n'
     )
     suffix = f"\n{after}" if after else ""
     return f"{before}\n\n{tool_block}{suffix}"
@@ -80,7 +80,7 @@ def merge_config(text: str, command: str) -> str:
             + "args = []\n"
             + f"tool_timeout_sec = {TIMEOUT_SECONDS}\n"
         )
-        return append_default_tool_prompt(merged, server_header, len(merged))
+        return append_default_tool_approval(merged, server_header, len(merged))
 
     start, end, _ = section
     block = text[start:end]
@@ -95,7 +95,7 @@ def merge_config(text: str, command: str) -> str:
 
     merged = text[:start] + block + text[end:]
     insertion = start + len(block)
-    return append_default_tool_prompt(merged, section[2], insertion)
+    return append_default_tool_approval(merged, section[2], insertion)
 
 
 def main() -> int:

@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 对话日志条目
@@ -266,30 +266,99 @@ fn format_path_block(label: &str, paths: &[String]) -> Option<String> {
     }
 }
 
-fn write_git_checkpoint(
-    knowledge_dir: &PathBuf,
-    conv_file: &PathBuf,
+/// 仓库正在 rebase/merge/cherry-pick/revert 时不能插入自动提交（P-2026-1693）。
+pub fn git_operation_in_progress(knowledge_dir: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(knowledge_dir)
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ]
+    .iter()
+    .any(|name| git_dir.join(name).exists())
+}
+
+/// 实时提交单条对话日志。只提交这一个文件（`--only`），其它已暂存内容保持原样；
+/// 仓库忙时跳过，文件已落盘，下一次提交会把内容补上。返回是否创建了提交。
+pub fn commit_conversation_file(
+    knowledge_dir: &Path,
+    conv_file: &Path,
     date_str: &str,
     time_str: &str,
-) {
+) -> bool {
     let Some(conv_file_str) = conv_file.to_str() else {
-        return;
+        return false;
     };
+    if git_operation_in_progress(knowledge_dir) {
+        return false;
+    }
 
-    let _ = Command::new("git")
-        .args(["add", conv_file_str])
-        .current_dir(knowledge_dir)
-        .output();
-    let _ = Command::new("git")
-        .args([
-            "commit",
-            "-m",
-            &format!("auto: conversation {}_{}", date_str, time_str),
-            "--quiet",
-            "--no-verify",
-        ])
-        .current_dir(knowledge_dir)
-        .output();
+    let message = format!("auto: conversation {}_{}", date_str, time_str);
+    // 多个 mcp-server 会同时提交；撞上 index.lock 时退避重试（总计约 2 秒）。
+    for attempt in 0..GIT_LOCK_RETRIES {
+        if attempt > 0 {
+            // 同一进程内的多个线程 pid 相同，按 pid 取抖动会同步重试；混入当前纳秒。
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let jitter = u64::from((std::process::id() ^ nanos) % 50);
+            std::thread::sleep(std::time::Duration::from_millis((40 * attempt).min(200) + jitter));
+        }
+        let added = run_git(knowledge_dir, &["add", "--", conv_file_str]);
+        if added.lock_busy {
+            continue;
+        }
+        if !added.ok {
+            return false;
+        }
+        let committed = run_git(
+            knowledge_dir,
+            &[
+                "commit", "--only", "-m", &message, "--quiet", "--no-verify", "--", conv_file_str,
+            ],
+        );
+        if committed.lock_busy {
+            continue;
+        }
+        return committed.ok;
+    }
+    false
+}
+
+// 退避封顶 200ms、最多 20 次（最坏约 3.6 秒）：全量并行测试或多会话同时回复时 10 次仍会偶发用尽。
+const GIT_LOCK_RETRIES: u64 = 20;
+
+struct GitResult {
+    ok: bool,
+    lock_busy: bool,
+}
+
+fn run_git(dir: &Path, args: &[&str]) -> GitResult {
+    match Command::new("git").args(args).current_dir(dir).output() {
+        Ok(out) => {
+            // index.lock 被占用，或提交期间 HEAD 被其它进程推进（cannot lock ref），都可重试。
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            GitResult {
+                ok: out.status.success(),
+                lock_busy: !out.status.success()
+                    && (stderr.contains(".lock") || stderr.contains("cannot lock ref")),
+            }
+        }
+        Err(_) => GitResult { ok: false, lock_busy: false },
+    }
 }
 
 fn build_conversation_meta_comment(entry: &ConversationEntry) -> Option<String> {
@@ -405,7 +474,7 @@ pub fn append_conversation_log(entry: &ConversationEntry) {
     {
         let _ = file.write_all(content.as_bytes());
         append_checkpoint_registry(entry);
-        write_git_checkpoint(&knowledge_dir, &conv_file, &date_str, &time_str);
+        commit_conversation_file(&knowledge_dir, &conv_file, &date_str, &time_str);
         log::info!(
             "[CHE-DEBUG][conversation] appended file={} request_id={:?} conversation_id={:?} current_node_id={:?} timeline_route_id={:?}",
             conv_file.display(),
@@ -518,6 +587,96 @@ mod tests {
         }
     }
 
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "t@example.com"]);
+        git(dir, &["config", "user.name", "t"]);
+        fs::write(dir.join("other.md"), "x\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "init"]);
+        temp
+    }
+
+    #[test]
+    fn conversation_commit_leaves_other_staged_changes_alone() {
+        let temp = init_repo();
+        let dir = temp.path();
+        fs::write(dir.join("other.md"), "x\nstaged by a human\n").unwrap();
+        git(dir, &["add", "other.md"]);
+        let conv = dir.join("conv.md");
+        fs::write(&conv, "first\n").unwrap();
+
+        assert!(super::commit_conversation_file(dir, &conv, "2026-10-10", "07:40:00"));
+
+        assert_eq!(git(dir, &["show", "--name-only", "--format=", "HEAD"]), "conv.md");
+        assert_eq!(git(dir, &["log", "-1", "--format=%s"]), "auto: conversation 2026-10-10_07:40:00");
+        assert_eq!(git(dir, &["diff", "--cached", "--name-only"]), "other.md");
+    }
+
+    #[test]
+    fn conversation_commit_skips_during_rebase_and_catches_up_later() {
+        let temp = init_repo();
+        let dir = temp.path();
+        let conv = dir.join("conv.md");
+        fs::write(&conv, "first\n").unwrap();
+        let git_dir = std::path::PathBuf::from(git(dir, &["rev-parse", "--absolute-git-dir"]));
+        let head_before = git(dir, &["rev-parse", "HEAD"]);
+
+        for marker in ["rebase-merge", "MERGE_HEAD", "CHERRY_PICK_HEAD"] {
+            let path = git_dir.join(marker);
+            if marker == "rebase-merge" {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, "").unwrap();
+            }
+            assert!(!super::commit_conversation_file(dir, &conv, "d", "t"), "{marker}");
+            assert_eq!(git(dir, &["rev-parse", "HEAD"]), head_before, "{marker}");
+            if path.is_dir() {
+                fs::remove_dir(&path).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+
+        fs::write(&conv, "first\nsecond\n").unwrap();
+        assert!(super::commit_conversation_file(dir, &conv, "d", "t"));
+        assert_eq!(git(dir, &["show", "HEAD:conv.md"]), "first\nsecond");
+    }
+
+    #[test]
+    fn concurrent_conversation_commits_all_land_and_leave_nothing_staged() {
+        let temp = init_repo();
+        let dir = temp.path().to_path_buf();
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let conv = dir.join(format!("conv{i}.md"));
+                    fs::write(&conv, format!("msg {i}\n")).unwrap();
+                    super::commit_conversation_file(&dir, &conv, "d", &i.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert!(results.iter().all(|ok| *ok), "{results:?}");
+        let tracked = git(&dir, &["ls-tree", "--name-only", "HEAD"]);
+        assert_eq!(tracked.lines().filter(|l| l.starts_with("conv")).count(), 12);
+        assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "");
+    }
+
     #[test]
     fn strip_auto_prompt_removes_line_markers() {
         let input = "正常内容\n✔️继续调用 zhi\n后续提示";
@@ -599,7 +758,7 @@ mod tests {
             project_path: Some(project_dir.to_string_lossy().to_string()),
             image_count: 1,
             file_paths: vec!["/tmp/spec.md".to_string()],
-            image_paths: vec!["/Users/test/.cunzhi/images/image_123_0.png".to_string()],
+            image_paths: vec!["/Users/example/.cunzhi/images/image_123_0.png".to_string()],
             selected_options: vec![],
             conversation_id: None,
             current_node_id: None,
@@ -620,7 +779,7 @@ mod tests {
             .expect("conversation path should exist");
         let content = fs::read_to_string(conv_path).unwrap();
         assert!(content.contains("附加文件路径：\n- /tmp/spec.md"));
-        assert!(content.contains("附加图片路径：\n- /Users/test/.cunzhi/images/image_123_0.png"));
+        assert!(content.contains("附加图片路径：\n- /Users/example/.cunzhi/images/image_123_0.png"));
         assert!(
             !content.contains("📷 *附图 1 张*"),
             "real image paths should replace count-only fallback"

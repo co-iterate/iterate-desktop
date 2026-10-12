@@ -1,6 +1,6 @@
 [package]
 name = "cunzhi"
-version = "0.6.4"
+version = "0.6.6"
 edition = "2021"
 default-run = "iterate"
 
@@ -31,7 +31,6 @@ tauri = { version = "2.9.1", features = ["macos-private-api",
 tauri-plugin-shell = "2.0.0"
 tauri-plugin-updater = "2.0.0"
 tauri-plugin-global-shortcut = "2.0.0"
-tauri-plugin-dialog = "2.7.2"
 serde = { version = "1.0", features = [ "derive" ] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = [
@@ -44,12 +43,12 @@ tokio = { version = "1.0", features = [
   "sync", # oneshot channel 需要
   "time" # sleep() 需要
 ] }
-anyhow = "1.0.103"
+anyhow = "1.0"
 thiserror = "1.0"
 uuid = { version = "1.0", features = [ "v4" ] }
 chrono = { version = "0.4", features = [ "serde" ] }
 dirs = "5.0"
-rmcp = { version = "1.4.0", default-features = false, features = [
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "main", features = [
   "server",
   "client",
   "transport-io",
@@ -57,20 +56,20 @@ rmcp = { version = "1.4.0", default-features = false, features = [
 ] }
 schemars = "0.8"
 rodio = "0.19"
-reqwest = { version = "0.12.24", default-features = false, features = [
+reqwest = { version = "0.11", default-features = false, features = [
   "stream",
   "json",
   "native-tls-alpn"
 ] }
 base64 = "0.21"
 base64_013 = { package = "base64", version = "0.13" }
-web-push-native = { version = "0.5.0", default-features = false }
+web-push = { version = "0.10.4", default-features = false, features = [ "hyper-client" ] }
 rust-embed = "8.0"
 teloxide = { version = "0.15.0", features = [ "macros" ] }
 regex = "1.0"
 log = "0.4.27"
 env_logger = "0.11.8"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = "9.3"
 percent-encoding = "2.3"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = [
@@ -95,7 +94,8 @@ tower-http = { version = "0.5", features = [
 parking_lot = "0.12" # 高效的同步原语，用于 zhi 授权状态追踪
 portable-pty = "0.9.0"
 tempfile = "3.10"
-openssl = { version = "0.10.80", features = ["vendored"] }
+toml_edit = "0.25" # 保留格式地修改用户的 Codex config.toml
+openssl = { version = "0.10", features = ["vendored"] }
 native-tls = "0.2"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 keyring = "3"
@@ -106,7 +106,6 @@ tauri-build = { version = "2.0", features = [] }
 
 [features]
 default = []
-custom-protocol = ["tauri/custom-protocol"]
 legacy-cunzhi-bin = []
 
 # 发布版本优化配置
@@ -123,16 +122,3 @@ core-foundation = "0.10.1"
 core-graphics = { version = "0.25.0", features = ["elcapitan"] }
 objc = "0.2.7"
 security-framework = "3.7"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-fs2 = "0.4"
-reqwest = { version = "0.12.24", default-features = false, features = [
-  "blocking",
-  "stream",
-  "json",
-  "native-tls-alpn"
-] }
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_System_Threading"
-] }

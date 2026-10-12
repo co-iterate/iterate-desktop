@@ -16,7 +16,9 @@ import { useKeyboard } from '../../composables/useKeyboard'
 import { usePromptLibrary } from '../../composables/usePromptLibrary'
 import { SpeechInsertGuard } from '../../services/speechInsertGuard'
 import {
-  extractGhostSuggestionAutoPromotionTerms,
+  directUserLearningChunkFromCompositionEvent,
+  directUserLearningChunkFromInputEvent,
+  extractDirectUserAuthoredPromotionTerms,
   getGhostSuggestionAutoPromotionCandidates,
   GHOST_SUGGESTION_AUTO_PROMOTION_STORAGE_KEY,
   parseGhostSuggestionAutoPromotionState,
@@ -34,7 +36,6 @@ import { insertDroppedText } from '../../utils/text-drop.mjs'
 interface Props {
   request: McpRequest | null
   contextKey?: string
-  contextPromptState?: Record<string, Pick<CustomPrompt, 'current_state' | 'is_active'>>
   enableContextAppend?: boolean
   loading?: boolean
   submitting?: boolean
@@ -82,7 +83,6 @@ let unlistenSpeechSnapshot: (() => void) | null = null
 let registeredSpeechTargetRequestId: string | null = null
 const speechInsertGuard = new SpeechInsertGuard()
 let suppressSpeechTargetFocusUntil = 0
-const contextPromptStateCache = new Map<string, Record<string, Pick<CustomPrompt, 'current_state' | 'is_active'>>>()
 
 // 响应式数据
 const userInput = ref('')
@@ -204,6 +204,8 @@ let textareaAutosizeFrame: number | null = null
 let optionGhostControlCandidate: 'AltLeft' | 'AltRight' | null = null
 const pressedGhostControlOptionCodes = new Set<'AltLeft' | 'AltRight'>()
 const TEXTAREA_AUTOSIZE_IDLE_MS = 120
+const MAX_GHOST_RENDER_INPUT_LENGTH = 320
+let directUserLearningBuffer = ''
 
 // 计算属性
 const hasOptions = computed(() => (props.request?.predefined_options?.length ?? 0) > 0)
@@ -304,7 +306,10 @@ const previewSuffix = computed(() => {
 })
 
 const shouldShowGhostSuggestion = computed(() => {
-  return !!activeSuggestion.value && previewSuffix.value.length > 0 && !textareaIsScrolled.value
+  return !!activeSuggestion.value
+    && previewSuffix.value.length > 0
+    && userInput.value.length <= MAX_GHOST_RENDER_INPUT_LENGTH
+    && !textareaIsScrolled.value
 })
 
 const canApplyActiveSuggestion = computed(() => {
@@ -329,18 +334,17 @@ const statusText = computed(() => {
 
 // 发送更新事件
 function emitUpdate() {
-  // 获取条件性prompt的追加内容
-  const conditionalContent = props.enableContextAppend ? generateConditionalContent() : ''
-
-  // 将条件性内容追加到用户输入
-  const finalUserInput = userInput.value + conditionalContent
-
   emit('update', {
-    userInput: finalUserInput,
+    userInput: userInput.value,
     selectedOptions: selectedOptions.value,
     draggedImages: uploadedImages.value,
     attachedFiles: attachedFiles.value,
   })
+}
+
+function getFinalUserInput() {
+  const conditionalContent = props.enableContextAppend ? generateConditionalContent() : ''
+  return userInput.value + conditionalContent
 }
 
 // 处理选项变化
@@ -697,11 +701,7 @@ function autoPromotionStateFromUnknown(value: unknown) {
 }
 
 async function syncAutoPromotionStateFromDisk() {
-  const legacyState = readAutoPromotionState()
-  const hasLegacyEntries = Object.keys(legacyState.entries).length > 0
-  const result = hasLegacyEntries
-    ? await invoke<unknown>('merge_ghost_suggestion_learning_state', { state: legacyState })
-    : await invoke<unknown>('get_ghost_suggestion_learning_state')
+  const result = await invoke<unknown>('get_ghost_suggestion_learning_state')
   const payload = result && typeof result === 'object' && 'state' in result
     ? (result as { state: unknown }).state
     : result
@@ -717,6 +717,7 @@ async function recordAutoPromotionEvent(
   const result = await invoke<unknown>('record_ghost_suggestion_learning', {
     request: {
       event,
+      provenance: event === 'typed' ? 'direct-user-input-v2' : undefined,
       terms,
     },
   })
@@ -779,7 +780,12 @@ async function recordAcceptedHistoryCommandSuggestion(suggestion: CommandSuggest
 }
 
 function recordSubmittedInputForAutoPromotion(input = userInput.value) {
-  const terms = extractGhostSuggestionAutoPromotionTerms(input, existingGhostSuggestionKeys())
+  const terms = extractDirectUserAuthoredPromotionTerms(
+    directUserLearningBuffer,
+    input,
+    existingGhostSuggestionKeys(),
+  )
+  directUserLearningBuffer = ''
   if (terms.length === 0)
     return
 
@@ -935,9 +941,9 @@ async function loadCustomPrompts(options: { forceRefresh?: boolean } = {}) {
       const promptConfig = config
 
       // 按sort_order排序
-      customPrompts.value = applyContextPromptState(
-        (promptConfig.prompts || []).sort((a: CustomPrompt, b: CustomPrompt) => a.sort_order - b.sort_order),
-      )
+      customPrompts.value = (promptConfig.prompts || [])
+        .map((prompt: CustomPrompt) => ({ ...prompt }))
+        .sort((a: CustomPrompt, b: CustomPrompt) => a.sort_order - b.sort_order)
       customPromptEnabled.value = promptConfig.enabled ?? true
       console.log('PopupInput: 加载到的prompt数量:', customPrompts.value.length)
       console.log('PopupInput: 条件性prompt列表:', customPrompts.value.filter(p => p.type === 'conditional'))
@@ -958,49 +964,6 @@ async function loadCustomPrompts(options: { forceRefresh?: boolean } = {}) {
   }
   catch (error) {
     console.error('PopupInput: 加载自定义prompt失败:', error)
-  }
-}
-
-function currentContextPromptState() {
-  const key = props.contextKey
-  if (!key)
-    return null
-
-  let state = contextPromptStateCache.get(key)
-  if (!state) {
-    state = {}
-    contextPromptStateCache.set(key, state)
-  }
-  return state
-}
-
-function applyContextPromptState(prompts: CustomPrompt[]) {
-  const contextState = currentContextPromptState()
-
-  return prompts.map((prompt) => {
-    const nextPrompt = { ...prompt }
-    const applyPromptState = (state?: Pick<CustomPrompt, 'current_state' | 'is_active'>) => {
-      if (!state)
-        return
-      if (state.current_state !== undefined)
-        nextPrompt.current_state = state.current_state
-      if (state.is_active !== undefined)
-        nextPrompt.is_active = state.is_active
-    }
-    applyPromptState(contextState?.[prompt.id])
-    applyPromptState(props.contextPromptState?.[prompt.id])
-    return nextPrompt
-  })
-}
-
-function rememberContextPromptState(prompt: CustomPrompt) {
-  const contextState = currentContextPromptState()
-  if (!contextState)
-    return
-
-  contextState[prompt.id] = {
-    current_state: prompt.current_state,
-    is_active: prompt.is_active,
   }
 }
 
@@ -1073,6 +1036,17 @@ async function handleLibraryImport(event: Event) {
   const result = await promptLibrary.importFiles(input.files)
   message.success(`导入 ${result.imported} 条，跳过 ${result.skipped} 条${result.failedFiles.length ? `，失败: ${result.failedFiles.join(', ')}` : ''}`)
   input.value = ''
+}
+
+// 处理从目录导入提示词
+async function handleDirectoryImport(dirPath: string) {
+  const result = await promptLibrary.importFromDirectory(dirPath)
+  if (result.imported > 0 || result.skipped > 0) {
+    message.success(`导入 ${result.imported} 条，跳过 ${result.skipped} 条${result.failedFiles.length ? `，失败: ${result.failedFiles.join(', ')}` : ''}`)
+  }
+  else {
+    message.warning('未找到可导入的提示词文件')
+  }
 }
 
 // 添加新提示词到库
@@ -1302,8 +1276,10 @@ async function focusInput(options: { registerSpeechTarget?: boolean } = {}) {
     return
 
   try {
-    const webview = getCurrentWebviewWindow()
-    await webview.setFocus()
+    // Delayed focus work must not pull a minimized/background native window forward.
+    // Once the user opens a Dock window, local textarea focus works even while muted.
+    if (!await invoke<boolean>('can_focus_popup_input'))
+      return
 
     const inputElement = getTextareaElement()
 
@@ -1477,12 +1453,17 @@ function cancelTextareaAutosize() {
   textareaAutosizeFrame = null
 }
 
+function handleDirectUserInputForLearning(event: InputEvent) {
+  directUserLearningBuffer += directUserLearningChunkFromInputEvent(event)
+}
+
 function handleCompositionStart() {
   isComposing.value = true
   cancelTextareaAutosize()
 }
 
-function handleCompositionEnd() {
+function handleCompositionEnd(event: CompositionEvent) {
+  directUserLearningBuffer += directUserLearningChunkFromCompositionEvent(event)
   isComposing.value = false
   void nextTick(() => {
     scheduleTextareaAutosize(0)
@@ -1580,7 +1561,6 @@ function handleConditionalActiveToggle(promptId: string, value: boolean) {
   const prompt = customPrompts.value.find(p => p.id === promptId)
   if (prompt) {
     prompt.is_active = value
-    rememberContextPromptState(prompt)
     emit('conditionalStateChange', { promptId, is_active: value })
     emitUpdate()
   }
@@ -1592,11 +1572,10 @@ function handleConditionalToggle(promptId: string, value: boolean) {
   const prompt = customPrompts.value.find(p => p.id === promptId)
   if (prompt) {
     prompt.current_state = value
-    // 如果当前未激活，自动激活当前窗口上下文，不写全局配置
+    // Switching a disabled item also enables it; save both values together.
     if (prompt.is_active === false) {
       prompt.is_active = true
     }
-    rememberContextPromptState(prompt)
     emit('conditionalStateChange', {
       promptId,
       current_state: value,
@@ -2035,6 +2014,7 @@ watch(() => props.request?.id, (requestId, previousRequestId) => {
   if (previousRequestId)
     void unregisterPopupSpeechTarget(previousRequestId)
   if (requestId) {
+    void loadCustomPrompts({ forceRefresh: true })
     scheduleTextareaFocus(`request-changed:${requestId}`)
   }
 })
@@ -2047,10 +2027,6 @@ watch(() => props.submitting, (submitting) => {
 watch(() => props.contextKey, () => {
   void loadCustomPrompts({ forceRefresh: true })
 })
-
-watch(() => props.contextPromptState, () => {
-  void loadCustomPrompts()
-}, { deep: true })
 
 watch(() => props.enableContextAppend, () => {
   emitUpdate()
@@ -2074,6 +2050,7 @@ watch(commandSuggestions, (suggestions) => {
 // 重置数据
 function reset() {
   userInput.value = ''
+  directUserLearningBuffer = ''
   selectedOptions.value = []
   uploadedImages.value = []
   attachedFiles.value = []
@@ -2106,6 +2083,7 @@ defineExpose({
   canSubmit,
   statusText,
   updateData,
+  getFinalUserInput,
   recordSubmittedInputForAutoPromotion,
   focusInput,
   handleQuoteMessage,
@@ -2145,6 +2123,7 @@ defineExpose({
           autocapitalize="off"
           spellcheck="false"
           data-guide="popup-input"
+          @input="handleDirectUserInputForLearning"
           @paste="handleInputPaste"
           @focus="handleSpeechTargetFocus"
           @click="handleSpeechTargetClick"
@@ -2334,6 +2313,14 @@ defineExpose({
                 @click="fileInputRef?.click()"
               >
                 {{ promptLibrary.isImporting.value ? '导入中...' : '导入' }}
+              </button>
+              <button
+                class="px-2 py-1 text-xs bg-blue-500/20 text-blue-400 rounded hover:bg-blue-500/30 transition-colors whitespace-nowrap"
+                :disabled="promptLibrary.isImporting.value"
+                title="从手机提示词库目录导入"
+                @click="handleDirectoryImport('~/手机:提示词')"
+              >
+                {{ promptLibrary.isImporting.value ? '...' : '📱导入' }}
               </button>
               <button
                 v-if="promptLibrary.items.value.length > 0"

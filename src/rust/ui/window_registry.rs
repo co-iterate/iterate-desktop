@@ -1,6 +1,4 @@
 use crate::log_important;
-#[cfg(target_os = "windows")]
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -11,7 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WindowInstance {
     pub pid: u32,
     pub project_path: String,
@@ -25,15 +23,29 @@ pub struct WindowInstance {
     pub request_title: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct WindowRegistry {
     pub instances: Vec<WindowInstance>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) last_focused_at_by_pid: HashMap<u32, String>,
 }
 
+/// 测试专用：把注册表重定向到临时文件。默认路径是真实的 `$TMPDIR/iterate_windows.json`，
+/// 本机运行中的 iterate 也在读写它，测试直接写会互相干扰（并行偶发失败），还会改坏线上状态。
+#[cfg(test)]
+pub(crate) static TEST_REGISTRY_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
 impl WindowRegistry {
     fn registry_path() -> PathBuf {
+        #[cfg(test)]
+        if let Some(path) = TEST_REGISTRY_PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return path;
+        }
         let tmp_dir = std::env::temp_dir();
         tmp_dir.join("iterate_windows.json")
     }
@@ -74,9 +86,26 @@ impl WindowRegistry {
         Ok(())
     }
 
+    /// The serve process already knows the real child PID and immutable request identity.
+    /// Register that popup before WebView startup so Bridge can route mobile delivery.
+    pub(crate) fn register_spawned_popup(
+        pid: u32,
+        project_path: &str,
+        request_id: &str,
+        request_title: &str,
+    ) -> Result<(), String> {
+        register_spawned_popup_at_path(
+            &Self::registry_path(),
+            pid,
+            project_path,
+            request_id,
+            request_title,
+        )
+    }
+
     pub fn unregister(&mut self) -> Result<(), String> {
         let pid = process::id();
-        *self = update_registry_at_path(&Self::registry_path(), false, |registry| {
+        *self = update_registry_at_path(&Self::registry_path(), |registry| {
             registry.instances.retain(|instance| instance.pid != pid);
             registry.last_focused_at_by_pid.remove(&pid);
         })?;
@@ -102,7 +131,7 @@ impl WindowRegistry {
 
     pub fn clear_request_binding(&mut self) -> Result<(), String> {
         let pid = process::id();
-        *self = update_registry_at_path(&Self::registry_path(), false, |registry| {
+        *self = update_registry_at_path(&Self::registry_path(), |registry| {
             if let Some(instance) = registry
                 .instances
                 .iter_mut()
@@ -121,7 +150,7 @@ impl WindowRegistry {
     }
 
     fn get_all_instances_at_path(&mut self, path: &Path) -> Vec<WindowInstance> {
-        match update_registry_at_path(path, true, |_| {}) {
+        match update_registry_at_path(path, |_| {}) {
             Ok(registry) => *self = registry,
             Err(error) => log_important!(warn, "读取窗口注册表失败: {}", error),
         }
@@ -191,11 +220,8 @@ fn save_registry_atomically(path: &Path, registry: &WindowRegistry) -> Result<()
 
 fn update_registry_at_path(
     path: &Path,
-    cleanup_stale: bool,
     mutate: impl FnOnce(&mut WindowRegistry),
 ) -> Result<WindowRegistry, String> {
-    #[cfg(not(target_os = "windows"))]
-    let _ = cleanup_stale;
     let lock_path = path.with_extension("json.lock");
     let lock_file = OpenOptions::new()
         .read(true)
@@ -204,10 +230,6 @@ fn update_registry_at_path(
         .open(&lock_path)
         .map_err(|error| format!("打开窗口注册表锁失败: {}", error))?;
 
-    #[cfg(target_os = "windows")]
-    lock_file
-        .lock_exclusive()
-        .map_err(|error| format!("锁定窗口注册表失败: {}", error))?;
     #[cfg(unix)]
     if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(format!(
@@ -217,30 +239,35 @@ fn update_registry_at_path(
     }
 
     let mut registry = load_registry_from_path(path);
-    #[cfg(target_os = "windows")]
-    let original = registry.clone();
-    #[cfg(target_os = "windows")]
-    if cleanup_stale {
-        registry.cleanup_stale_instances();
-    }
-    #[cfg(not(target_os = "windows"))]
     registry.cleanup_stale_instances();
     mutate(&mut registry);
-    #[cfg(target_os = "windows")]
-    let save_result = if registry == original {
-        Ok(())
-    } else {
-        save_registry_atomically(path, &registry)
-    };
-    #[cfg(not(target_os = "windows"))]
     let save_result = save_registry_atomically(path, &registry);
 
-    #[cfg(target_os = "windows")]
-    let _ = FileExt::unlock(&lock_file);
     #[cfg(unix)]
     let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
 
     save_result.map(|_| registry)
+}
+
+fn register_spawned_popup_at_path(
+    path: &Path,
+    pid: u32,
+    project_path: &str,
+    request_id: &str,
+    request_title: &str,
+) -> Result<(), String> {
+    if pid == 0 || request_id.trim().is_empty() {
+        return Err("invalid spawned popup identity".to_string());
+    }
+    register_instance_at_path(
+        path,
+        pid,
+        &normalize_project_path(project_path, pid),
+        Some(request_id),
+        Some(&truncate_request_title(request_title)),
+        None,
+    )?;
+    Ok(())
 }
 
 fn register_instance_at_path(
@@ -255,7 +282,7 @@ fn register_instance_at_path(
     let request_id = normalize_optional_trimmed(request_id);
     let request_title =
         normalize_optional_trimmed(request_title).map(|title| truncate_request_title(&title));
-    update_registry_at_path(path, true, move |registry| {
+    update_registry_at_path(path, move |registry| {
         if let Some(instance) = registry
             .instances
             .iter_mut()
@@ -286,7 +313,7 @@ fn mark_instance_focused_at_path(
     focused_at: String,
 ) -> Result<(WindowRegistry, bool), String> {
     let mut updated = false;
-    let registry = update_registry_at_path(path, false, |registry| {
+    let registry = update_registry_at_path(path, |registry| {
         if registry
             .instances
             .iter()
@@ -356,24 +383,12 @@ fn is_process_running(pid: u32) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        const STILL_ACTIVE_EXIT_CODE: u32 = 259;
-
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return false;
-            }
-
-            let mut exit_code = 0u32;
-            let running = GetExitCodeProcess(handle, &mut exit_code) != 0
-                && exit_code == STILL_ACTIVE_EXIT_CODE;
-            let _ = CloseHandle(handle);
-            running
-        }
+        use std::process::Command;
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid)])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
     }
 
     #[cfg(target_os = "linux")]
@@ -569,6 +584,38 @@ pub fn activate_window(pid: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_delivery_registers_real_child_identity_without_a_webview() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windows.json");
+        let pid = std::process::id();
+        super::register_spawned_popup_at_path(
+            &path,
+            pid,
+            "/tmp/native-delivery",
+            "serve-12345",
+            "new request",
+        )
+        .unwrap();
+        let registry = super::load_registry_from_path(&path);
+        assert_eq!(registry.instances.len(), 1);
+        assert_eq!(registry.instances[0].pid, pid);
+        assert_eq!(
+            registry.instances[0].request_id.as_deref(),
+            Some("serve-12345")
+        );
+        assert_eq!(registry.instances[0].project_path, "/tmp/native-delivery");
+        assert!(registry.instances[0].port.is_none());
+        assert!(super::register_spawned_popup_at_path(
+            &path,
+            0,
+            "/tmp/native-delivery",
+            "serve-12345",
+            "new request"
+        )
+        .is_err());
+    }
+
     use super::{
         command_chain_serve_port, command_serve_port, normalize_project_path,
         register_instance_at_path, WindowRegistry,
@@ -606,8 +653,8 @@ mod tests {
     #[test]
     fn keeps_real_project_path() {
         assert_eq!(
-            normalize_project_path("/Users/test/project", 42),
-            "/Users/test/project"
+            normalize_project_path("/Users/example/cunzhi", 42),
+            "/Users/example/cunzhi"
         );
     }
 
@@ -633,7 +680,7 @@ mod tests {
         let _config_guard = EnvGuard::remove("ITERATE_CONFIG_DIR");
 
         let normalized = normalize_project_path("Unknown", 42);
-        assert!(std::path::Path::new(&normalized).is_absolute() || normalized == "Unknown:pid-42");
+        assert!(normalized.starts_with('/') || normalized == "Unknown:pid-42");
     }
 
     #[test]
@@ -803,16 +850,10 @@ mod tests {
     fn locked_registrations_preserve_other_live_processes() {
         let temp_dir = tempfile::tempdir().expect("temp registry directory");
         let registry_path = std::sync::Arc::new(temp_dir.path().join("iterate_windows.json"));
-        let mut child = std::process::Command::new(
-            std::env::current_exe().expect("resolve current test executable"),
-        )
-        .args([
-            "--ignored",
-            "--exact",
-            "window_registry::tests::window_registry_sleep_helper",
-        ])
-        .spawn()
-        .expect("spawn second live popup process");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn second live popup process");
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let first_path = std::sync::Arc::clone(&registry_path);
@@ -866,11 +907,5 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(paths, vec!["/tmp/project-a", "/tmp/project-b"]);
-    }
-
-    #[test]
-    #[ignore = "subprocess helper for the cross-process registry test"]
-    fn window_registry_sleep_helper() {
-        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }

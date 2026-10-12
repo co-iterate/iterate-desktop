@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   createEmptyGhostSuggestionAutoPromotionState,
+  directUserLearningChunkFromCompositionEvent,
+  directUserLearningChunkFromInputEvent,
+  extractDirectUserAuthoredPromotionTerms,
   extractGhostSuggestionAutoPromotionTerms,
   getGhostSuggestionAutoPromotionCandidates,
   markGhostSuggestionAutoPromotionPromoted,
@@ -53,7 +56,7 @@ describe('ghost suggestion auto promotion', () => {
 
   it('filters existing suggestions and noisy values', () => {
     assert.equal(shouldTrackGhostSuggestionAutoPromotion('activity', ['activity']), false)
-    assert.equal(shouldTrackGhostSuggestionAutoPromotion('/Users/test/project'), false)
+    assert.equal(shouldTrackGhostSuggestionAutoPromotion('/Users/example/cunzhi'), false)
     assert.equal(shouldTrackGhostSuggestionAutoPromotion('global_rules.md'), false)
     assert.equal(shouldTrackGhostSuggestionAutoPromotion('.env'), false)
     assert.equal(shouldTrackGhostSuggestionAutoPromotion('auth_token'), false)
@@ -82,7 +85,49 @@ describe('ghost suggestion auto promotion', () => {
 
   it('extracts only trackable terms from submitted input', () => {
     assert.deepEqual(
-      extractGhostSuggestionAutoPromotionTerms('activity global_rules.md auth_token /Users/test/project activity', []),
+      extractGhostSuggestionAutoPromotionTerms('activity global_rules.md auth_token /Users/example/cunzhi activity', []),
+      ['activity'],
+    )
+  })
+
+  it('learns only native text insertion and committed IME text event types', () => {
+    assert.equal(directUserLearningChunkFromInputEvent({
+      isTrusted: true,
+      inputType: 'insertText',
+      data: 'activity',
+      isComposing: false,
+    }), 'activity')
+    assert.equal(directUserLearningChunkFromInputEvent({
+      isTrusted: true,
+      inputType: 'insertFromPaste',
+      data: 'AI response',
+      isComposing: false,
+    }), '')
+    assert.equal(directUserLearningChunkFromInputEvent({
+      isTrusted: false,
+      inputType: 'insertText',
+      data: 'webview-text',
+      isComposing: false,
+    }), 'webview-text')
+    assert.equal(directUserLearningChunkFromInputEvent({
+      isTrusted: true,
+      inputType: 'insertCompositionText',
+      data: '上',
+      isComposing: true,
+    }), '')
+    assert.equal(directUserLearningChunkFromCompositionEvent({
+      isTrusted: false,
+      data: '上下文',
+    }), '上下文')
+  })
+
+  it('excludes programmatic or deleted text from submitted learning terms', () => {
+    assert.deepEqual(
+      extractDirectUserAuthoredPromotionTerms(
+        'activity deletedWord',
+        'AI generated context gpt-5.6-terra activity',
+        [],
+      ),
       ['activity'],
     )
   })

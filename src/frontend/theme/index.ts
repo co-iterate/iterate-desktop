@@ -1,6 +1,6 @@
 import type { GlobalTheme } from 'naive-ui'
 import { darkTheme, lightTheme } from 'naive-ui'
-import { functionalColors, primaryColors, themeColors } from './colors'
+import { functionalColors, inputColors, interactionColors, primaryColors, themeColors } from './colors'
 
 // 自定义暗黑主题
 export const customDarkTheme: GlobalTheme = {
@@ -34,8 +34,8 @@ export const customDarkTheme: GlobalTheme = {
     inputColorDisabled: themeColors.dark.surface300,
 
     // 悬停色
-    hoverColor: 'rgba(255, 255, 255, 0.09)',
-    pressedColor: 'rgba(255, 255, 255, 0.13)',
+    hoverColor: interactionColors.dark.hover,
+    pressedColor: interactionColors.dark.pressed,
 
     // 成功、警告、错误色
     successColor: functionalColors.success,
@@ -77,8 +77,8 @@ export const customLightTheme: GlobalTheme = {
     inputColorDisabled: themeColors.light.surface100,
 
     // 悬停色
-    hoverColor: 'rgba(0, 0, 0, 0.09)',
-    pressedColor: 'rgba(0, 0, 0, 0.13)',
+    hoverColor: interactionColors.light.hover,
+    pressedColor: interactionColors.light.pressed,
 
     // 成功、警告、错误色
     successColor: functionalColors.success,
@@ -129,6 +129,11 @@ export function applyThemeVariables(themeName: string) {
   root.style.setProperty('--color-container', colors.container)
   root.style.setProperty('--color-border', colors.border)
   root.style.setProperty('--color-divider', colors.divider)
+
+  root.style.setProperty('--color-input-focus', inputColors.focus)
+  root.style.setProperty('--color-input-hover', inputColors.hover)
+  root.style.setProperty('--color-input-focus-ring', inputColors.focusRing)
+  root.style.setProperty('--color-quote-border', primaryColors[500])
 
   // 设置body和text颜色变量（兼容旧CSS）
   root.style.setProperty('--body-color', colors.surface)

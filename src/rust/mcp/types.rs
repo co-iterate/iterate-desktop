@@ -161,6 +161,8 @@ pub struct PopupRequest {
     pub link_title: Option<String>,
     #[serde(default)]
     pub browser_ai_response: Option<String>,
+    #[serde(default)]
+    pub browser_tab_id: Option<u32>,
 }
 
 /// 新的结构化响应数据格式

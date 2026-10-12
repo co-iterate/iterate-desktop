@@ -125,10 +125,15 @@ impl ZhiServer {
 
 impl ServerHandler for ZhiServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_server_info(Implementation::new("Zhi-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Zhi 智能代码审查工具，支持交互式对话和记忆管理")
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "Zhi-mcp".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            instructions: Some("Zhi 智能代码审查工具，支持交互式对话和记忆管理".to_string()),
+        }
     }
 
     async fn initialize(
@@ -175,11 +180,12 @@ impl ServerHandler for ZhiServer {
         });
 
         if let serde_json::Value::Object(schema_map) = zhi_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("zhi"),
-                Cow::Borrowed("iterate 交互工具（L0 协调者）。用户发送 'zhi' 时必须立即调用，停止一切其他操作。所有对话必经，控制任务流程。支持预定义选项、自由文本输入和图片上传。"),
-                Arc::new(schema_map),
-            ));
+            tools.push(Tool {
+                name: Cow::Borrowed("zhi"),
+                description: Some(Cow::Borrowed("iterate 交互工具（L0 协调者）。用户发送 'zhi' 时必须立即调用，停止一切其他操作。所有对话必经，控制任务流程。支持预定义选项、自由文本输入和图片上传。")),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
 
         // 记忆管理工具 - 仅在启用时添加
@@ -208,11 +214,12 @@ impl ServerHandler for ZhiServer {
             });
 
             if let serde_json::Value::Object(schema_map) = ji_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("ji"),
-                    Cow::Borrowed("全局记忆管理工具。支持 4 种 action：回忆/记忆/沉淀/摘要。必须绑定 git 根目录。用于存储开发规范、用户偏好和最佳实践。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("ji"),
+                    description: Some(Cow::Borrowed("全局记忆管理工具。支持 4 种 action：回忆/记忆/沉淀/摘要。必须绑定 git 根目录。用于存储开发规范、用户偏好和最佳实践。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -238,11 +245,12 @@ impl ServerHandler for ZhiServer {
             });
 
             if let serde_json::Value::Object(schema_map) = ku_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("ci"),
-                    Cow::Borrowed("提示词库搜索工具。在 .cunzhi-knowledge/prompts/ 中搜索相关模板。触发：用户输入目录名（如 ci、git、testing）。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("ci"),
+                    description: Some(Cow::Borrowed("提示词库搜索工具。在 .cunzhi-knowledge/prompts/ 中搜索相关模板。触发：用户输入目录名（如 ci、git、testing）。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -264,11 +272,12 @@ impl ServerHandler for ZhiServer {
             });
 
             if let serde_json::Value::Object(schema_map) = smart_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("ask_smart_friend"),
-                    Cow::Borrowed("向更强大的 AI 模型咨询建议。使用场景：1. 代码探索后、执行前 - 请求计划审查；2. 遇到新错误/Bug - 请求调试建议；3. 完成编码后 - 请求代码审查。它能看到整个对话上下文。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("ask_smart_friend"),
+                    description: Some(Cow::Borrowed("向更强大的 AI 模型咨询建议。使用场景：1. 代码探索后、执行前 - 请求计划审查；2. 遇到新错误/Bug - 请求调试建议；3. 完成编码后 - 请求代码审查。它能看到整个对话上下文。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -311,11 +320,12 @@ impl ServerHandler for ZhiServer {
             });
 
             if let serde_json::Value::Object(schema_map) = pai_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("pai"),
-                    Cow::Borrowed("Pai Room 编排工具。生成 pnpm codex-room 调度草案和 worker 回包协议，不创建或派发子代理。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("pai"),
+                    description: Some(Cow::Borrowed("Pai Room 编排工具。生成 pnpm codex-room 调度草案和 worker 回包协议，不创建或派发子代理。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -349,11 +359,12 @@ impl ServerHandler for ZhiServer {
             });
 
             if let serde_json::Value::Object(schema_map) = pty_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("exec_pty"),
-                    Cow::Borrowed("在伪终端 (PTY) 中执行 shell 命令。通过代理 Node.js Terminal MCP Server 实现，支持超时控制。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("exec_pty"),
+                    description: Some(Cow::Borrowed("在伪终端 (PTY) 中执行 shell 命令。通过代理 Node.js Terminal MCP Server 实现，支持超时控制。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
 
             // write_to_pty 工具
@@ -372,11 +383,12 @@ impl ServerHandler for ZhiServer {
                 "required": ["run_id", "input"]
             });
             if let serde_json::Value::Object(schema_map) = write_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("write_to_pty"),
-                    Cow::Borrowed("向运行中的 PTY 进程写入输入。用于处理交互式命令（如确认提示、密码输入等）。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("write_to_pty"),
+                    description: Some(Cow::Borrowed("向运行中的 PTY 进程写入输入。用于处理交互式命令（如确认提示、密码输入等）。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
 
             // cancel_pty 工具
@@ -391,11 +403,14 @@ impl ServerHandler for ZhiServer {
                 "required": ["run_id"]
             });
             if let serde_json::Value::Object(schema_map) = cancel_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("cancel_pty"),
-                    Cow::Borrowed("终止运行中的 PTY 命令。用于停止长时间运行的进程或卡住的命令。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("cancel_pty"),
+                    description: Some(Cow::Borrowed(
+                        "终止运行中的 PTY 命令。用于停止长时间运行的进程或卡住的命令。",
+                    )),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
 
             // list_active_runs 工具
@@ -405,11 +420,14 @@ impl ServerHandler for ZhiServer {
                 "required": []
             });
             if let serde_json::Value::Object(schema_map) = list_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("list_active_runs"),
-                    Cow::Borrowed("列出所有活跃的 PTY 会话。返回正在运行的命令列表及其状态。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("list_active_runs"),
+                    description: Some(Cow::Borrowed(
+                        "列出所有活跃的 PTY 会话。返回正在运行的命令列表及其状态。",
+                    )),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -434,11 +452,12 @@ impl ServerHandler for ZhiServer {
                 "required": ["url"]
             });
             if let serde_json::Value::Object(schema_map) = fetch_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("web_fetch"),
-                    Cow::Borrowed("抓取网页内容并提取纯文本。支持 HTML 自动转文本、超时控制和内容截断。用于查阅文档、调研信息。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("web_fetch"),
+                    description: Some(Cow::Borrowed("抓取网页内容并提取纯文本。支持 HTML 自动转文本、超时控制和内容截断。用于查阅文档、调研信息。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -467,11 +486,12 @@ impl ServerHandler for ZhiServer {
                 "required": ["action"]
             });
             if let serde_json::Value::Object(schema_map) = cron_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("cron_manage"),
-                    Cow::Borrowed("管理系统定时任务（crontab）。支持列出、添加、移除定时任务。可用于设置闹钟、定时脚本、定期清理等。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("cron_manage"),
+                    description: Some(Cow::Borrowed("管理系统定时任务（crontab）。支持列出、添加、移除定时任务。可用于设置闹钟、定时脚本、定期清理等。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -512,11 +532,12 @@ impl ServerHandler for ZhiServer {
                 "required": ["action", "project_path"]
             });
             if let serde_json::Value::Object(schema_map) = task_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("task"),
-                    Cow::Borrowed("文件持久化任务系统。任务存储在 .cunzhi-memory/tasks.json，跨会话持久。支持 list/add/update/done/remove。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("task"),
+                    description: Some(Cow::Borrowed("文件持久化任务系统。任务存储在 .cunzhi-memory/tasks.json，跨会话持久。支持 list/add/update/done/remove。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -567,11 +588,12 @@ impl ServerHandler for ZhiServer {
                 "required": ["action"]
             });
             if let serde_json::Value::Object(schema_map) = phone_action_schema {
-                tools.push(Tool::new(
-                    Cow::Borrowed("phone_action"),
-                    Cow::Borrowed("iPhone 合法动作路由工具。把 AI 请求路由成 iOS 允许的动作并返回投递/回执状态；不能控制其他 App、不能接管侧边按钮。"),
-                    Arc::new(schema_map),
-                ));
+                tools.push(Tool {
+                    name: Cow::Borrowed("phone_action"),
+                    description: Some(Cow::Borrowed("iPhone 合法动作路由工具。把 AI 请求路由成 iOS 允许的动作并返回投递/回执状态；不能控制其他 App、不能接管侧边按钮。")),
+                    input_schema: Arc::new(schema_map),
+                    annotations: None,
+                });
             }
         }
 
@@ -593,7 +615,10 @@ impl ServerHandler for ZhiServer {
             tools.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
 
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+        })
     }
 
     async fn call_tool(
@@ -961,12 +986,13 @@ mod tests {
         });
         let client = ().serve(client_transport).await.expect("start test client");
         let result = client
-            .call_tool(CallToolRequestParam::new("cron_manage").with_arguments(
-                serde_json::Map::from_iter([(
+            .call_tool(CallToolRequestParam {
+                name: "cron_manage".into(),
+                arguments: Some(serde_json::Map::from_iter([(
                     "action".to_string(),
                     serde_json::Value::String("list".to_string()),
-                )]),
-            ))
+                )])),
+            })
             .await;
 
         assert!(

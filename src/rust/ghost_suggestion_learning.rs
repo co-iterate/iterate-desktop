@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tempfile::NamedTempFile;
 
-const LEARNING_VERSION: u32 = 1;
+const LEARNING_VERSION: u32 = 2;
 const ACCEPT_THRESHOLD: u64 = 2;
 const TYPED_THRESHOLD: u64 = 3;
 const MAX_ENTRIES: usize = 1_000;
 const MAX_KEY_LENGTH: usize = 32;
+const DIRECT_USER_INPUT_PROVENANCE: &str = "direct-user-input-v2";
 const ACCEPTED_DESCRIPTION: &str = "自动学习 / 当前项目高频";
 const TYPED_DESCRIPTION: &str = "自动学习 / 手动输入高频候选";
 
@@ -74,6 +75,8 @@ pub struct GhostSuggestionLearningTerm {
 pub struct RecordGhostSuggestionLearningRequest {
     pub event: String,
     #[serde(default)]
+    pub provenance: String,
+    #[serde(default)]
     pub terms: Vec<GhostSuggestionLearningTerm>,
 }
 
@@ -108,7 +111,12 @@ pub fn load_store() -> Result<GhostSuggestionLearningStore, String> {
         .map_err(|error| format!("读取幽灵补全学习账本失败: {error}"))?;
     let store: GhostSuggestionLearningStore =
         serde_json::from_str(&raw).map_err(|error| format!("解析幽灵补全学习账本失败: {error}"))?;
-    Ok(normalize_store(store))
+    let (store, migrated) = migrate_legacy_untrusted_typed_entries(store);
+    if migrated {
+        ghost_suggestions::remove_ghost_suggestions_by_description(TYPED_DESCRIPTION)?;
+        write_store(&store)?;
+    }
+    Ok(store)
 }
 
 pub fn record_learning(
@@ -122,6 +130,14 @@ pub fn record_learning(
         .lock()
         .map_err(|_| "幽灵补全学习账本写入锁不可用".to_string())?;
     let mut state = load_store()?;
+    if should_ignore_unprovenanced_typed_event(&event, &request.provenance) {
+        return Ok(GhostSuggestionLearningResult {
+            state,
+            promoted_keys: Vec::new(),
+            ghost_suggestions: ghost_suggestions::load_store_value(),
+        });
+    }
+    let allow_typed_promotion = event == "typed";
     let existing_keys = existing_ghost_suggestion_keys();
     let now = Utc::now().to_rfc3339();
     let mut seen = HashSet::new();
@@ -143,13 +159,18 @@ pub fn record_learning(
         );
     }
 
-    let (promoted_keys, ghost_suggestions) = promote_ready_entries(&mut state)?;
+    let (promoted_keys, ghost_suggestions) =
+        promote_ready_entries(&mut state, allow_typed_promotion)?;
     write_store(&state)?;
     Ok(GhostSuggestionLearningResult {
         state,
         promoted_keys,
         ghost_suggestions,
     })
+}
+
+fn should_ignore_unprovenanced_typed_event(event: &str, provenance: &str) -> bool {
+    event == "typed" && provenance.trim() != DIRECT_USER_INPUT_PROVENANCE
 }
 
 pub fn merge_legacy_store(
@@ -187,7 +208,7 @@ pub fn merge_legacy_store(
         }
     }
     state = normalize_store(state);
-    let (promoted_keys, ghost_suggestions) = promote_ready_entries(&mut state)?;
+    let (promoted_keys, ghost_suggestions) = promote_ready_entries(&mut state, false)?;
     write_store(&state)?;
     Ok(GhostSuggestionLearningResult {
         state,
@@ -239,23 +260,15 @@ fn record_event_in_store(
 
 fn promote_ready_entries(
     state: &mut GhostSuggestionLearningStore,
+    allow_typed_promotion: bool,
 ) -> Result<(Vec<String>, Value), String> {
     let mut promoted_keys = Vec::new();
     let ready = state
         .entries
         .values()
-        .filter(|entry| {
-            !entry.promoted
-                && (entry.accepted_count >= ACCEPT_THRESHOLD
-                    || entry.typed_count >= TYPED_THRESHOLD)
-        })
-        .map(|entry| {
-            let description = if entry.accepted_count >= ACCEPT_THRESHOLD {
-                ACCEPTED_DESCRIPTION
-            } else {
-                TYPED_DESCRIPTION
-            };
-            (entry.key.clone(), description.to_string())
+        .filter_map(|entry| {
+            promotion_description(entry, allow_typed_promotion)
+                .map(|description| (entry.key.clone(), description.to_string()))
         })
         .collect::<Vec<_>>();
 
@@ -276,6 +289,22 @@ fn promote_ready_entries(
     }
 
     Ok((promoted_keys, ghost_suggestions))
+}
+
+fn promotion_description(
+    entry: &GhostSuggestionLearningEntry,
+    allow_typed_promotion: bool,
+) -> Option<&'static str> {
+    if entry.promoted {
+        return None;
+    }
+    if entry.accepted_count >= ACCEPT_THRESHOLD {
+        return Some(ACCEPTED_DESCRIPTION);
+    }
+    if allow_typed_promotion && entry.typed_count >= TYPED_THRESHOLD {
+        return Some(TYPED_DESCRIPTION);
+    }
+    None
 }
 
 fn existing_ghost_suggestion_keys() -> HashSet<String> {
@@ -327,6 +356,22 @@ fn normalize_store(store: GhostSuggestionLearningStore) -> GhostSuggestionLearni
         version: LEARNING_VERSION,
         entries: entries.into_iter().collect(),
     }
+}
+
+fn migrate_legacy_untrusted_typed_entries(
+    store: GhostSuggestionLearningStore,
+) -> (GhostSuggestionLearningStore, bool) {
+    let should_migrate = store.version < LEARNING_VERSION;
+    let mut store = normalize_store(store);
+    if !should_migrate {
+        return (store, false);
+    }
+
+    store.entries.retain(|_, entry| entry.accepted_count > 0);
+    for entry in store.entries.values_mut() {
+        entry.promoted = entry.accepted_count >= ACCEPT_THRESHOLD;
+    }
+    (store, true)
 }
 
 fn normalize_learning_key(value: &str) -> Option<String> {
@@ -480,5 +525,90 @@ mod tests {
         assert!(entry.promoted);
         assert_eq!(entry.first_typed_at, "2026-07-13T00:00:00Z");
         assert_eq!(entry.last_typed_at, "2026-07-15T00:00:00Z");
+    }
+
+    #[test]
+    fn version_two_migration_discards_unaccepted_legacy_typed_entries() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "ai-rule-term".to_string(),
+            GhostSuggestionLearningEntry {
+                key: "ai-rule-term".to_string(),
+                description: TYPED_DESCRIPTION.to_string(),
+                accepted_count: 0,
+                typed_count: 3,
+                first_accepted_at: String::new(),
+                last_accepted_at: String::new(),
+                first_typed_at: "2026-08-02T00:00:00Z".to_string(),
+                last_typed_at: "2026-08-03T00:00:00Z".to_string(),
+                promoted: true,
+            },
+        );
+        entries.insert(
+            "user-accepted".to_string(),
+            GhostSuggestionLearningEntry {
+                key: "user-accepted".to_string(),
+                description: ACCEPTED_DESCRIPTION.to_string(),
+                accepted_count: 1,
+                typed_count: 3,
+                first_accepted_at: "2026-08-03T00:00:00Z".to_string(),
+                last_accepted_at: "2026-08-03T00:00:00Z".to_string(),
+                first_typed_at: "2026-08-02T00:00:00Z".to_string(),
+                last_typed_at: "2026-08-03T00:00:00Z".to_string(),
+                promoted: true,
+            },
+        );
+
+        let (migrated, changed) =
+            migrate_legacy_untrusted_typed_entries(GhostSuggestionLearningStore {
+                version: 1,
+                entries,
+            });
+
+        assert!(changed);
+        assert_eq!(migrated.version, LEARNING_VERSION);
+        assert!(!migrated.entries.contains_key("ai-rule-term"));
+        assert!(!migrated.entries["user-accepted"].promoted);
+    }
+
+    #[test]
+    fn typed_threshold_requires_explicit_provenanced_promotion() {
+        let mut store = default_store();
+        record_event_in_store(
+            &mut store,
+            "typed",
+            "activity".to_string(),
+            TYPED_DESCRIPTION.to_string(),
+            "2026-08-30T00:00:00Z",
+        );
+        record_event_in_store(
+            &mut store,
+            "typed",
+            "activity".to_string(),
+            TYPED_DESCRIPTION.to_string(),
+            "2026-08-30T00:01:00Z",
+        );
+        record_event_in_store(
+            &mut store,
+            "typed",
+            "activity".to_string(),
+            TYPED_DESCRIPTION.to_string(),
+            "2026-08-30T00:02:00Z",
+        );
+
+        let entry = store.entries.get("activity").expect("learning entry");
+        assert_eq!(promotion_description(entry, false), None);
+        assert_eq!(promotion_description(entry, true), Some(TYPED_DESCRIPTION));
+    }
+
+    #[test]
+    fn typed_learning_requires_direct_user_input_v2_provenance() {
+        assert!(should_ignore_unprovenanced_typed_event("typed", ""));
+        assert!(should_ignore_unprovenanced_typed_event("typed", "legacy"));
+        assert!(!should_ignore_unprovenanced_typed_event(
+            "typed",
+            "direct-user-input-v2"
+        ));
+        assert!(!should_ignore_unprovenanced_typed_event("accepted", ""));
     }
 }

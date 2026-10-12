@@ -1,3 +1,4 @@
+pub mod atomic_file;
 pub mod logger;
 pub mod timeline_debug;
 pub mod workspace;

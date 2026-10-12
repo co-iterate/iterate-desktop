@@ -56,6 +56,7 @@ export default defineConfig({
     },
   },
   shortcuts: [
+    ['skeleton-fill', 'bg-gray-200 dark:bg-gray-700 animate-pulse'],
   ],
   rules: [
     // 自定义规则

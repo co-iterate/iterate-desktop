@@ -334,9 +334,6 @@ pub struct AppState {
     pub request_ready_channels: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     // 快捷键全局启用状态原子变量，用于高性能检查
     pub global_shortcut_enabled: Arc<AtomicBool>,
-    #[cfg(target_os = "windows")]
-    // 防止 Windows 窗口关闭事件重复进入退出流程
-    pub exit_in_progress: AtomicBool,
     // 防误触退出机制
     pub exit_attempt_count: Mutex<u32>,
     pub last_exit_attempt: Mutex<Option<std::time::Instant>>,
@@ -349,8 +346,6 @@ impl Default for AppState {
             response_channels: Mutex::new(HashMap::new()),
             request_ready_channels: Mutex::new(HashMap::new()),
             global_shortcut_enabled: Arc::new(AtomicBool::new(true)),
-            #[cfg(target_os = "windows")]
-            exit_in_progress: AtomicBool::new(false),
             exit_attempt_count: Mutex::new(0),
             last_exit_attempt: Mutex::new(None),
         }

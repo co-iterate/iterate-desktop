@@ -40,6 +40,24 @@ fn open_log_file(file_path: &str) -> std::io::Result<std::fs::File> {
     OpenOptions::new().create(true).append(true).open(file_path)
 }
 
+/// 调试日志单文件上限；超过后滚动为 `.1`，单个日志最多占用约两倍空间。
+pub const DEBUG_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 追加一行到调试日志，超过上限时先把当前文件滚动为 `<name>.1`（覆盖旧的 `.1`）。
+pub fn append_capped_log_line(path: &std::path::Path, line: &[u8], max_bytes: u64) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::metadata(path).map(|meta| meta.len() >= max_bytes).unwrap_or(false) {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, rotated);
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line)?;
+    file.flush()
+}
+
 fn default_gui_log_file_path() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -256,6 +274,30 @@ mod tests {
         assert_eq!(config.level, LevelFilter::Warn);
         assert_eq!(config.file_path, None);
         assert_eq!(config.is_mcp_mode, false);
+    }
+
+    #[test]
+    fn test_append_capped_log_line_rotates_at_limit() {
+        let dir = std::env::temp_dir().join(format!("iterate-capped-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("debug.log");
+        let rotated = dir.join("debug.log.1");
+
+        append_capped_log_line(&path, b"0123456789", 16).unwrap();
+        append_capped_log_line(&path, b"abcdefghij", 16).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789abcdefghij");
+        assert!(!rotated.exists());
+
+        append_capped_log_line(&path, b"new", 16).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"0123456789abcdefghij");
+
+        std::fs::write(&path, vec![b'x'; 16]).unwrap();
+        append_capped_log_line(&path, b"latest", 16).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"latest");
+        assert_eq!(std::fs::read(&rotated).unwrap(), vec![b'x'; 16]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

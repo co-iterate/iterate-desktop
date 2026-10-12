@@ -2,12 +2,13 @@
 import type { McpLaunchContext } from './composables/useMcpHandler'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import AppContent from './components/AppContent.vue'
 import TrialExpiredOverlay from './components/common/TrialExpiredOverlay.vue'
 import InfinitySpeechAnchor from './components/speech/InfinitySpeechAnchor.vue'
 import { useAppManager } from './composables/useAppManager'
 import { useEventHandlers } from './composables/useEventHandlers'
+import { refreshGlobalMute } from './composables/useGlobalMute'
 import { useGlobalSpeechRuntimeHost } from './composables/useGlobalSpeechRuntimeHost'
 import { resolveMcpLaunchContext } from './composables/useMcpHandler'
 
@@ -37,14 +38,6 @@ const mcpLaunchContext = ref<McpLaunchContext | null>(null)
 const trialCheckMessage = ref('正在检查授权状态...')
 const TRIAL_STATUS_TIMEOUT_MS = 5000
 const speechOverlayMode = new URLSearchParams(window.location.search).get('view') === 'speech-overlay'
-const windowsPlatform = navigator.platform.toUpperCase().includes('WIN')
-interface StartupStatus {
-  phase: 'starting' | 'ready' | 'degraded'
-  message: string
-}
-const startupStatus = ref<StartupStatus>({ phase: 'starting', message: '正在启动后台服务' })
-const retryingBackgroundServices = ref(false)
-let unlistenStartupStatus: (() => void) | null = null
 const trialExpired = computed(() => Boolean(trialStatus.value?.is_expired))
 const mcpShellMode = computed(() => Boolean(mcpLaunchContext.value?.isMcp))
 const appReadyToRender = computed(() => {
@@ -59,6 +52,17 @@ const shouldShowActivation = computed(() => {
 
   return trialExpired.value || !isLicensed.value
 })
+
+// A process or loaded HTML alone cannot prove the Vue application rendered.
+watch(() => !speechOverlayMode && (shouldShowActivation.value || (appReadyToRender.value && appStarted.value)), async (ready) => {
+  if (!ready)
+    return
+  await nextTick()
+  if (!document.querySelector('#app')?.childElementCount)
+    return
+  await invoke('mark_desktop_ui_ready', { surface: shouldShowActivation.value ? 'activation' : 'application' })
+    .catch(error => console.warn('Desktop readiness receipt failed:', error))
+}, { flush: 'post' })
 
 // 浏览器监控弹窗监听器
 let unlistenBrowserPopup: (() => void) | null = null
@@ -81,19 +85,19 @@ async function initializeApplication(options: InitializeApplicationOptions = {})
   unlistenBrowserPopup = await listen<{ site_name: string, url: string, title: string }>('show-browser-popup', async (event) => {
     const { site_name, url, title } = event.payload
     // 静音模式下跳过声音和通知
-    if (isMuted.value) {
+    if (await refreshGlobalMute().catch(() => true)) {
       console.log('🔕 静音模式：跳过浏览器弹窗通知')
       return
     }
     // 播放提示音
     try {
-      await invoke('test_audio_sound')
+      await invoke('play_notification_sound')
     }
     catch (e) {
       console.log('播放提示音失败:', e)
     }
     // 显示系统通知
-    if (Notification.permission === 'granted') {
+    if (!await refreshGlobalMute().catch(() => true) && Notification.permission === 'granted') {
       const notification = new Notification(`${site_name} AI 完成`, {
         body: title || '点击跳转到聊天页面',
         icon: '/icon.png',
@@ -103,21 +107,6 @@ async function initializeApplication(options: InitializeApplicationOptions = {})
       }
     }
   })
-}
-
-async function retryBackgroundServices() {
-  if (retryingBackgroundServices.value)
-    return
-  retryingBackgroundServices.value = true
-  try {
-    startupStatus.value = await invoke<StartupStatus>('retry_background_services')
-  }
-  catch (error) {
-    startupStatus.value = { phase: 'degraded', message: `重试失败：${String(error)}` }
-  }
-  finally {
-    retryingBackgroundServices.value = false
-  }
 }
 
 async function reportTrialDebug(message: string) {
@@ -177,18 +166,6 @@ function getTrialStatusWithTimeout() {
 onMounted(async () => {
   if (speechOverlayMode)
     return
-
-  if (windowsPlatform) {
-    unlistenStartupStatus = await listen<StartupStatus>('startup-status-changed', (event) => {
-      startupStatus.value = event.payload
-    })
-    try {
-      startupStatus.value = await invoke<StartupStatus>('get_startup_status')
-    }
-    catch (error) {
-      console.warn('读取后台启动状态失败:', error)
-    }
-  }
 
   await reportTrialDebug('onMounted:start')
   try {
@@ -266,8 +243,6 @@ onMounted(async () => {
 
 // 清理
 onUnmounted(() => {
-  unlistenStartupStatus?.()
-  unlistenStartupStatus = null
   speechRuntimeHost.dispose()
   if (!speechOverlayMode)
     actions.app.cleanup()
@@ -281,28 +256,6 @@ onUnmounted(() => {
   <InfinitySpeechAnchor v-if="speechOverlayMode" />
 
   <div v-else class="min-h-screen bg-surface transition-colors duration-200">
-    <div
-      v-if="windowsPlatform && startupStatus.phase !== 'ready'"
-      class="fixed left-1/2 top-3 z-[1000] flex max-w-[calc(100%-24px)] -translate-x-1/2 items-center gap-3 rounded-lg border px-3 py-2 text-sm shadow-lg"
-      :class="startupStatus.phase === 'degraded'
-        ? 'border-amber-400/40 bg-amber-950/95 text-amber-100'
-        : 'border-blue-400/30 bg-slate-950/95 text-slate-100'"
-    >
-      <div
-        class="h-2.5 w-2.5 flex-none rounded-full"
-        :class="startupStatus.phase === 'starting' ? 'animate-pulse bg-blue-400' : 'bg-amber-400'"
-      />
-      <span class="min-w-0 truncate">{{ startupStatus.message }}</span>
-      <button
-        v-if="startupStatus.phase === 'degraded'"
-        type="button"
-        class="flex-none rounded-md bg-white/10 px-2 py-1 text-xs hover:bg-white/20 disabled:opacity-50"
-        :disabled="retryingBackgroundServices"
-        @click="retryBackgroundServices"
-      >
-        {{ retryingBackgroundServices ? '重试中…' : '重试' }}
-      </button>
-    </div>
     <!-- 试用期到期遮罩 -->
     <TrialExpiredOverlay
       v-if="shouldShowActivation"

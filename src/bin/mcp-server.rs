@@ -26,11 +26,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-/// MCP server 进程启动后是否已拉取过 .cunzhi-knowledge（0=未拉，1=已拉，u64::MAX=进行中）
-static LAST_KNOWLEDGE_PULL: AtomicU64 = AtomicU64::new(0);
 
 const HTML_ARTIFACT_CAPABILITY: &str = "html_artifact";
 
@@ -42,13 +38,12 @@ fn instance_debug_log(tag: &str, message: impl AsRef<str>) {
         tag,
         message.as_ref()
     );
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/iterate-instance-debug.log")
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
+    // 多个进程共用这份日志，原来无上限（P-2026-9337）。
+    let _ = cunzhi::utils::logger::append_capped_log_line(
+        std::path::Path::new("/tmp/iterate-instance-debug.log"),
+        line.as_bytes(),
+        cunzhi::utils::logger::DEBUG_LOG_MAX_BYTES,
+    );
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {
@@ -425,7 +420,7 @@ struct SyncArgs {
     /// 项目路径（可选，用于定位 .cunzhi-knowledge）
     #[serde(default)]
     project_path: Option<String>,
-    /// 操作方向：pull / push / both（默认 both）
+    /// 操作方向：pull / push / both（默认 pull）
     #[serde(default)]
     direction: Option<String>,
 }
@@ -912,7 +907,7 @@ async fn start_iterate_service_with_workspace(port: u16, workspace: &str) -> boo
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(serve_log_stdio(port))
             .spawn();
 
         match result {
@@ -1071,6 +1066,27 @@ async fn start_iterate_service_with_workspace(port: u16, workspace: &str) -> boo
     false
 }
 
+const SERVE_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// `--serve` 及其 GUI 子进程的 stderr 写到 `~/Library/Logs/iterate/serve-<port>.log`。
+/// 原始 fd 写入绕不开大小上限，所以在每次启动 serve 前检查并滚动成 `.1`（P-2026-9339）。
+fn serve_log_stdio(port: u16) -> std::process::Stdio {
+    let Some(dir) = dirs::home_dir().map(|home| home.join("Library/Logs/iterate")) else {
+        return std::process::Stdio::null();
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return std::process::Stdio::null();
+    }
+    let path = dir.join(format!("serve-{port}.log"));
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= SERVE_LOG_MAX_BYTES) {
+        let _ = std::fs::rename(&path, dir.join(format!("serve-{port}.log.1")));
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => std::process::Stdio::from(file),
+        Err(_) => std::process::Stdio::null(),
+    }
+}
+
 fn iterate_launch_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -1079,6 +1095,9 @@ fn iterate_launch_candidates() -> Vec<PathBuf> {
     }
 
     if let Ok(current_exe) = std::env::current_exe() {
+        // 客户端配置指向的是稳定入口（符号链接）；macOS 的 current_exe 返回链接自身路径，
+        // 需先解析到 App 包内的真实位置，才能找到同目录的 iterate。
+        let current_exe = current_exe.canonicalize().unwrap_or(current_exe);
         if let Some(exe_dir) = current_exe.parent() {
             push_executable_candidate(&mut candidates, exe_dir.join("iterate"));
         }
@@ -1462,29 +1481,6 @@ async fn find_available_port(preferred_port: u16) -> u16 {
     preferred_port
 }
 
-/// 查找 .cunzhi-knowledge 目录
-fn find_knowledge_dir(workspace: &str) -> Option<PathBuf> {
-    // 优先级：workspace/.cunzhi-knowledge → cwd/.cunzhi-knowledge → home/.cunzhi-knowledge
-    let candidates = [
-        if workspace.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(workspace).join(".cunzhi-knowledge"))
-        },
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.join(".cunzhi-knowledge")),
-        dirs::home_dir().map(|p| p.join(".cunzhi-knowledge")),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// 截断用户输入中的 Auto Prompt 注入内容
 /// 策略：1) 精确 sentinel 优先 2) 行首 marker 匹配 3) 取最早位置
 fn strip_auto_prompt(input: &str) -> Cow<'_, str> {
@@ -1602,42 +1598,6 @@ async fn call_zhi(
     caller_codex_thread_id: Option<String>,
     argument_codex_thread_id: Option<String>,
 ) -> Result<CallToolResult, ErrorData> {
-    // 进程启动后第一次 call_zhi 时拉取 .cunzhi-knowledge（cold start，只拉一次）
-    // 0=未拉，u64::MAX=进行中，1=已拉
-    if LAST_KNOWLEDGE_PULL
-        .compare_exchange(0, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        let workspace = args.project_path.as_str();
-        let knowledge_dir = find_knowledge_dir(workspace);
-        if let Some(kdir) = knowledge_dir {
-            let result = Command::new("git")
-                .args(["pull", "--rebase", "--autostash", "--quiet"])
-                .current_dir(&kdir)
-                .output();
-            // 写入同步日志（成功/失败都记录，方便排查）
-            let log_msg = match &result {
-                Ok(o) if o.status.success() => {
-                    format!("[knowledge-sync] OK: pulled {}\n", kdir.display())
-                }
-                Ok(o) => format!(
-                    "[knowledge-sync] FAIL: git pull exited {}: {}\n",
-                    o.status,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => format!("[knowledge-sync] ERROR: {}\n", e),
-            };
-            if let Ok(mut f) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/cunzhi_knowledge_sync.log")
-            {
-                let _ = f.write_all(log_msg.as_bytes());
-            }
-        }
-        LAST_KNOWLEDGE_PULL.store(1, Ordering::SeqCst);
-    }
-
     let explicit_codex_thread_id = args
         .codex_thread_id
         .as_deref()
@@ -2099,12 +2059,15 @@ async fn web_fetch(args: WebFetchArgs) -> Result<CallToolResult, ErrorData> {
         .to_string();
 
     if !status.is_success() {
-        return Ok(CallToolResult::error(vec![Content::text(format!(
-            "HTTP 请求失败: {} {}\nURL: {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("Unknown"),
-            args.url
-        ))]));
+        return Ok(CallToolResult {
+            content: vec![Content::text(format!(
+                "HTTP 请求失败: {} {}\nURL: {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown"),
+                args.url
+            ))],
+            is_error: Some(true),
+        });
     }
 
     let body = response
@@ -2139,9 +2102,10 @@ async fn web_fetch(args: WebFetchArgs) -> Result<CallToolResult, ErrorData> {
         "content": truncated
     });
 
-    Ok(CallToolResult::success(vec![Content::text(
-        result_json.to_string(),
-    )]))
+    Ok(CallToolResult {
+        content: vec![Content::text(result_json.to_string())],
+        is_error: None,
+    })
 }
 
 /// 简单的 HTML 标签剥离
@@ -2218,10 +2182,13 @@ fn cron_manage(args: CronManageArgs) -> Result<CallToolResult, ErrorData> {
         "list" => cron_list_jobs(),
         "add" => cron_add_job(args),
         "remove" => cron_remove_job(args),
-        _ => Ok(CallToolResult::error(vec![Content::text(format!(
-            "未知操作: {}。支持的操作: list, add, remove",
-            args.action
-        ))])),
+        _ => Ok(CallToolResult {
+            content: vec![Content::text(format!(
+                "未知操作: {}。支持的操作: list, add, remove",
+                args.action
+            ))],
+            is_error: Some(true),
+        }),
     }
 }
 
@@ -2235,9 +2202,12 @@ fn cron_list_jobs() -> Result<CallToolResult, ErrorData> {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if !output.status.success() && stderr.contains("no crontab") {
-        return Ok(CallToolResult::success(vec![Content::text(
-            serde_json::json!({ "jobs": [], "message": "当前没有定时任务" }).to_string(),
-        )]));
+        return Ok(CallToolResult {
+            content: vec![Content::text(
+                serde_json::json!({ "jobs": [], "message": "当前没有定时任务" }).to_string(),
+            )],
+            is_error: None,
+        });
     }
 
     let jobs: Vec<serde_json::Value> = stdout
@@ -2258,9 +2228,12 @@ fn cron_list_jobs() -> Result<CallToolResult, ErrorData> {
         })
         .collect();
 
-    Ok(CallToolResult::success(vec![Content::text(
-        serde_json::json!({ "jobs": jobs, "count": jobs.len() }).to_string(),
-    )]))
+    Ok(CallToolResult {
+        content: vec![Content::text(
+            serde_json::json!({ "jobs": jobs, "count": jobs.len() }).to_string(),
+        )],
+        is_error: None,
+    })
 }
 
 fn cron_add_job(args: CronManageArgs) -> Result<CallToolResult, ErrorData> {
@@ -2307,14 +2280,17 @@ fn cron_add_job(args: CronManageArgs) -> Result<CallToolResult, ErrorData> {
         .wait()
         .map_err(|e| ErrorData::internal_error(format!("等待 crontab 失败: {}", e), None))?;
 
-    Ok(CallToolResult::success(vec![Content::text(
-        serde_json::json!({
-            "success": true,
-            "entry": new_entry,
-            "message": format!("已添加定时任务: {}", label)
-        })
-        .to_string(),
-    )]))
+    Ok(CallToolResult {
+        content: vec![Content::text(
+            serde_json::json!({
+                "success": true,
+                "entry": new_entry,
+                "message": format!("已添加定时任务: {}", label)
+            })
+            .to_string(),
+        )],
+        is_error: None,
+    })
 }
 
 fn cron_remove_job(args: CronManageArgs) -> Result<CallToolResult, ErrorData> {
@@ -2339,13 +2315,16 @@ fn cron_remove_job(args: CronManageArgs) -> Result<CallToolResult, ErrorData> {
     let removed = count_before - entries_after.len();
 
     if removed == 0 {
-        return Ok(CallToolResult::error(vec![Content::text(
-            serde_json::json!({
-                "success": false,
-                "message": format!("未找到标签为 '{}' 的定时任务", label)
-            })
-            .to_string(),
-        )]));
+        return Ok(CallToolResult {
+            content: vec![Content::text(
+                serde_json::json!({
+                    "success": false,
+                    "message": format!("未找到标签为 '{}' 的定时任务", label)
+                })
+                .to_string(),
+            )],
+            is_error: Some(true),
+        });
     }
 
     let joined = if entries_after.is_empty() {
@@ -2371,22 +2350,65 @@ fn cron_remove_job(args: CronManageArgs) -> Result<CallToolResult, ErrorData> {
         .wait()
         .map_err(|e| ErrorData::internal_error(format!("等待 crontab 失败: {}", e), None))?;
 
-    Ok(CallToolResult::success(vec![Content::text(
-        serde_json::json!({
-            "success": true,
-            "removed": removed,
-            "message": format!("已移除 {} 条标签为 '{}' 的定时任务", removed, label)
-        })
-        .to_string(),
-    )]))
+    Ok(CallToolResult {
+        content: vec![Content::text(
+            serde_json::json!({
+                "success": true,
+                "removed": removed,
+                "message": format!("已移除 {} 条标签为 '{}' 的定时任务", removed, label)
+            })
+            .to_string(),
+        )],
+        is_error: None,
+    })
 }
 
-/// sync 工具：同步 .cunzhi-knowledge 知识库
-/// 按 sync-knowledge/SKILL.md 规则：
-/// 1. 检查本地变更（git status）
-/// 2. 有变更则先 commit
-/// 3. fetch + pull --no-rebase
-/// 4. push（如有本地提交）
+/// 积压超过这个数时不自动推送，需要用户确认后手动推送。
+const KNOWLEDGE_SYNC_MAX_AUTO_PUSH: u64 = 50;
+
+struct KnowledgeSyncPlan {
+    fast_forward: bool,
+    push: bool,
+    notes: Vec<String>,
+}
+
+/// 只根据 ahead/behind 决定做什么；不提交、不 rebase、不强推。
+fn plan_knowledge_sync(direction: &str, ahead: u64, behind: u64) -> KnowledgeSyncPlan {
+    let wants_pull = direction == "pull" || direction == "both";
+    let wants_push = direction == "push" || direction == "both";
+    let mut plan = KnowledgeSyncPlan { fast_forward: false, push: false, notes: Vec::new() };
+
+    if ahead > 0 && behind > 0 {
+        plan.notes.push("⚠️ 本地与远端已分叉：不拉取、不推送，需要单独对账".to_string());
+        return plan;
+    }
+    if behind > 0 {
+        if wants_pull {
+            plan.fast_forward = true;
+        } else {
+            plan.notes.push("ℹ️ 远端有更新，本次未拉取".to_string());
+        }
+    }
+    if ahead > 0 && wants_push {
+        if ahead > KNOWLEDGE_SYNC_MAX_AUTO_PUSH {
+            plan.notes.push(format!(
+                "⚠️ 积压 {ahead} 个本地提交，超过 {KNOWLEDGE_SYNC_MAX_AUTO_PUSH}，不自动推送；请确认后手动 git push"
+            ));
+        } else {
+            plan.push = true;
+        }
+    }
+    if ahead == 0 && behind == 0 {
+        plan.notes.push("✅ 已与远端一致".to_string());
+    }
+    plan
+}
+
+/// sync 工具：同步 .cunzhi-knowledge 知识库，规则与 sync-knowledge/SKILL.md 一致（P-2026-9315 / P-2026-2143）：
+/// 1. 不自动提交：工作区常混着其它会话未完成的改动，只报告数量，提交交给各自写入方；
+/// 2. 仓库处于 rebase/merge 等进行中时直接停下；
+/// 3. fetch 后按 ahead/behind 决定：拉取只做 fast-forward，分叉时只报告；
+/// 4. 推送只在 behind=0 时进行，积压过多需用户确认后手动推送。
 fn sync_knowledge(args: SyncArgs) -> Result<CallToolResult, ErrorData> {
     let knowledge_dir = match find_knowledge_dir_for(args.project_path.as_deref()) {
         Some(d) => d,
@@ -2399,87 +2421,63 @@ fn sync_knowledge(args: SyncArgs) -> Result<CallToolResult, ErrorData> {
 
     let direction = args.direction.as_deref().unwrap_or("pull");
     let mut results = Vec::new();
-
-    // 步骤 1：检查本地变更
-    let status_out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&knowledge_dir)
-        .output()
-        .map_err(|e| ErrorData::internal_error(format!("git status 失败: {}", e), None))?;
-
-    let has_local_changes = !String::from_utf8_lossy(&status_out.stdout)
-        .trim()
-        .is_empty();
-
-    // 步骤 2：有本地变更则先 commit（仅在 push 或 both 时，pull 时不偶尔 commit）
-    if has_local_changes && (direction == "push" || direction == "both") {
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&knowledge_dir)
-            .output();
-
-        let now = Local::now();
-        let commit_msg = format!("sync: {}", now.format("%Y-%m-%d %H:%M"));
-        let commit_out = Command::new("git")
-            .args(["commit", "-m", &commit_msg, "--quiet", "--no-verify"])
-            .current_dir(&knowledge_dir)
-            .output();
-
-        if commit_out.map(|o| o.status.success()).unwrap_or(false) {
-            results.push("✅ 本地变更已提交".to_string());
-        }
-    } else if !has_local_changes {
-        results.push("✅ 本地无变更".to_string());
-    }
-
-    // 步骤 3：fetch + pull --no-rebase
-    if direction == "pull" || direction == "both" {
-        let fetch_out = Command::new("git")
-            .args(["fetch", "--quiet"])
-            .current_dir(&knowledge_dir)
-            .output();
-
-        if fetch_out.map(|o| o.status.success()).unwrap_or(false) {
-            results.push("✅ Fetched from origin".to_string());
-        }
-
-        let pull_out = Command::new("git")
-            .args(["pull", "--no-rebase", "--quiet"])
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
             .current_dir(&knowledge_dir)
             .output()
-            .map_err(|e| ErrorData::internal_error(format!("git pull 失败: {}", e), None))?;
+    };
 
-        if pull_out.status.success() {
-            let stdout = String::from_utf8_lossy(&pull_out.stdout);
-            if stdout.contains("Already up to date") || stdout.trim().is_empty() {
-                results.push("✅ Already up to date".to_string());
-            } else {
-                results.push("✅ 已拉取最新更新".to_string());
-            }
-        } else {
-            let stderr = String::from_utf8_lossy(&pull_out.stderr);
-            // 检查是否有 merge 冲突
-            if stderr.contains("CONFLICT") || stderr.contains("conflict") {
-                results.push(format!("⚠️ Merge 冲突，需要手动解决: {}", stderr.trim()));
-            } else {
-                results.push(format!("⚠️ git pull 失败: {}", stderr.trim()));
-            }
+    if cunzhi::mcp::tools::interaction::logger::git_operation_in_progress(&knowledge_dir) {
+        results.push("⛔ 仓库正处于 rebase / merge / cherry-pick 中，已停止同步，请先处理完".to_string());
+    } else {
+        let pending = git(&["status", "--porcelain"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0);
+        if pending > 0 {
+            results.push(format!(
+                "ℹ️ 有 {pending} 个未提交改动，sync 不会自动提交（避免混入其它会话的改动），请按条目单独提交"
+            ));
         }
-    }
 
-    // 步骤 4：push（如有本地提交）
-    if direction == "push" || direction == "both" {
-        let push_out = Command::new("git")
-            .args(["push", "--quiet"])
-            .current_dir(&knowledge_dir)
-            .output()
-            .map_err(|e| ErrorData::internal_error(format!("git push 失败: {}", e), None))?;
+        let fetched = git(&["fetch", "--quiet"]).map(|o| o.status.success()).unwrap_or(false);
+        let counts = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                let mut parts = text.split_whitespace().map(|n| n.parse::<u64>().ok());
+                Some((parts.next()??, parts.next()??))
+            });
 
-        if push_out.status.success() {
-            results.push("🚀 已推送到 GitHub".to_string());
-        } else {
-            let stderr = String::from_utf8_lossy(&push_out.stderr);
-            results.push(format!("⚠️ git push 失败: {}", stderr.trim()));
+        match (fetched, counts) {
+            (false, _) => results.push("⚠️ git fetch 失败，未做任何拉取或推送".to_string()),
+            (true, None) => results.push("⚠️ 当前分支没有 upstream，未做任何拉取或推送".to_string()),
+            (true, Some((ahead, behind))) => {
+                let plan = plan_knowledge_sync(direction, ahead, behind);
+                results.push(format!("📊 本地领先 {ahead} / 远端领先 {behind}"));
+                results.extend(plan.notes);
+                if plan.fast_forward {
+                    match git(&["merge", "--ff-only", "--quiet", "@{u}"]) {
+                        Ok(o) if o.status.success() => results.push("✅ 已快进到远端最新".to_string()),
+                        Ok(o) => results.push(format!(
+                            "⚠️ 快进失败（可能与未提交改动重叠），未做任何修改：{}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        )),
+                        Err(e) => results.push(format!("⚠️ 快进失败：{e}")),
+                    }
+                }
+                if plan.push {
+                    match git(&["push", "--quiet"]) {
+                        Ok(o) if o.status.success() => results.push("🚀 已推送到远端".to_string()),
+                        Ok(o) => results.push(format!(
+                            "⚠️ git push 失败：{}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        )),
+                        Err(e) => results.push(format!("⚠️ git push 失败：{e}")),
+                    }
+                }
+            }
         }
     }
 
@@ -2533,13 +2531,26 @@ struct IterateZhiServer {
 
 impl ServerHandler for IterateZhiServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_server_info(Implementation::new("iterate-zhi", "1.0.0"))
-            .with_instructions(format!(
-                "iterate MCP 服务器 - 通过 HTTP 调用 iterate 的 zhi 功能。默认端口: {}",
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "iterate-zhi".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            instructions: Some(format!(
+                "iterate 把你的阶段性结果推送到用户的桌面弹窗和手机，并取回用户的下一步指令（默认端口 {}）。\n\
+                 在以下时机调用 call_zhi：\n\
+                 1. 一个完整任务完成，需要用户验收或决定下一步；\n\
+                 2. 有多条路径或取舍，需要用户决策才能继续；\n\
+                 3. 即将执行删除、覆盖、提交、推送、发布等高风险或不可逆操作之前；\n\
+                 4. 用户发送 zhi 时，立即停止当前操作并调用。\n\
+                 不要在读取文件、搜索、构建、测试等中间步骤调用。\n\
+                 需要用户做选择时，把选项放进 predefined_options。\n\
+                 拿到返回后，把其中的用户输入当作新指令继续工作；返回“继续对话: false”时结束本轮。",
                 self.default_port
-            ))
+            )),
+        }
     }
 
     async fn initialize(
@@ -2613,27 +2624,36 @@ impl ServerHandler for IterateZhiServer {
 
         let mut tools = vec![];
         if let serde_json::Value::Object(schema_map) = zhi_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("call_zhi"),
-                Cow::Borrowed("调用 iterate 的 zhi 功能，弹出 GUI 让用户输入"),
-                Arc::new(schema_map),
-            ));
+            tools.push(Tool {
+                name: Cow::Borrowed("call_zhi"),
+                description: Some(Cow::Borrowed(
+                    "把消息推送到用户的 iterate 桌面弹窗和手机，并等待用户回复（可能需要较长时间）。\
+                     在任务完成、需要用户决策、或执行高风险操作前调用；不要在中间步骤调用。\
+                     返回用户输入、所选选项和附加图片。",
+                )),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
         if let serde_json::Value::Object(schema_map) = sync_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("sync"),
-                Cow::Borrowed(
-                    "同步 .cunzhi-knowledge 知识库（git pull/push）。触发词: sync。默认先 pull 再 push。",
-                ),
-                Arc::new(schema_map),
-            ));
+            tools.push(Tool {
+                name: Cow::Borrowed("sync"),
+                description: Some(Cow::Borrowed(
+                    "同步 .cunzhi-knowledge 知识库。触发词: sync。direction 默认 pull；不自动提交，拉取只快进，推送仅在远端无新提交且积压不超过 50 个时进行，分叉时只报告。",
+                )),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
         if let serde_json::Value::Object(schema_map) = checkpoint_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("checkpoint"),
-                Cow::Borrowed("在项目中创建 Git 型检查点。在重要操作前调用，确保代码可回滚。"),
-                Arc::new(schema_map),
-            ));
+            tools.push(Tool {
+                name: Cow::Borrowed("checkpoint"),
+                description: Some(Cow::Borrowed(
+                    "在项目中创建 Git 型检查点。在重要操作前调用，确保代码可回滚。",
+                )),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
 
         // web_fetch 工具
@@ -2656,13 +2676,14 @@ impl ServerHandler for IterateZhiServer {
             "required": ["url"]
         });
         if let serde_json::Value::Object(schema_map) = web_fetch_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("web_fetch"),
-                Cow::Borrowed(
+            tools.push(Tool {
+                name: Cow::Borrowed("web_fetch"),
+                description: Some(Cow::Borrowed(
                     "抓取网页内容。支持 HTML→纯文本提取、超时控制和内容截断。用于获取网页信息。",
-                ),
-                Arc::new(schema_map),
-            ));
+                )),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
 
         // cron_manage 工具
@@ -2690,13 +2711,14 @@ impl ServerHandler for IterateZhiServer {
             "required": ["action"]
         });
         if let serde_json::Value::Object(schema_map) = cron_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("cron_manage"),
-                Cow::Borrowed(
+            tools.push(Tool {
+                name: Cow::Borrowed("cron_manage"),
+                description: Some(Cow::Borrowed(
                     "管理系统定时任务（crontab）。支持列出、添加、移除定时任务。可用于设置闹钟、定时脚本、定期清理等。",
-                ),
-                Arc::new(schema_map),
-            ));
+                )),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
 
         // task 工具 - 文件持久化任务系统
@@ -2735,16 +2757,20 @@ impl ServerHandler for IterateZhiServer {
             "required": ["action", "project_path"]
         });
         if let serde_json::Value::Object(schema_map) = task_schema {
-            tools.push(Tool::new(
-                Cow::Borrowed("task"),
-                Cow::Borrowed(
+            tools.push(Tool {
+                name: Cow::Borrowed("task"),
+                description: Some(Cow::Borrowed(
                     "文件持久化任务系统。任务存储在 .cunzhi-memory/tasks.json，跨会话持久。支持 list/add/update/done/remove。",
-                ),
-                Arc::new(schema_map),
-            ));
+                )),
+                input_schema: Arc::new(schema_map),
+                annotations: None,
+            });
         }
 
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+        })
     }
 
     async fn call_tool(
@@ -2887,6 +2913,29 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knowledge_sync_never_pulls_or_pushes_when_diverged() {
+        let plan = plan_knowledge_sync("both", 3, 2);
+        assert!(!plan.fast_forward && !plan.push);
+        assert!(plan.notes.iter().any(|n| n.contains("分叉")));
+    }
+
+    #[test]
+    fn knowledge_sync_fast_forwards_only_when_behind() {
+        assert!(plan_knowledge_sync("pull", 0, 4).fast_forward);
+        assert!(!plan_knowledge_sync("push", 0, 4).fast_forward);
+        assert!(!plan_knowledge_sync("pull", 0, 0).fast_forward);
+    }
+
+    #[test]
+    fn knowledge_sync_pushes_only_ahead_and_within_limit() {
+        assert!(plan_knowledge_sync("push", 5, 0).push);
+        assert!(!plan_knowledge_sync("pull", 5, 0).push);
+        let big = plan_knowledge_sync("both", KNOWLEDGE_SYNC_MAX_AUTO_PUSH + 1, 0);
+        assert!(!big.push);
+        assert!(big.notes.iter().any(|n| n.contains("不自动推送")));
+    }
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::path::Path;
@@ -2913,7 +2962,7 @@ mod tests {
             response_source: "web_bridge_goal_submit".to_string(),
             selected_options: vec![],
             file_paths: vec![],
-            image_paths: vec!["/Users/test/.cunzhi/images/image_123_0.jpg".to_string()],
+            image_paths: vec!["/Users/example/.cunzhi/images/image_123_0.jpg".to_string()],
             metadata: ResponseMetadata::default(),
             error: None,
         };
@@ -2925,10 +2974,10 @@ mod tests {
         assert!(!response.user_input.contains("见 images 附件"));
         assert!(response
             .user_input
-            .contains("附加图片路径：\n- /Users/test/.cunzhi/images/image_123_0.jpg"));
+            .contains("附加图片路径：\n- /Users/example/.cunzhi/images/image_123_0.jpg"));
         assert!(response
             .user_input
-            .contains("附加图片路径：\n- /Users/test/.cunzhi/images/image_123_0.jpg》"));
+            .contains("附加图片路径：\n- /Users/example/.cunzhi/images/image_123_0.jpg》"));
         assert!(response.user_input.contains("》\n\n执行规则"));
     }
 
@@ -2980,7 +3029,7 @@ mod tests {
             response_source: "web_bridge_goal_submit".to_string(),
             selected_options: vec![],
             file_paths: vec!["/tmp/spec.md".to_string()],
-            image_paths: vec!["/Users/test/.cunzhi/images/image_123_0.jpg".to_string()],
+            image_paths: vec!["/Users/example/.cunzhi/images/image_123_0.jpg".to_string()],
             metadata: ResponseMetadata::default(),
             error: None,
         };
@@ -2992,7 +3041,7 @@ mod tests {
         assert!(!response.user_input.contains("见 images 附件"));
         assert!(response
             .user_input
-            .contains("附加图片路径：\n- /Users/test/.cunzhi/images/image_123_0.jpg》"));
+            .contains("附加图片路径：\n- /Users/example/.cunzhi/images/image_123_0.jpg》"));
     }
 
     #[test]
@@ -3027,7 +3076,7 @@ mod tests {
             response_source: "popup_submit".to_string(),
             selected_options: vec![],
             file_paths: vec![],
-            image_paths: vec!["/Users/test/.cunzhi/images/image_123_0.jpg".to_string()],
+            image_paths: vec!["/Users/example/.cunzhi/images/image_123_0.jpg".to_string()],
             metadata: ResponseMetadata::default(),
             error: None,
         };
@@ -3147,7 +3196,7 @@ mod tests {
             is_busy: true,
             busy_since: Some(timestamp.to_string()),
             active_request_id: active_request_id.map(ToOwned::to_owned),
-            active_workspace: Some("/Users/test/project".to_string()),
+            active_workspace: Some("/Users/example/cunzhi".to_string()),
             interaction_phase: interaction_phase.map(ToOwned::to_owned),
             phase_since: Some(timestamp.to_string()),
             active_serve_request_id: Some("serve-123".to_string()),
@@ -3294,14 +3343,14 @@ mod tests {
 
         let diagnostics = runtime_diagnostics_from_status(
             5312,
-            "/Users/test/project",
-            Some("/Users/test/other"),
+            "/Users/example/cunzhi",
+            Some("/Users/example/other"),
             Some(&status),
         );
 
         assert!(diagnostics.contains("port=5312"));
-        assert!(diagnostics.contains("request_workspace=/Users/test/project"));
-        assert!(diagnostics.contains("registered_workspace=/Users/test/other"));
+        assert!(diagnostics.contains("request_workspace=/Users/example/cunzhi"));
+        assert!(diagnostics.contains("registered_workspace=/Users/example/other"));
         assert!(diagnostics.contains("version=0.5.8"));
         assert!(diagnostics.contains("pid=1234"));
         assert!(diagnostics.contains("/Applications/iterate.app/Contents/MacOS/iterate"));
@@ -3361,6 +3410,44 @@ mod tests {
                 "call_zhi must not restore project/thread-level popup merging: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn call_zhi_keeps_knowledge_sync_explicit() {
+        let source = include_str!("mcp-server.rs");
+        let call_zhi_source = source
+            .split("async fn call_zhi(")
+            .nth(1)
+            .and_then(|tail| tail.split("\nfn send_dialog_request").next())
+            .expect("call_zhi source should be present");
+
+        assert!(
+            !call_zhi_source.contains("find_knowledge_dir("),
+            "call_zhi must not discover a knowledge repository implicitly"
+        );
+        assert!(
+            !call_zhi_source.contains("--autostash"),
+            "call_zhi must not run an implicit knowledge pull"
+        );
+        assert!(
+            source.contains("fn sync_knowledge("),
+            "the explicit sync tool must remain available"
+        );
+        assert!(
+            source.contains("git(&[\"merge\", \"--ff-only\", \"--quiet\", \"@{u}\"])")
+                && source.contains("git(&[\"push\", \"--quiet\"])")
+                && source.contains("git(&[\"fetch\", \"--quiet\"])"),
+            "the explicit sync tool must retain fetch / fast-forward pull / push behavior"
+        );
+        let sync_source = source
+            .split("fn sync_knowledge(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("sync_knowledge source should be present");
+        assert!(
+            !sync_source.contains("\"-A\"") && !sync_source.contains("\"--no-rebase\""),
+            "sync must not sweep the working tree into a commit or merge a diverged upstream (P-2026-9315)"
+        );
     }
 
     #[test]

@@ -72,8 +72,8 @@ mod tests {
 
     #[test]
     fn file_list_browser_roots_do_not_expand_to_ancestors() {
-        let roots = file_list_browser_roots_for_known_root(PathBuf::from("/Users/test/project"));
-        assert_eq!(roots, vec![PathBuf::from("/Users/test/project")]);
+        let roots = file_list_browser_roots_for_known_root(PathBuf::from("/Users/example/cunzhi"));
+        assert_eq!(roots, vec![PathBuf::from("/Users/example/cunzhi")]);
 
         let shallow_roots = file_list_browser_roots_for_known_root(PathBuf::from("/cunzhi"));
         assert_eq!(shallow_roots, vec![PathBuf::from("/cunzhi")]);

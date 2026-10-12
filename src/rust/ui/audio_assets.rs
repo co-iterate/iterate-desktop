@@ -2,6 +2,7 @@ use anyhow::Result;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -32,19 +33,21 @@ impl AudioAssetManager {
     }
 
     /// 从应用中加载音频资源
-    pub fn load_from_app(&mut self, _app: &AppHandle) -> Result<()> {
-        self.assets.clear();
-        self.load_embedded_audio()?;
-
-        // 在 standalone 模式下不输出日志（避免污染 JSON 输出）
-        if std::env::var("ITERATE_STANDALONE_MODE").is_err()
-            && !std::env::args().any(|arg| arg == "--ui")
-        {
-            eprintln!("✅ 从内嵌资源加载了 {} 个音频资源", self.assets.len());
+    pub fn load_from_app(&mut self, app: &AppHandle) -> Result<()> {
+        // 优先加载内嵌音频资源
+        if let Ok(()) = self.load_embedded_audio() {
+            // 在 standalone 模式下不输出日志（避免污染 JSON 输出）
+            if std::env::var("ITERATE_STANDALONE_MODE").is_err()
+                && !std::env::args().any(|arg| arg == "--ui")
+            {
+                eprintln!("✅ 从内嵌资源加载了 {} 个音频资源", self.assets.len());
+            }
+            return Ok(());
         }
 
-        // 公开源码版本允许零内置音频；用户仍可导入受管的本地提示音。
-        Ok(())
+        // 回退到文件系统加载（开发环境）
+        eprintln!("⚠️ 内嵌资源加载失败，尝试从开发环境文件系统加载...");
+        self.scan_audio_directory(app)
     }
 
     /// 加载内嵌音频资源
@@ -58,6 +61,44 @@ impl AudioAssetManager {
             }
         }
 
+        if self.assets.is_empty() {
+            return Err(anyhow::anyhow!(
+                "没有找到任何内嵌音频资源。请确保 src/rust/assets/resources/ 目录中包含音频文件。"
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// 扫描音频目录（仅开发环境使用）
+    fn scan_audio_directory(&mut self, _app: &AppHandle) -> Result<()> {
+        // 仅在开发环境扫描文件系统
+        let sounds_dir = std::env::current_dir()
+            .unwrap_or_default()
+            .join("src/rust/assets/resources");
+
+        if !sounds_dir.exists() {
+            return Err(anyhow::anyhow!("开发环境音频目录不存在: {:?}", sounds_dir));
+        }
+
+        let entries =
+            fs::read_dir(&sounds_dir).map_err(|e| anyhow::anyhow!("读取音频目录失败: {}", e))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| anyhow::anyhow!("读取目录项失败: {}", e))?;
+            let path = entry.path();
+
+            if path.is_file() {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    if self.is_audio_file(filename) {
+                        let asset = self.create_asset_from_filename(filename);
+                        self.assets.insert(asset.id.clone(), asset);
+                    }
+                }
+            }
+        }
+
+        eprintln!("✅ 扫描音频目录，发现 {} 个音频文件", self.assets.len());
         Ok(())
     }
 
@@ -196,8 +237,8 @@ impl AudioAssetManager {
         ))
     }
 
-    /// 解析音频来源，只允许内置资源 ID 或应用数据目录中的受管音频。
-    pub fn parse_audio_url(&self, app: &AppHandle, audio_url: &str) -> Result<AudioSource> {
+    /// 解析音频URL，支持资源ID、文件路径和网络URL
+    pub fn parse_audio_url(&self, _app: &AppHandle, audio_url: &str) -> Result<AudioSource> {
         if audio_url.is_empty() {
             // 如果为空，使用第一个可用的音频资源作为默认
             let all_assets = self.get_all_assets();
@@ -208,16 +249,9 @@ impl AudioAssetManager {
             }
         }
 
-        if let Some(filename) = crate::constants::audio::managed_audio_filename(audio_url) {
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|_| anyhow::anyhow!("无法获取应用数据目录"))?;
-            return Ok(AudioSource::File(data_dir.join("audio").join(filename)));
-        }
-
+        // 检查是否是网络URL
         if audio_url.starts_with("http://") || audio_url.starts_with("https://") {
-            return Err(anyhow::anyhow!("自定义提示音不支持网络 URL"));
+            return Ok(AudioSource::Url(audio_url.to_string()));
         }
 
         // 检查是否是资源ID
@@ -231,7 +265,14 @@ impl AudioAssetManager {
             return Ok(AudioSource::Asset(filename_without_ext.to_string()));
         }
 
-        Err(anyhow::anyhow!("音频来源无效或不可用"))
+        // 检查是否是文件路径
+        let path = PathBuf::from(audio_url);
+        if path.exists() {
+            return Ok(AudioSource::File(path));
+        }
+
+        // 默认返回文件路径（可能是相对路径）
+        Ok(AudioSource::File(path))
     }
 }
 
@@ -239,7 +280,8 @@ impl AudioAssetManager {
 #[derive(Debug, Clone)]
 pub enum AudioSource {
     Asset(String), // 内置资源ID
-    File(PathBuf), // 应用数据目录中的受管本地文件
+    File(PathBuf), // 本地文件路径
+    Url(String),   // 网络URL
 }
 
 impl Default for AudioAssetManager {

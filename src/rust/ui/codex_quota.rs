@@ -401,7 +401,7 @@ fn codex_http_client(timeout: Duration, label: &str) -> Result<reqwest::Client, 
 }
 
 #[cfg(target_os = "macos")]
-fn macos_system_https_proxy_url() -> Option<String> {
+pub(crate) fn macos_system_https_proxy_url() -> Option<String> {
     let output = std::process::Command::new("scutil")
         .arg("--proxy")
         .output()
@@ -414,7 +414,7 @@ fn macos_system_https_proxy_url() -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_system_https_proxy_url() -> Option<String> {
+pub(crate) fn macos_system_https_proxy_url() -> Option<String> {
     None
 }
 

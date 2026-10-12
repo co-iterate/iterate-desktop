@@ -4,25 +4,35 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-APP_PATH="${REPO_ROOT}/target/release/bundle/macos/iterate.app"
-ZIP_PATH="${REPO_ROOT}/target/release/delivery/macos/iterate.app.zip"
-DELIVERY_DIR="${REPO_ROOT}/target/release/delivery/macos"
+source "${SCRIPT_DIR}/macos-release-identity.sh"
+export CUNZHI_MACOS_ALLOW_DIRTY_SOURCE=0
+
+resolve_repo_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "${REPO_ROOT}" "$1" ;;
+  esac
+}
+
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  CARGO_TARGET_DIR_RESOLVED="$(resolve_repo_path "${CARGO_TARGET_DIR}")"
+else
+  CARGO_TARGET_DIR_RESOLVED="$(cargo metadata --manifest-path "${REPO_ROOT}/Cargo.toml" --format-version 1 --no-deps \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n 1)"
+  [[ -n "${CARGO_TARGET_DIR_RESOLVED}" ]] || { echo 'Cannot resolve Cargo target directory' >&2; exit 1; }
+fi
+APP_PATH="${CARGO_TARGET_DIR_RESOLVED}/release/bundle/macos/iterate.app"
+DELIVERY_DIR="$(resolve_repo_path "${CUNZHI_MACOS_DELIVERY_DIR:-${CARGO_TARGET_DIR_RESOLVED}/release/delivery/macos}")"
+ZIP_PATH="${DELIVERY_DIR}/iterate.app.zip"
+SOURCE_RECEIPT_TOOL="${REPO_ROOT}/scripts/macos-source-receipt.mjs"
 INSTALLATION_PATH="${DELIVERY_DIR}/INSTALLATION.md"
 PROMPT_PATH="${DELIVERY_DIR}/INSTALL_PROMPT.md"
-SYSTEM_PROMPT_PATH="${DELIVERY_DIR}/SYSTEM_PROMPT.md"
 PROFILE_NAME="${CUNZHI_NOTARY_PROFILE:-cunzhi-notary}"
 TEAM_ID="${APPLE_TEAM_ID:-${CUNZHI_NOTARY_TEAM_ID:-UM3Z9G5DNH}}"
 SIGN_IDENTITY="${CUNZHI_MACOS_SIGN_IDENTITY:-}"
 
 detect_sign_identity() {
-  if [[ -n "${SIGN_IDENTITY}" ]]; then
-    printf '%s\n' "${SIGN_IDENTITY}"
-    return 0
-  fi
-
-  security find-identity -v -p codesigning \
-    | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' \
-    | head -n 1
+  resolve_macos_release_sign_identity "${SIGN_IDENTITY}"
 }
 
 have_keychain_profile() {
@@ -123,7 +133,8 @@ assert_app_entitlement() {
   entitlements_dump="$(plutil -p "${entitlements_file}" 2>/dev/null || true)"
   rm -f "${entitlements_file}"
 
-  if ! grep -Fq "\"${entitlement_key}\" => true" <<<"${entitlements_dump}"; then
+  # 不同 macOS 版本的 plutil -p 把布尔值打印成 true 或 1。
+  if ! grep -Eq "\"${entitlement_key//./\\.}\" => (true|1)\$" <<<"${entitlements_dump}"; then
     echo "Missing required app entitlement: ${entitlement_key}" >&2
     echo "${entitlements_dump}" >&2
     exit 1
@@ -145,7 +156,7 @@ rebuild_delivery_dmg() {
   if [[ -n "${existing_dmg}" ]]; then
     dmg_name="$(basename "${existing_dmg}")"
   else
-    dmg_name="$(basename "$(find "${REPO_ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | head -n 1)")"
+    dmg_name="$(basename "$(find "${CARGO_TARGET_DIR_RESOLVED}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | head -n 1)")"
   fi
 
   if [[ -z "${dmg_name}" ]]; then
@@ -165,10 +176,6 @@ rebuild_delivery_dmg() {
 
   if [[ -f "${PROMPT_PATH}" ]]; then
     cp "${PROMPT_PATH}" "${stage_dir}/INSTALL_PROMPT.md"
-  fi
-
-  if [[ -f "${SYSTEM_PROMPT_PATH}" ]]; then
-    cp "${SYSTEM_PROMPT_PATH}" "${stage_dir}/SYSTEM_PROMPT.md"
   fi
 
   rm -f "${output_dmg_path}"
@@ -198,7 +205,7 @@ notarize_delivery_dmg() {
 
   printf 'Signing delivery DMG with Developer ID identity: %s\n' "${identity}"
   codesign --force --timestamp --sign "${identity}" "${dmg_path}"
-  codesign --verify --strict --verbose=2 "${dmg_path}"
+  codesign --verify --strict --verbose=2 -R "=${MACOS_RELEASE_CODE_REQUIREMENT}" "${dmg_path}"
 
   submit_notarization "${dmg_path}"
   xcrun stapler staple "${dmg_path}"
@@ -219,6 +226,14 @@ if [[ ! -f "${ZIP_PATH}" ]]; then
   exit 1
 fi
 
+# Verify the exact current candidate before uploading anything. Recreate its
+# archive so a stale zip cannot be notarized in place of the checked bundle.
+node "${SOURCE_RECEIPT_TOOL}" --verify --repo-root "${REPO_ROOT}" --app "${APP_PATH}"
+verify_macos_release_identity "${APP_PATH}"
+SIGN_IDENTITY="$(detect_sign_identity || true)"
+[[ -n "${SIGN_IDENTITY}" ]] || { echo 'Missing pinned-team signing identity' >&2; exit 1; }
+ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "${ZIP_PATH}"
+shasum -a 256 "${ZIP_PATH}"
 submit_notarization "${ZIP_PATH}"
 
 xcrun stapler staple "${APP_PATH}"

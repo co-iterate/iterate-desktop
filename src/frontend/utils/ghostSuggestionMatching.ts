@@ -8,6 +8,8 @@ interface MatchingOptions {
   isComposing?: boolean
 }
 
+export const MAX_RUNTIME_GHOST_SUGGESTIONS = 20
+
 export function filterCommandSuggestions<T extends CommandSuggestion>(
   suggestions: T[],
   rawQuery: string,
@@ -53,22 +55,23 @@ export function getMatchingCommandSuggestions(
   if (options.acceptedSuggestionToken && token === options.acceptedSuggestionToken.toLowerCase())
     return []
 
-  return suggestions
-    .map((suggestion, index) => ({
-      suggestion,
-      index,
-      key: suggestion.key.toLowerCase(),
-    }))
-    .filter(({ key }) => key.startsWith(token))
-    .sort((left, right) => {
-      const leftExact = left.key === token
-      const rightExact = right.key === token
-      if (leftExact !== rightExact)
-        return leftExact ? -1 : 1
+  let exactMatch: CommandSuggestion | null = null
+  const prefixMatches: CommandSuggestion[] = []
 
-      return left.index - right.index
-    })
-    .map(({ suggestion }) => suggestion)
+  for (const suggestion of suggestions) {
+    const key = suggestion.key.toLowerCase()
+    if (key === token) {
+      exactMatch = suggestion
+      continue
+    }
+    if (key.startsWith(token) && prefixMatches.length < MAX_RUNTIME_GHOST_SUGGESTIONS)
+      prefixMatches.push(suggestion)
+  }
+
+  if (!exactMatch)
+    return prefixMatches
+
+  return [exactMatch, ...prefixMatches.slice(0, MAX_RUNTIME_GHOST_SUGGESTIONS - 1)]
 }
 
 export function getCommandSuggestionSuffix(suggestion: CommandSuggestion | null, token: string): string {

@@ -273,7 +273,7 @@ pub(super) fn try_write_serve_response_file(
         );
     };
 
-    match std::fs::write(response_file, response_str) {
+    match crate::utils::atomic_file::write_file_atomically(response_file, response_str.as_bytes()) {
         Ok(()) => {
             let _ = std::fs::remove_file(route_file);
             debug_log(&format!(

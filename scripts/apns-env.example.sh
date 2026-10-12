@@ -10,6 +10,14 @@ export APNS_KEY_ID="YOUR_KEY_ID"
 export APNS_TEAM_ID="YOUR_TEAM_ID"
 export APNS_AUTH_KEY_PATH="/absolute/path/to/AuthKey_XXXXXXXXXX.p8"
 
+# Environment-specific provider keys. When at least one scoped key is set,
+# the legacy key above is used only for APNS_ENV; the other environment must
+# have its own scoped key instead of silently crossing environments.
+# export APNS_SANDBOX_KEY_ID="YOUR_SANDBOX_KEY_ID"
+# export APNS_SANDBOX_AUTH_KEY_PATH="/absolute/path/to/AuthKey_SANDBOX.p8"
+# export APNS_PRODUCTION_KEY_ID="YOUR_PRODUCTION_KEY_ID"
+# export APNS_PRODUCTION_AUTH_KEY_PATH="/absolute/path/to/AuthKey_PRODUCTION.p8"
+
 # Optional overrides.
 # APNS_TOPIC is the app bundle id. Live Activity pushes derive
 # "<bundle id>.push-type.liveactivity" automatically.
