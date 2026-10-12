@@ -54,7 +54,7 @@ rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "mai
   "transport-io",
   "transport-child-process"
 ] }
-schemars = "0.8"
+schemars = "1.2"
 rodio = "0.19"
 reqwest = { version = "0.11", default-features = false, features = [
   "stream",
