@@ -2297,7 +2297,6 @@ fn open_accessibility_settings() {
         .output();
 }
 
-#[cfg(target_os = "macos")]
 fn build_codex_new_thread_deeplink(content: &str, project_path: Option<&str>) -> Option<String> {
     let prompt = content.trim();
     if prompt.is_empty() {
@@ -2437,6 +2436,301 @@ fn launch_codex_desktop(project_path: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn codex_desktop_cli_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let bin_root = PathBuf::from(local_app_data)
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin");
+        if let Ok(entries) = std::fs::read_dir(bin_root) {
+            let mut directories = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            directories.sort_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            });
+            directories.reverse();
+            candidates.extend(
+                directories
+                    .into_iter()
+                    .map(|directory| directory.join("codex.exe")),
+            );
+        }
+    }
+
+    if let Some(path_env) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path_env).map(|dir| dir.join("codex.exe")));
+    }
+
+    candidates.dedup();
+    candidates
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_codex_desktop_cli() -> Result<PathBuf, String> {
+    let candidates = codex_desktop_cli_candidates();
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "未找到 Codex Desktop CLI；已检查：{}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn codex_desktop_app_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let windows_apps = PathBuf::from(program_files).join("WindowsApps");
+        if let Ok(entries) = std::fs::read_dir(windows_apps) {
+            let mut directories = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("openai.codex_"))
+                })
+                .collect::<Vec<_>>();
+            directories.sort_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            });
+            directories.reverse();
+            candidates.extend(
+                directories
+                    .into_iter()
+                    .map(|directory| directory.join("app").join("ChatGPT.exe")),
+            );
+        }
+    }
+
+    candidates.dedup();
+    candidates
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_codex_desktop_app_exe() -> Result<PathBuf, String> {
+    let candidates = codex_desktop_app_candidates();
+    if let Some(candidate) = candidates.iter().find(|candidate| candidate.is_file()) {
+        return Ok(candidate.clone());
+    }
+
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation",
+        ])
+        .without_console_window()
+        .output()
+        .map_err(|error| format!("查询官方 Codex Desktop App 失败: {error}"))?;
+
+    if output.status.success() {
+        let install_location = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !install_location.is_empty() {
+            let candidate = PathBuf::from(install_location)
+                .join("app")
+                .join("ChatGPT.exe");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(format!(
+        "未找到官方 Codex Desktop App；已检查 WindowsApps 并查询 OpenAI.Codex Appx 包。候选：{}",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn launch_codex_desktop_project(project_path: &str) -> Result<(), String> {
+    if let Ok(app_exe) = resolve_codex_desktop_app_exe() {
+        match std::process::Command::new(&app_exe)
+            .arg(project_path)
+            .without_console_window()
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                log::warn!(
+                    "官方 Codex Desktop App 直接打开项目失败，回退到 CLI：{}",
+                    error
+                );
+            }
+        }
+    }
+
+    let codex_cli = resolve_codex_desktop_cli()?;
+    let output = std::process::Command::new(&codex_cli)
+        .args(["app", project_path])
+        .without_console_window()
+        .output()
+        .map_err(|error| format!("调用 Codex Desktop CLI 失败: {}", error))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!(
+            "Codex Desktop CLI 打开项目失败（{}）：{}",
+            codex_cli.display(),
+            if stderr.is_empty() {
+                format!("退出码 {:?}", output.status.code())
+            } else {
+                stderr
+            }
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn launch_codex_desktop_deeplink(url: &str) -> Result<(), String> {
+    let app_exe = resolve_codex_desktop_app_exe()?;
+    std::process::Command::new(&app_exe)
+        .arg(url)
+        .without_console_window()
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("官方 Codex Desktop App 打开 deeplink 失败: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_foreground_executable_path() -> Option<PathBuf> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return None;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) } != 0;
+    unsafe {
+        CloseHandle(process);
+    }
+    if !ok || size == 0 {
+        return None;
+    }
+
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..size as usize],
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn is_codex_desktop_foreground_path(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase());
+
+    if file_name.as_deref() != Some("chatgpt.exe") {
+        return false;
+    }
+
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/windowsapps/openai.codex_")
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_codex_foreground(timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if windows_foreground_executable_path()
+            .as_deref()
+            .is_some_and(is_codex_desktop_foreground_path)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // 新对话改为只预填；保留给需要确认路由就绪后才发送的场景
+fn post_return_keypress_to_codex() -> Result<(), String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYEVENTF_KEYUP, VK_RETURN,
+    };
+
+    if !wait_for_codex_foreground(std::time::Duration::from_secs(3)) {
+        return Err("Codex 未成为前台窗口，为避免误发按键已取消自动发送".to_string());
+    }
+
+    unsafe {
+        keybd_event(VK_RETURN as u8, 0, 0, 0);
+        keybd_event(VK_RETURN as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn post_new_task_keypress_to_codex() -> Result<(), String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYEVENTF_KEYUP, VK_CONTROL,
+    };
+
+    if !wait_for_codex_foreground(std::time::Duration::from_secs(3)) {
+        return Err("Codex 未成为前台窗口，为避免误发快捷键已取消新建对话".to_string());
+    }
+
+    const VK_N: u8 = b'N';
+    unsafe {
+        keybd_event(VK_CONTROL as u8, 0, 0, 0);
+        keybd_event(VK_N, 0, 0, 0);
+        keybd_event(VK_N, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn open_new_codex_chat_with_applescript(
     content: &str,
@@ -2528,12 +2822,30 @@ end tell
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn probe_codex_automation_permission() -> Result<CodexAutomationProbeResult, String> {
+    match resolve_codex_desktop_app_exe() {
+        Ok(path) => Ok(CodexAutomationProbeResult {
+            status: "granted".to_string(),
+            details: format!(
+                "已确认 Windows Codex Desktop 可用：{}；自动按键仅在官方 Codex 窗口确认成为前台时执行。",
+                path.display()
+            ),
+        }),
+        Err(error) => Ok(CodexAutomationProbeResult {
+            status: "error".to_string(),
+            details: error,
+        }),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 pub async fn probe_codex_automation_permission() -> Result<CodexAutomationProbeResult, String> {
     Ok(CodexAutomationProbeResult {
         status: "unsupported".to_string(),
-        details: "仅 macOS 支持 Codex 自动化权限探测。".to_string(),
+        details: "当前平台暂不支持 Codex 自动化权限探测。".to_string(),
     })
 }
 
@@ -2561,17 +2873,67 @@ pub async fn open_codex_thread(thread_id: String) -> Result<(), String> {
     launch_codex_desktop_deeplink(&deeplink)
 }
 
-/// 非 macOS 平台暂不支持按项目打开 Codex
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 #[tauri::command]
-pub async fn open_codex_project(_project_path: String) -> Result<(), String> {
-    Err("仅 macOS 暂支持 Codex Desktop 项目跳转".to_string())
+pub async fn open_codex_project(project_path: String) -> Result<(), String> {
+    let normalized_project_path = project_path.trim();
+    if normalized_project_path.is_empty() || normalized_project_path == "main_page" {
+        return Err("项目路径无效".to_string());
+    }
+    if !std::path::Path::new(normalized_project_path).is_absolute() {
+        return Err("仅支持绝对路径项目".to_string());
+    }
+    launch_codex_desktop_project(normalized_project_path)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn open_codex_thread(thread_id: String) -> Result<(), String> {
+    let deeplink =
+        codex_thread_deeplink(&thread_id).ok_or_else(|| "Codex 会话 ID 无效".to_string())?;
+    launch_codex_desktop_deeplink(&deeplink)
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn open_new_codex_chat(thread_id: String) -> Result<(), String> {
+    let deeplink =
+        codex_thread_deeplink(&thread_id).ok_or_else(|| "Codex 会话 ID 无效".to_string())?;
+
+    launch_codex_desktop_deeplink(&deeplink)?;
+    if !wait_for_codex_foreground(std::time::Duration::from_secs(3)) {
+        return Err("原 Codex 会话未成为前台窗口，未创建新对话".to_string());
+    }
+
+    // Codex 的 thread deeplink 没有路由完成回调。给 Electron 一次很短的 settle，
+    // 随后再次确认前台仍是官方 Codex，避免 Ctrl+N 抢在 thread 路由切换之前。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    if !windows_foreground_executable_path()
+        .as_deref()
+        .is_some_and(is_codex_desktop_foreground_path)
+    {
+        return Err("Codex 会话切换期间失去前台，为避免误发快捷键已取消新建对话".to_string());
+    }
+
+    post_new_task_keypress_to_codex()
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub async fn open_new_codex_chat(_thread_id: String) -> Result<(), String> {
+    Err("当前平台暂不使用 Windows Codex 空白新会话入口".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[tauri::command]
+pub async fn open_codex_project(_project_path: String) -> Result<(), String> {
+    Err("当前平台暂不支持 Codex Desktop 项目跳转".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 pub async fn open_codex_thread(_thread_id: String) -> Result<(), String> {
-    Err("仅 macOS 暂支持 Codex Desktop 会话跳转".to_string())
+    Err("当前平台暂不支持 Codex Desktop 会话跳转".to_string())
 }
 
 /// 在 Codex 中打开项目或唤起应用。
@@ -2744,14 +3106,44 @@ pub async fn open_new_codex_chat_with_text(
     })
 }
 
-/// 非 macOS 平台暂不支持 Codex 自动化
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn open_new_codex_chat_with_text(
+    content: String,
+    project_path: Option<String>,
+) -> Result<OpenCodexChatResult, String> {
+    let prompt = content.trim();
+    if prompt.is_empty() {
+        return Err("Codex 新对话内容不能为空".to_string());
+    }
+
+    let normalized_project_path = project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && *path != "main_page")
+        .filter(|path| std::path::Path::new(path).is_absolute());
+
+    let deeplink = build_codex_new_thread_deeplink(prompt, normalized_project_path)
+        .ok_or_else(|| "无法构造 Codex 新对话链接".to_string())?;
+    launch_codex_desktop_deeplink(&deeplink)?;
+
+    // 只预填、不自动按回车：Codex 成为前台不代表已经切到新对话，
+    // 此时按回车可能把旧会话里的草稿发出去。
+    Ok(OpenCodexChatResult {
+        ok: true,
+        sent: false,
+        mode: "windows_deeplink_prefilled".to_string(),
+        message: format!("已打开 Codex 并预填 {}，请在 Codex 中确认后发送", prompt),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 pub async fn open_new_codex_chat_with_text(
     _content: String,
     _project_path: Option<String>,
 ) -> Result<OpenCodexChatResult, String> {
-    Err("仅 macOS 暂支持 Codex 自动化".to_string())
+    Err("当前平台暂不支持 Codex 自动化".to_string())
 }
 
 /// 打开新的 Windsurf 聊天标签页并发送内容
@@ -3865,6 +4257,22 @@ pub async fn activate_app_window(app: AppHandle) -> Result<(), String> {
             .unminimize()
             .map_err(|e| format!("恢复窗口失败: {}", e))?;
         window.show().map_err(|e| format!("显示窗口失败: {}", e))?;
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                BringWindowToTop, SetForegroundWindow, ShowWindow, SW_RESTORE,
+            };
+
+            let hwnd = window
+                .hwnd()
+                .map_err(|e| format!("获取 Windows 窗口句柄失败: {}", e))?;
+            let raw_hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+            unsafe {
+                ShowWindow(raw_hwnd, SW_RESTORE);
+                BringWindowToTop(raw_hwnd);
+                SetForegroundWindow(raw_hwnd);
+            }
+        }
         window
             .set_focus()
             .map_err(|e| format!("聚焦窗口失败: {}", e))?;
@@ -3961,15 +4369,58 @@ pub async fn select_files_and_folders(
     rx.recv().map_err(|e| e.to_string())?
 }
 
-/// 非 macOS 平台的文件选择器 - 返回空数组（功能暂不支持）
-#[cfg(not(target_os = "macos"))]
+/// 其他平台（如 Linux）保持回流前的行为：返回空数组，前端静默处理
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 pub async fn select_files_and_folders(
     _default_path: Option<String>,
     _directories_only: Option<bool>,
 ) -> Result<Vec<String>, String> {
-    // 非 macOS 平台暂不支持，返回空数组让前端静默处理
     Ok(vec![])
+}
+
+/// Windows 使用原生文件/目录对话框（#33）
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn select_files_and_folders(
+    app: tauri::AppHandle,
+    default_path: Option<String>,
+    directories_only: Option<bool>,
+) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let directories_only = directories_only.unwrap_or(false);
+    let mut dialog = app.dialog().file().set_title(if directories_only {
+        "选择目录"
+    } else {
+        "选择文件"
+    });
+
+    if let Some(path) = default_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        dialog = dialog.set_directory(path);
+    }
+
+    let selected = if directories_only {
+        dialog
+            .blocking_pick_folder()
+            .map(|path| vec![path])
+            .unwrap_or_default()
+    } else {
+        dialog.blocking_pick_files().unwrap_or_default()
+    };
+
+    selected
+        .into_iter()
+        .map(|path| {
+            path.into_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .map_err(|_| "无法读取所选路径".to_string())
+        })
+        .collect()
 }
 
 /// 读取 macOS 剪贴板里的文件路径（用于支持 Finder 复制文件后直接粘贴为附件）
@@ -4048,7 +4499,78 @@ pub async fn read_clipboard_file_paths(app: tauri::AppHandle) -> Result<Vec<Stri
         .map_err(|e| format!("等待剪贴板读取结果失败: {}", e))?
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Ole::CF_HDROP;
+    use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 {
+            return Ok(vec![]);
+        }
+
+        const CLIPBOARD_OPEN_ATTEMPTS: usize = 5;
+        const CLIPBOARD_RETRY_DELAY_MS: u64 = 20;
+
+        let mut clipboard_opened = false;
+        for attempt in 0..CLIPBOARD_OPEN_ATTEMPTS {
+            if OpenClipboard(std::ptr::null_mut()) != 0 {
+                clipboard_opened = true;
+                break;
+            }
+
+            if attempt + 1 < CLIPBOARD_OPEN_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(CLIPBOARD_RETRY_DELAY_MS));
+            }
+        }
+
+        if !clipboard_opened {
+            return Err("打开 Windows 剪贴板失败".to_string());
+        }
+
+        let result = (|| -> Result<Vec<String>, String> {
+            let clipboard_handle = GetClipboardData(CF_HDROP as u32);
+            if clipboard_handle.is_null() {
+                return Ok(vec![]);
+            }
+
+            let hdrop = clipboard_handle as HDROP;
+            let count = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
+            let mut unique_paths = HashSet::new();
+            let mut selected_paths = Vec::with_capacity(count as usize);
+
+            for index in 0..count {
+                let path_len = DragQueryFileW(hdrop, index, std::ptr::null_mut(), 0);
+                if path_len == 0 {
+                    continue;
+                }
+
+                let mut buffer = vec![0u16; path_len as usize + 1];
+                let written =
+                    DragQueryFileW(hdrop, index, buffer.as_mut_ptr(), buffer.len() as u32);
+                if written == 0 {
+                    continue;
+                }
+
+                let path = String::from_utf16_lossy(&buffer[..written as usize]);
+                if !path.is_empty() && unique_paths.insert(path.clone()) {
+                    selected_paths.push(path);
+                }
+            }
+
+            Ok(selected_paths)
+        })();
+
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 pub async fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
     Ok(vec![])
@@ -4057,12 +4579,25 @@ pub async fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
 // ============ 防止睡眠功能 ============
 
 use once_cell::sync::Lazy;
+#[cfg(not(target_os = "windows"))]
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
 /// 存储 caffeinate 进程
+#[cfg(not(target_os = "windows"))]
 static CAFFEINATE_PROCESS: Lazy<Mutex<Option<Child>>> = Lazy::new(|| Mutex::new(None));
 
+#[cfg(target_os = "windows")]
+struct WindowsPreventSleepGuard {
+    stop_tx: std::sync::mpsc::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "windows")]
+static WINDOWS_PREVENT_SLEEP_GUARD: Lazy<Mutex<Option<WindowsPreventSleepGuard>>> =
+    Lazy::new(|| Mutex::new(None));
+
+#[cfg(not(target_os = "windows"))]
 fn reconcile_prevent_sleep_process(process_guard: &mut Option<Child>) -> bool {
     let Some(child) = process_guard.as_mut() else {
         return false;
@@ -4086,6 +4621,7 @@ fn reconcile_prevent_sleep_process(process_guard: &mut Option<Child>) -> bool {
 }
 
 /// 在当前进程开启合盖运行。仅供持有 8080 的 bridge 进程调用。
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn enable_prevent_sleep_local() -> Result<bool, String> {
     let mut process_guard = CAFFEINATE_PROCESS.lock().map_err(|e| e.to_string())?;
 
@@ -4111,7 +4647,62 @@ pub(crate) fn enable_prevent_sleep_local() -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn enable_prevent_sleep_local() -> Result<bool, String> {
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+    };
+
+    let mut guard = WINDOWS_PREVENT_SLEEP_GUARD
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if let Some(existing) = guard.as_ref() {
+        if !existing.join.is_finished() {
+            return Ok(true);
+        }
+    }
+    if let Some(stale) = guard.take() {
+        let _ = stale.join.join();
+    }
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    let join = std::thread::Builder::new()
+        .name("iterate-prevent-sleep".to_string())
+        .spawn(move || {
+            let previous = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+            if previous == 0 {
+                let _ = ready_tx.send(Err("SetThreadExecutionState 启用失败".to_string()));
+                return;
+            }
+            let _ = ready_tx.send(Ok(()));
+            let _ = stop_rx.recv();
+            unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS);
+            }
+        })
+        .map_err(|e| format!("启动 Windows 防睡眠线程失败: {}", e))?;
+
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(())) => {
+            *guard = Some(WindowsPreventSleepGuard { stop_tx, join });
+            log::info!("[PreventSleep] 已开启 Windows 系统防睡眠");
+            Ok(true)
+        }
+        Ok(Err(error)) => {
+            let _ = join.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = stop_tx.send(());
+            let _ = join.join();
+            Err(format!("等待 Windows 防睡眠线程启动超时: {}", error))
+        }
+    }
+}
+
 /// 在当前进程关闭合盖运行。仅供持有 8080 的 bridge 进程调用。
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn disable_prevent_sleep_local() -> Result<bool, String> {
     let mut process_guard = CAFFEINATE_PROCESS.lock().map_err(|e| e.to_string())?;
 
@@ -4121,6 +4712,20 @@ pub(crate) fn disable_prevent_sleep_local() -> Result<bool, String> {
     }
 
     log::info!("[PreventSleep] 已关闭合盖运行模式");
+    Ok(false)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn disable_prevent_sleep_local() -> Result<bool, String> {
+    let guard = WINDOWS_PREVENT_SLEEP_GUARD
+        .lock()
+        .map_err(|e| e.to_string())?
+        .take();
+    if let Some(guard) = guard {
+        let _ = guard.stop_tx.send(());
+        let _ = guard.join.join();
+    }
+    log::info!("[PreventSleep] 已关闭 Windows 系统防睡眠");
     Ok(false)
 }
 
@@ -4134,11 +4739,29 @@ pub(crate) fn toggle_prevent_sleep_local() -> Result<bool, String> {
 }
 
 /// 获取当前 bridge 进程持有的合盖运行状态。
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn get_prevent_sleep_status_local() -> bool {
     let Ok(mut process_guard) = CAFFEINATE_PROCESS.lock() else {
         return false;
     };
     reconcile_prevent_sleep_process(&mut process_guard)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn get_prevent_sleep_status_local() -> bool {
+    let Ok(mut guard) = WINDOWS_PREVENT_SLEEP_GUARD.lock() else {
+        return false;
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|entry| !entry.join.is_finished())
+    {
+        return true;
+    }
+    if let Some(stale) = guard.take() {
+        let _ = stale.join.join();
+    }
+    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -4983,35 +5606,162 @@ pub fn read_text_file(file_path: String) -> Result<String, String> {
     std::fs::read_to_string(&file_path).map_err(|e| format!("读取文件失败 {}: {}", file_path, e))
 }
 
-/// 截取全屏并返回 base64 图片
+/// 截取全屏并返回 base64 图片。
 #[tauri::command]
 pub async fn capture_screenshot() -> Result<String, String> {
-    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
 
-    // 临时文件路径
-    let temp_path = "/tmp/iterate_screenshot.png";
+        let temp_path = "/tmp/iterate_screenshot.png";
+        let output = Command::new("screencapture")
+            .arg("-x")
+            .arg(temp_path)
+            .output()
+            .map_err(|e| format!("执行 screencapture 失败: {}", e))?;
 
-    // 使用 screencapture 截取全屏（-x 参数表示不播放快门声音）
-    let output = Command::new("screencapture")
-        .arg("-x")
-        .arg(temp_path)
-        .output()
-        .map_err(|e| format!("执行 screencapture 失败: {}", e))?;
+        if !output.status.success() {
+            return Err(format!("screencapture 命令失败: {:?}", output.stderr));
+        }
 
-    if !output.status.success() {
-        return Err(format!("screencapture 命令失败: {:?}", output.stderr));
+        let data = std::fs::read(temp_path).map_err(|e| format!("读取截图文件失败: {}", e))?;
+        let _ = std::fs::remove_file(temp_path);
+        return Ok(format!(
+            "data:image/png;base64,{}",
+            base64_013::encode(&data)
+        ));
     }
 
-    // 读取截图文件
-    let data = std::fs::read(temp_path).map_err(|e| format!("读取截图文件失败: {}", e))?;
+    #[cfg(target_os = "windows")]
+    {
+        use image::codecs::png::PngEncoder;
+        use image::{ExtendedColorType, ImageEncoder};
+        use std::ffi::c_void;
+        use windows_sys::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
+            SRCCOPY,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
 
-    // 转换为 base64
-    let b64 = base64_013::encode(&data);
+        let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if width <= 0 || height <= 0 {
+            return Err(format!("Windows 虚拟桌面尺寸无效: {}x{}", width, height));
+        }
 
-    // 删除临时文件
-    let _ = std::fs::remove_file(temp_path);
+        let screen_dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if screen_dc.is_null() {
+            return Err("获取 Windows 屏幕 DC 失败".to_string());
+        }
 
-    Ok(format!("data:image/png;base64,{}", b64))
+        let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        if memory_dc.is_null() {
+            unsafe {
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("创建 Windows 截图内存 DC 失败".to_string());
+        }
+
+        let mut bitmap_info = BITMAPINFO::default();
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                screen_dc,
+                &bitmap_info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if bitmap.is_null() || bits.is_null() {
+            unsafe {
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("创建 Windows 截图 DIB 失败".to_string());
+        }
+
+        let previous_object = unsafe { SelectObject(memory_dc, bitmap) };
+        if previous_object.is_null() {
+            unsafe {
+                DeleteObject(bitmap);
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("选择 Windows 截图位图失败".to_string());
+        }
+
+        let copied = unsafe {
+            BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                screen_dc,
+                left,
+                top,
+                SRCCOPY | CAPTUREBLT,
+            )
+        };
+        if copied == 0 {
+            unsafe {
+                SelectObject(memory_dc, previous_object);
+                DeleteObject(bitmap);
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return Err("Windows BitBlt 截图失败".to_string());
+        }
+
+        let byte_len = width as usize * height as usize * 4;
+        let bgra = unsafe { std::slice::from_raw_parts(bits as *const u8, byte_len) };
+        let mut rgba = vec![0u8; byte_len];
+        for (source, target) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+            target[0] = source[2];
+            target[1] = source[1];
+            target[2] = source[0];
+            target[3] = 255;
+        }
+
+        unsafe {
+            SelectObject(memory_dc, previous_object);
+            DeleteObject(bitmap);
+            DeleteDC(memory_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+        }
+
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, width as u32, height as u32, ExtendedColorType::Rgba8)
+            .map_err(|e| format!("编码 Windows 截图 PNG 失败: {}", e))?;
+
+        return Ok(format!(
+            "data:image/png;base64,{}",
+            base64_013::encode(&png)
+        ));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("当前平台暂不支持截图".to_string())
+    }
 }
 
 #[cfg(test)]

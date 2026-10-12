@@ -33,12 +33,19 @@ sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" package.json
 echo "  ✅ package.json"
 
 # Cargo.toml (只改第一个 version)
-sed -i '' "0,/^version = \"[^\"]*\"/s//version = \"$VERSION\"/" Cargo.toml
+# BSD sed（macOS）不支持 GNU 的 0,/re/ 地址，用 perl 只替换第一处
+perl -0pi -e "s/^version = \"[^\"]*\"/version = \"$VERSION\"/m" Cargo.toml
 echo "  ✅ Cargo.toml"
 
 # tauri.conf.json
 sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" tauri.conf.json
 echo "  ✅ tauri.conf.json"
+
+# README 版本徽章（scripts/check-version-consistency.mjs 会核对）
+if [[ -f README.md ]]; then
+    perl -pi -e "s{img\.shields\.io/badge/version-[0-9.]+-blue}{img.shields.io/badge/version-$VERSION-blue}" README.md
+    echo "  ✅ README.md 徽章"
+fi
 
 # version.json（release.yml 的版本校验优先读它）
 if [[ -f version.json ]]; then

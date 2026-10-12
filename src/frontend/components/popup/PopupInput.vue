@@ -88,6 +88,7 @@ let suppressSpeechTargetFocusUntil = 0
 // 响应式数据
 const userInput = ref('')
 const selectedOptions = ref<string[]>([])
+const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
 const uploadedImages = ref<string[]>([])
 const attachedFiles = ref<PopupFileAttachment[]>([])
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
@@ -98,6 +99,7 @@ const ghostMetricsStyle = ref('')
 const textareaIsScrolled = ref(false)
 const historyCommandSuggestions = ref<CommandSuggestion[]>([])
 const isInputDragOver = ref(false)
+let windowsScreenshotPending = false
 
 // 自定义prompt相关状态
 const customPrompts = ref<CustomPrompt[]>([])
@@ -381,7 +383,8 @@ function handleOptionToggle(option: string) {
 const IMAGE_PATH_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|bmp|heic|heif|tiff?)$/i
 
 function getDisplayNameFromPath(path: string): string {
-  return path.split('/').filter(Boolean).pop() || path
+  // 反斜杠只在 Windows 上是目录分隔符；macOS/Linux 上它可以是文件名的一部分
+  return path.split(windowsPlatform ? /[\\/]/ : '/').filter(Boolean).pop() || path
 }
 
 function isImagePath(path: string): boolean {
@@ -393,9 +396,14 @@ function normalizeClipboardPath(rawValue: string): string | null {
   if (!trimmed)
     return null
 
+  // Explorer copies absolute paths with drive letters or UNC prefixes.
+  if (windowsPlatform && (/^[a-z]:[\\/]/i.test(trimmed) || /^\\\\[^\\]+\\[^\\]+/.test(trimmed)))
+    return trimmed
+
   if (trimmed.startsWith('file://')) {
     try {
-      return decodeURIComponent(new URL(trimmed).pathname)
+      const decodedPath = decodeURIComponent(new URL(trimmed).pathname)
+      return windowsPlatform && /^\/[a-z]:\//i.test(decodedPath) ? decodedPath.slice(1) : decodedPath
     }
     catch {
       return decodeURIComponent(trimmed.replace(/^file:\/\//, ''))
@@ -1741,6 +1749,55 @@ async function setupWindowMoveListener() {
 // 截图事件监听器
 let unlistenScreenshot: (() => void) | null = null
 
+// Windows 的 iterate popup 运行在独立进程中，不能依赖第一个 iterate 进程抢到的
+// 系统级 RegisterHotKey。macOS 继续走 Rust 全局快捷键；Windows 在当前聚焦 popup
+// 内处理 F8，避开 WebView2 自带的 Ctrl+Shift+K（Duplicate Tab）快捷键。
+async function handleWindowsScreenshotShortcut(event: KeyboardEvent) {
+  if (!windowsPlatform
+    || event.code !== 'F8'
+    || event.ctrlKey
+    || event.altKey
+    || event.shiftKey
+    || event.metaKey
+    || event.repeat
+    || windowsScreenshotPending) {
+    return
+  }
+
+  event.preventDefault()
+  event.stopPropagation()
+  windowsScreenshotPending = true
+
+  const webview = getCurrentWebviewWindow()
+  try {
+    await webview.hide()
+    await new Promise<void>(resolve => setTimeout(resolve, 80))
+
+    const screenshotData = await invoke<string>('capture_screenshot')
+    if (screenshotData && !uploadedImages.value.includes(screenshotData)) {
+      uploadedImages.value.push(screenshotData)
+      message.success('截图已添加')
+      emitUpdate()
+    }
+  }
+  catch (error) {
+    console.error('Windows 截图失败:', error)
+    message.error('截图失败')
+  }
+  finally {
+    try {
+      await webview.show()
+      await webview.setFocus()
+    }
+    catch (error) {
+      console.error('恢复截图窗口失败:', error)
+    }
+    windowsScreenshotPending = false
+    await nextTick()
+    textareaRef.value?.focus()
+  }
+}
+
 // Cmd+1~9 快捷键选择预定义选项
 function handleOptionShortcut(event: KeyboardEvent) {
   if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey)
@@ -1951,6 +2008,9 @@ onMounted(() => {
   // 设置窗口移动监听器
   void setupWindowMoveListener()
 
+  // Windows 多进程下由当前聚焦 popup 自己处理截图快捷键。
+  window.addEventListener('keydown', handleWindowsScreenshotShortcut)
+
   // 注册 Cmd+1~9 快捷键监听
   window.addEventListener('keydown', handleOptionShortcut)
   window.addEventListener('keydown', handleOptionGhostControlKeydown)
@@ -1999,6 +2059,8 @@ onUnmounted(() => {
   if (unlistenNativeTextDrop) {
     unlistenNativeTextDrop()
   }
+
+  window.removeEventListener('keydown', handleWindowsScreenshotShortcut)
 
   // 清理 Cmd+1~9 快捷键监听
   window.removeEventListener('keydown', handleOptionShortcut)

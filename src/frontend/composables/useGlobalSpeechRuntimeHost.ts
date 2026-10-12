@@ -17,6 +17,11 @@ interface ProcessTranscriptPayload {
   text: string
 }
 
+interface WindowsTranscriptPayload {
+  targetToken: string
+  text: string
+}
+
 export function useGlobalSpeechRuntimeHost() {
   const guard = new GlobalSpeechSessionGuard()
   let muscleMemoryEntries: SpeechMemoryEntry[] = []
@@ -25,6 +30,12 @@ export function useGlobalSpeechRuntimeHost() {
   let contextualStrings: string[] = []
   let unlistenSnapshot: (() => void) | null = null
   let unlistenTranscript: (() => void) | null = null
+  let unlistenWindowsTranscript: (() => void) | null = null
+  let unlistenWindowsError: (() => void) | null = null
+  // 初始化与 dispose 可能交错：每次 dispose 递增，旧的初始化在 await 之后发现代次变化就放弃
+  let lifecycle = 0
+  // 最近一次发布 ready=true 的代次；旧初始化只在没有更新的初始化接手时才撤销就绪
+  let readyGeneration = -1
   let resourcesReady: Promise<void> = Promise.resolve()
   let initialized = false
 
@@ -173,11 +184,62 @@ export function useGlobalSpeechRuntimeHost() {
     }).catch(() => undefined)
   }
 
+  async function processWindowsTranscript(payload: WindowsTranscriptPayload) {
+    const rawText = payload.text.trim()
+    if (!rawText || !payload.targetToken)
+      return
+
+    let finalText = rawText
+    try {
+      await resourcesReady
+      const processed = applySpeechPostprocess({
+        text: rawText,
+        muscleMemoryEntries,
+        correctionMemoryEntries,
+        contextTerms: buildCorrectionEligibilityTerms(),
+      })
+      finalText = processed.text
+      await persistMemoryWriteback(processed)
+    }
+    catch {
+      finalText = rawText
+    }
+
+    await invoke('commit_windows_speech_text', {
+      targetToken: payload.targetToken,
+      text: finalText,
+    }).catch(error => console.error('Windows 语音写回失败:', error))
+  }
+
   async function initialize() {
     if (initialized)
       return
     initialized = true
+    const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
     resourcesReady = refreshRecognitionResources()
+
+    if (windowsPlatform) {
+      const current = lifecycle
+      const transcriptUnlisten = await listen<WindowsTranscriptPayload>('speech://windows-transcript', event => void processWindowsTranscript(event.payload))
+      if (current !== lifecycle) {
+        transcriptUnlisten()
+        return
+      }
+      unlistenWindowsTranscript = transcriptUnlisten
+      const errorUnlisten = await listen<string>('speech://windows-error', event => console.warn('Windows 语音识别失败:', event.payload))
+      if (current !== lifecycle) {
+        errorUnlisten()
+        return
+      }
+      unlistenWindowsError = errorUnlisten
+      // 监听注册完成后才允许后端开始听写，否则识别结果无处写回
+      readyGeneration = current
+      await invoke('set_windows_speech_listener_ready', { ready: true }).catch(error => console.warn('通知 Windows 语音监听就绪失败:', error))
+      // 通知过程中被 dispose 且没有更新的初始化接手：撤销刚发布的就绪状态
+      if (current !== lifecycle && readyGeneration === current)
+        void invoke('set_windows_speech_listener_ready', { ready: false }).catch(() => {})
+      return
+    }
     unlistenSnapshot = await listen<SpeechSnapshot>('speech://session-snapshot', event => acceptSnapshot(event.payload))
     unlistenTranscript = await listen<ProcessTranscriptPayload>('speech://process-transcript', event => void processTranscript(event.payload))
     const snapshot = await invoke<SpeechSnapshot>('get_speech_control_snapshot')
@@ -186,10 +248,18 @@ export function useGlobalSpeechRuntimeHost() {
   }
 
   function dispose() {
+    lifecycle += 1
+    const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
+    if (windowsPlatform)
+      void invoke('set_windows_speech_listener_ready', { ready: false }).catch(() => {})
     unlistenSnapshot?.()
     unlistenTranscript?.()
+    unlistenWindowsTranscript?.()
+    unlistenWindowsError?.()
     unlistenSnapshot = null
     unlistenTranscript = null
+    unlistenWindowsTranscript = null
+    unlistenWindowsError = null
     initialized = false
   }
 

@@ -576,6 +576,9 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    // Windows 的原生文件/目录选择器（select_files_and_folders）依赖对话框插件
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_dialog::init());
 
     #[cfg(target_os = "macos")]
     let builder = builder.on_window_event(forward_macos_native_text_drop);
@@ -721,6 +724,14 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::native_speech::set_codex_live_audio_reserved,
             crate::native_speech::commit_speech_text,
             crate::native_speech::paste_text,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::get_windows_speech_capability,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::start_windows_speech_dictation,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::commit_windows_speech_text,
+            #[cfg(target_os = "windows")]
+            crate::native_speech::windows::set_windows_speech_listener_ready,
             crate::ui::commands::list_prompt_files,
             crate::ui::commands::read_text_file,
             crate::ui::commands::capture_screenshot,
@@ -728,6 +739,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_new_windsurf_chat_with_content,
             open_codex_project,
             open_codex_thread,
+            open_new_codex_chat,
             open_new_codex_chat_with_text,
             ack_mcp_request_ready,
             crate::app::desktop_health::mark_desktop_ui_ready,

@@ -7,15 +7,28 @@ import {
   GlobalSpeechSessionGuard,
 } from '../services/globalSpeechSession'
 
+interface WindowsSpeechStatePayload {
+  active: boolean
+  phase: 'idle' | 'listening' | 'processing' | 'success' | 'error'
+  message: string
+}
+
 export function useGlobalSpeechInput() {
   const guard = new GlobalSpeechSessionGuard()
   const currentSnapshot = shallowRef<SpeechSnapshot | null>(null)
-  const phase = computed(() => currentSnapshot.value ? deriveSpeechRenderPhase(currentSnapshot.value) : 'idle')
+  const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
+  const windowsState = shallowRef<WindowsSpeechStatePayload | null>(null)
+  const phase = computed(() => windowsPlatform
+    ? (windowsState.value?.phase ?? 'idle')
+    : (currentSnapshot.value ? deriveSpeechRenderPhase(currentSnapshot.value) : 'idle'))
   const partialText = computed(() => '')
   const finalText = computed(() => '')
-  const statusMessage = computed(() => currentSnapshot.value?.phase.toLowerCase() ?? 'idle')
+  const statusMessage = computed(() => windowsPlatform
+    ? (windowsState.value?.message ?? 'idle')
+    : (currentSnapshot.value?.phase.toLowerCase() ?? 'idle'))
   const errorMessage = computed(() => phase.value === 'error' ? '语音写入失败' : '')
   let unlistenSnapshot: (() => void) | null = null
+  let unlistenWindowsState: (() => void) | null = null
 
   async function acknowledgeAppliedSnapshot(snapshot: SpeechSnapshot) {
     if (!snapshot.identity)
@@ -39,6 +52,12 @@ export function useGlobalSpeechInput() {
   }
 
   async function initialize() {
+    if (windowsPlatform) {
+      unlistenWindowsState = await listen<WindowsSpeechStatePayload>('speech://windows-state', (event) => {
+        windowsState.value = event.payload
+      })
+      return
+    }
     unlistenSnapshot = await listen<SpeechSnapshot>('speech://session-snapshot', event => project(event.payload))
     const snapshot = await invoke<SpeechSnapshot>('get_speech_control_snapshot')
     project(snapshot)
@@ -46,7 +65,9 @@ export function useGlobalSpeechInput() {
 
   function dispose() {
     unlistenSnapshot?.()
+    unlistenWindowsState?.()
     unlistenSnapshot = null
+    unlistenWindowsState = null
   }
 
   return {
