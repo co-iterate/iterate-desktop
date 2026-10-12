@@ -57,6 +57,7 @@ rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "mai
 schemars = "0.8"
 rodio = "0.19"
 reqwest = { version = "0.11", default-features = false, features = [
+  "blocking",
   "stream",
   "json",
   "native-tls-alpn"
@@ -95,6 +96,7 @@ parking_lot = "0.12" # 高效的同步原语，用于 zhi 授权状态追踪
 portable-pty = "0.9.0"
 tempfile = "3.10"
 toml_edit = "0.25" # 保留格式地修改用户的 Codex config.toml
+fs2 = "0.4" # 窗口注册表跨进程文件锁
 openssl = { version = "0.10", features = ["vendored"] }
 native-tls = "0.2"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
@@ -106,6 +108,7 @@ tauri-build = { version = "2.0", features = [] }
 
 [features]
 default = []
+custom-protocol = ["tauri/custom-protocol"]
 legacy-cunzhi-bin = []
 
 # 发布版本优化配置
@@ -122,3 +125,10 @@ core-foundation = "0.10.1"
 core-graphics = { version = "0.25.0", features = ["elcapitan"] }
 objc = "0.2.7"
 security-framework = "3.7"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading"
+] }

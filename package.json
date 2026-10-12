@@ -25,13 +25,14 @@
     "release:parity": "bash ./scripts/iterate-release-parity-check.sh",
     "loop:impact": "node ./scripts/iterate-cross-platform-impact.mjs",
     "smoke:windows-package": "pwsh -NoProfile -File ./scripts/windows-install-smoke.ps1",
+    "smoke:windows-installer": "pwsh -NoProfile -File ./scripts/windows-installer-smoke.ps1",
     "smoke:macos-manifest": "bash ./scripts/macos-manifest-smoke.sh",
     "smoke:macos-manifest:latest": "MANIFEST_URL=https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest bash ./scripts/macos-manifest-smoke.sh",
     "smoke:macos-manifest:latest:urls": "CHECK_URLS=1 MANIFEST_URL=https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest bash ./scripts/macos-manifest-smoke.sh",
     "smoke:macos-manifest:latest:downloads": "CHECK_URLS=1 CHECK_DOWNLOADS=1 HTTP_TIMEOUT_SECS=60 MANIFEST_URL=https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest bash ./scripts/macos-manifest-smoke.sh",
     "smoke:macos-manifest:latest:checksums": "CHECK_URLS=1 CHECK_DOWNLOADS=1 REQUIRE_CHECKSUM_ASSETS=1 HTTP_TIMEOUT_SECS=60 MANIFEST_URL=https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest bash ./scripts/macos-manifest-smoke.sh",
     "test": "pnpm run test:frontend && pnpm run test:scripts && pnpm run test:rust",
-    "test:frontend": "pnpm run test:checkpoint-settings && pnpm run test:popup-header-codex-open && pnpm run test:desktop-codex-live && pnpm run test:popup-selection-quote && pnpm run test:local-markdown-links && pnpm run test:external-markdown-links && pnpm run test:bridge-fetch && pnpm run test:mobile-connection && pnpm run test:mcp-response-speed && pnpm run test:speech-services",
+    "test:frontend": "pnpm run test:checkpoint-settings && pnpm run test:conversation-end && pnpm run test:popup-header-codex-open && pnpm run test:desktop-codex-live && pnpm run test:popup-selection-quote && pnpm run test:local-markdown-links && pnpm run test:external-markdown-links && pnpm run test:bridge-fetch && pnpm run test:mobile-connection && pnpm run test:mcp-response-speed && pnpm run test:speech-services",
     "test:frontend:interactive": "pnpm run test:ui",
     "test:checkpoint-settings": "node --test src/frontend/components/settings/CheckpointSettings.test.ts",
     "test:popup-header-codex-open": "node --test src/frontend/components/popup/PopupHeader.codexProjectOpen.test.ts",
@@ -59,9 +60,12 @@
     "test:ios-speech-context-ranking": "swift scripts/verify-ios-speech-context-ranking.swift",
     "test:ios-ghost-suggestion-learning": "swift scripts/verify-ios-ghost-suggestion-learning.swift",
     "test:ios-relay-fallback": "swift scripts/verify-ios-relay-fallback.swift",
-    "test:rust": "cargo test",
+    "test:rust": "node scripts/run-rust-tests.mjs",
     "test:ui": "cd src/frontend/test && vite",
-    "test:ui:build": "cd src/frontend/test && vite build"
+    "test:ui:build": "cd src/frontend/test && vite build",
+    "test:conversation-end": "node --test src/frontend/utils/conversationEndCommand.test.ts",
+    "test:windows-experience": "node --test scripts/windows-experience-contract.test.mjs",
+    "tauri:build:windows": "pwsh -NoProfile -File ./scripts/build-windows-installer.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0",
@@ -82,6 +86,7 @@
   "devDependencies": {
     "@antfu/eslint-config": "^4.14.1",
     "@iconify-json/carbon": "^1.2.9",
+    "@tauri-apps/cli": "2.10.1",
     "@unocss/preset-attributify": "^66.2.1",
     "@unocss/preset-icons": "^66.2.1",
     "@unocss/preset-typography": "^66.2.1",

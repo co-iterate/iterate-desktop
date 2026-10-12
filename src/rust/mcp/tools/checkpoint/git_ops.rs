@@ -779,6 +779,10 @@ mod tests {
             .expect("git command should run")
     }
 
+    fn normalized_file_content(path: &PathBuf) -> String {
+        fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+    }
+
     #[test]
     fn list_checkpoints_reads_registry_entries() {
         let temp = tempdir().unwrap();
@@ -954,7 +958,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fs::read_to_string(repo.join("demo.txt")).unwrap(), "v2\n");
+        assert_eq!(normalized_file_content(&repo.join("demo.txt")), "v2\n");
     }
 
     #[test]
@@ -1004,7 +1008,7 @@ mod tests {
         assert!(preview.status_snapshot.is_some());
         assert!(preview.plan_expires_at.is_some());
         assert!(preview.safety_checkpoint.is_none());
-        assert_eq!(fs::read_to_string(repo.join("demo.txt")).unwrap(), "v3\n");
+        assert_eq!(normalized_file_content(&repo.join("demo.txt")), "v3\n");
 
         let _ = fs::remove_dir_all(&repo);
     }
@@ -1062,7 +1066,7 @@ mod tests {
             result.unwrap_err(),
             "恢复预览已过期，请重新预览".to_string()
         );
-        assert_eq!(fs::read_to_string(repo.join("demo.txt")).unwrap(), "v4\n");
+        assert_eq!(normalized_file_content(&repo.join("demo.txt")), "v4\n");
 
         let _ = fs::remove_dir_all(&repo);
     }
@@ -1129,7 +1133,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fs::read_to_string(repo.join("demo.txt")).unwrap(), "v1\n");
+        assert_eq!(normalized_file_content(&repo.join("demo.txt")), "v1\n");
 
         let _ = fs::remove_dir_all(&repo);
     }
@@ -1175,7 +1179,7 @@ mod tests {
         assert!(!result.dry_run);
         assert!(result.will_create_safety_checkpoint);
         assert!(result.safety_checkpoint.is_some());
-        assert_eq!(fs::read_to_string(repo.join("demo.txt")).unwrap(), "v2\n");
+        assert_eq!(normalized_file_content(&repo.join("demo.txt")), "v2\n");
 
         let _ = fs::remove_dir_all(&repo);
     }
@@ -1227,7 +1231,7 @@ mod tests {
         .unwrap();
 
         assert!(result.ok);
-        assert_eq!(fs::read_to_string(repo.join("demo.txt")).unwrap(), "v2\n");
+        assert_eq!(normalized_file_content(&repo.join("demo.txt")), "v2\n");
 
         let event_path = repo.join(".cunzhi-memory").join("rollback_events.jsonl");
         let content = fs::read_to_string(event_path).unwrap();

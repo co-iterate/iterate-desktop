@@ -51,6 +51,7 @@ interface Emits {
   openIteratePairing: []
   toggleCodexLive: []
   toggleCodexLiveMute: []
+  closeCurrentDialog: []
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -265,6 +266,10 @@ function handleToggleAlwaysOnTop() {
 
 function handleToggleMute() {
   emit('toggleMute')
+}
+
+function handleCloseCurrentDialog() {
+  emit('closeCurrentDialog')
 }
 
 function handleNewChat() {
@@ -514,6 +519,20 @@ function handleCodexLiveClick() {
             <ThemeIcon :theme="props.currentTheme" class="w-4 h-4" style="color: #111827;" />
           </template>
         </n-button>
+        <n-button
+          size="small"
+          quaternary
+          circle
+          class="close-current-dialog-button"
+          title="结束当前对话（iterate 继续运行）"
+          aria-label="结束当前对话（iterate 继续运行）"
+          data-guide="close-current-dialog"
+          @click="handleCloseCurrentDialog"
+        >
+          <template #icon>
+            <div class="i-carbon-close w-4 h-4" />
+          </template>
+        </n-button>
       </n-space>
     </div>
   </div>
@@ -556,6 +575,16 @@ function handleCodexLiveClick() {
   z-index: 5000;
   overflow: visible;
   isolation: isolate;
+}
+
+.close-current-dialog-button {
+  color: #dc2626;
+}
+
+.close-current-dialog-button:hover,
+.close-current-dialog-button:focus-visible {
+  background: rgba(239, 68, 68, 0.14);
+  color: #ef4444;
 }
 
 .codex-live-button {

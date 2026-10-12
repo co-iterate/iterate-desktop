@@ -301,6 +301,21 @@ export function useMcpHandler() {
   const mcpRequest = ref(null)
   const showMcpPopup = ref(false)
   const isMcpProcess = ref(false)
+  const resolvingRequestIds = new Set<string>()
+
+  function beginRequestResolution(request: any, response?: any): string | null {
+    const key = resolveRequestId(request) ?? resolveRequestId(response) ?? '__unrouted_mcp_request__'
+    if (resolvingRequestIds.has(key)) {
+      console.info('[MCP] 忽略重复响应', { requestId: key })
+      return null
+    }
+    resolvingRequestIds.add(key)
+    return key
+  }
+
+  function finishRequestResolution(key: string) {
+    resolvingRequestIds.delete(key)
+  }
 
   interface ImmediateMcpDismissal {
     request: any
@@ -395,10 +410,14 @@ export function useMcpHandler() {
    */
   async function handleMcpResponse(response: any) {
     const request = mcpRequest.value as any
+    const resolutionKey = beginRequestResolution(request, response)
+    if (!resolutionKey)
+      return
     const projectPath = resolveProjectPath(request)
     const requestId = resolveRequestId(request)
-    const dismissal = await dismissMcpUiImmediately(request)
+    let dismissal: ImmediateMcpDismissal | null = null
     try {
+      dismissal = await dismissMcpUiImmediately(request)
       // 通过Tauri命令发送响应并退出应用
       const timelineRouteId = await resolveConversationRouteIdWithFallback(request, projectPath)
       console.info('[MCP] 发送响应', {
@@ -415,8 +434,35 @@ export function useMcpHandler() {
     }
     catch (error) {
       console.error('MCP响应处理失败:', error)
-      await restoreMcpUiAfterFailure(dismissal)
+      if (dismissal)
+        await restoreMcpUiAfterFailure(dismissal)
     }
+    finally {
+      finishRequestResolution(resolutionKey)
+    }
+  }
+
+  /**
+   * 结束当前 zhi/call_zhi，但保留 iterate 主程序和其他请求。
+   */
+  async function handleMcpCloseCurrentDialog() {
+    const request = mcpRequest.value as any
+    const requestId = resolveRequestId(request)
+    if (!request || !requestId)
+      return
+
+    await handleMcpResponse({
+      user_input: '',
+      selected_options: [],
+      images: [],
+      file_paths: [],
+      image_paths: [],
+      metadata: {
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        source: 'popup_closed',
+      },
+    })
   }
 
   /**
@@ -424,10 +470,14 @@ export function useMcpHandler() {
    */
   async function handleMcpCancel() {
     const request = mcpRequest.value as any
+    const resolutionKey = beginRequestResolution(request)
+    if (!resolutionKey)
+      return
     const projectPath = resolveProjectPath(request)
     const requestId = resolveRequestId(request)
-    const dismissal = await dismissMcpUiImmediately(request)
+    let dismissal: ImmediateMcpDismissal | null = null
     try {
+      dismissal = await dismissMcpUiImmediately(request)
       // 发送取消信息并退出应用
       const timelineRouteId = await resolveConversationRouteIdWithFallback(request, projectPath)
       console.info('[MCP] 发送取消响应', {
@@ -444,7 +494,11 @@ export function useMcpHandler() {
     catch (error) {
       // 静默处理MCP取消错误
       console.error('MCP取消处理失败:', error)
-      await restoreMcpUiAfterFailure(dismissal)
+      if (dismissal)
+        await restoreMcpUiAfterFailure(dismissal)
+    }
+    finally {
+      finishRequestResolution(resolutionKey)
     }
   }
 
@@ -740,6 +794,7 @@ export function useMcpHandler() {
     toggleMute,
     handleMcpResponse,
     handleMcpCancel,
+    handleMcpCloseCurrentDialog,
     handleMcpContinue,
     handleMcpLoopReply,
     handleMcpEnhance,

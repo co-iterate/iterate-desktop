@@ -1,6 +1,12 @@
 pub mod commands;
+pub mod end_command;
 pub mod manager;
 pub mod types;
+
+pub use end_command::{
+    is_explicit_conversation_end, is_explicit_conversation_end_response,
+    is_popup_closed_response_source, EXPLICIT_CONVERSATION_END_SOURCE, POPUP_CLOSED_SOURCE,
+};
 
 pub use manager::ConversationManager;
 pub use types::{

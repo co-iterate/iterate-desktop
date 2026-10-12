@@ -15,6 +15,7 @@ import { GHOST_SUGGESTION_TOKEN_PATTERN, useGhostSuggestions } from '../../compo
 import { useKeyboard } from '../../composables/useKeyboard'
 import { usePromptLibrary } from '../../composables/usePromptLibrary'
 import { SpeechInsertGuard } from '../../services/speechInsertGuard'
+import { isExplicitConversationEndInput } from '../../utils/conversationEndCommand'
 import {
   directUserLearningChunkFromCompositionEvent,
   directUserLearningChunkFromInputEvent,
@@ -343,7 +344,12 @@ function emitUpdate() {
 }
 
 function getFinalUserInput() {
-  const conditionalContent = props.enableContextAppend ? generateConditionalContent() : ''
+  // 结束指令必须保持为完整原文，不能被上下文模板扩展后再交给
+  // Rust 响应边界判断。其他输入仍沿用原有上下文追加行为。
+  const conditionalContent = props.enableContextAppend
+    && !isExplicitConversationEndInput(userInput.value)
+    ? generateConditionalContent()
+    : ''
   return userInput.value + conditionalContent
 }
 
@@ -507,6 +513,13 @@ function handleInputPaste(event: ClipboardEvent) {
   }
 
   const clipboardText = event.clipboardData?.getData('text') ?? ''
+
+  // `/end` starts with a slash but is a conversation command, not a file path.
+  // Let the browser paste it normally; the Rust response boundary decides
+  // whether it ends this interaction.
+  if (isExplicitConversationEndInput(clipboardText))
+    return
+
   const pastedPaths = extractClipboardPaths(clipboardText)
 
   if (pastedPaths.length > 0) {
@@ -819,7 +832,7 @@ function applyCommandSuggestion(index = activeSuggestionIndex.value) {
 }
 
 function handleInputKeydown(event: KeyboardEvent) {
-  if (isComposing.value)
+  if (isComposing.value || event.isComposing || event.keyCode === 229 || event.repeat)
     return
 
   if (!hasCommandSuggestions.value)
@@ -2116,7 +2129,7 @@ defineExpose({
           v-model="userInput"
           class="popup-main-input"
           :class="{ 'popup-main-input--ghosting': shouldShowGhostSuggestion }"
-          :placeholder="hasOptions ? `您可以在这里添加补充说明... (支持粘贴图片/文件/路径 ${pasteShortcut})` : `请输入您的回复... (支持粘贴图片/文件/路径 ${pasteShortcut})`"
+          :placeholder="hasOptions ? `补充说明；输入“结束对话”或 /end 可结束本次交互（支持粘贴 ${pasteShortcut}）` : `请输入回复；输入“结束对话”或 /end 可结束本次交互（支持粘贴 ${pasteShortcut}）`"
           :disabled="submitting"
           rows="3"
           autocomplete="off"

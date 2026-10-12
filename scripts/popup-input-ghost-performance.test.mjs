@@ -7,7 +7,7 @@ import test from 'node:test'
 const popupInputSource = readFileSync(
   new URL('../src/frontend/components/popup/PopupInput.vue', import.meta.url),
   'utf8',
-)
+).replace(/\r\n/g, '\n')
 const popupStylesSource = readFileSync(
   new URL('../src/frontend/assets/styles/style.css', import.meta.url),
   'utf8',

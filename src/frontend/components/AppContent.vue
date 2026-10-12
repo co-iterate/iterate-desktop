@@ -56,6 +56,7 @@ interface Props {
 interface Emits {
   mcpResponse: [response: any]
   mcpCancel: []
+  mcpCloseCurrentDialog: []
   themeChange: [theme: string]
   toggleAlwaysOnTop: []
   toggleMute: []
@@ -390,7 +391,10 @@ async function syncWindowRegistration(projectPath?: string | null, request?: any
     title: resolveRequestMessage(request),
   })
   const window = getCurrentWindow()
-  await window.setTitle(`iterate - ${resolvedProjectPath}`)
+  const title = navigator.platform.toUpperCase().includes('WIN')
+    ? 'iterate'
+    : `iterate - ${resolvedProjectPath}`
+  await window.setTitle(title)
 }
 
 function normalizeRequestId(request: any): string | null {
@@ -1629,6 +1633,7 @@ onUnmounted(async () => {
           @open-iterate-pairing="showIteratePairingModal = true"
           @toggle-codex-live="handleToggleCodexLive"
           @toggle-codex-live-mute="handleToggleCodexLiveMute"
+          @close-current-dialog="$emit('mcpCloseCurrentDialog')"
         />
       </div>
 

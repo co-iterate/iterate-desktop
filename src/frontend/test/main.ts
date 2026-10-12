@@ -508,12 +508,12 @@ if (!window.__TAURI__) {
     if (command === 'get_shortcut_config') {
       return {
         shortcuts: {
-          submit: {
-            id: 'submit',
+          quick_submit: {
+            id: 'quick_submit',
             name: '快速发送',
             description: '提交当前输入',
             action: 'submit',
-            key_combination: { key: 'Enter', ctrl: false, alt: false, shift: false, meta: true },
+            key_combination: { key: 'Enter', ctrl: false, alt: false, shift: true, meta: false },
             enabled: true,
             scope: 'popup',
           },
@@ -522,7 +522,7 @@ if (!window.__TAURI__) {
             name: '目标',
             description: '提交当前输入为目标',
             action: 'enhance',
-            key_combination: { key: 'Enter', ctrl: false, alt: true, shift: false, meta: false },
+            key_combination: { key: 'Enter', ctrl: true, alt: false, shift: true, meta: false },
             enabled: true,
             scope: 'popup',
           },
@@ -531,7 +531,7 @@ if (!window.__TAURI__) {
             name: '继续',
             description: '继续当前任务',
             action: 'continue',
-            key_combination: { key: 'Enter', ctrl: false, alt: false, shift: true, meta: false },
+            key_combination: { key: 'Enter', ctrl: true, alt: false, shift: false, meta: false },
             enabled: true,
             scope: 'popup',
           },

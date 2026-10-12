@@ -148,7 +148,9 @@
     "assets/iterate-desktop-interceptor-zh.png",
     "assets/iterate-mobile-interceptor-zh.png",
     "scripts/windows-runtime-stress.ps1",
-    "scripts/windows-watchdog-smoke.ps1"
+    "scripts/windows-watchdog-smoke.ps1",
+    "resources/windows-test.manifest",
+    "scripts/run-rust-tests.mjs"
   ],
   "excludePrefixes": [
     ".antigravitycli/",

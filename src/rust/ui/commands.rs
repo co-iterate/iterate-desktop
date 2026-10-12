@@ -22,6 +22,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position, State};
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+trait BackgroundCommandExt {
+    fn without_console_window(&mut self) -> &mut Self;
+}
+
+impl BackgroundCommandExt for std::process::Command {
+    fn without_console_window(&mut self) -> &mut Self {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+}
+
 #[cfg(target_os = "macos")]
 static STANDALONE_PREVIOUS_FRONTMOST_APPLICATION: OnceLock<
     std::sync::Mutex<Option<crate::native_speech::target::FrontmostApplication>>,
@@ -2075,7 +2093,10 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
 
     // 根据操作系统选择合适的命令
     let result = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/C", "start", &url]).spawn()
+        Command::new("cmd")
+            .args(["/C", "start", &url])
+            .without_console_window()
+            .spawn()
     } else if cfg!(target_os = "macos") {
         Command::new("open").arg(&url).spawn()
     } else {
@@ -2110,6 +2131,7 @@ pub async fn open_local_path(
     let result = if cfg!(target_os = "windows") {
         Command::new("cmd")
             .args(["/C", "start", "", &resolved_path_string])
+            .without_console_window()
             .spawn()
     } else if cfg!(target_os = "macos") {
         let mut command = Command::new("open");
@@ -3731,11 +3753,13 @@ pub async fn open_in_ide(project_path: String) -> Result<(), String> {
         // Windows: 先尝试 windsurf，再尝试 cursor
         let result = Command::new("cmd")
             .args(["/C", "windsurf", &project_path])
+            .without_console_window()
             .spawn();
 
         if result.is_err() {
             Command::new("cmd")
                 .args(["/C", "cursor", &project_path])
+                .without_console_window()
                 .spawn()
                 .map_err(|e| format!("打开 IDE 失败: {}", e))?;
         }

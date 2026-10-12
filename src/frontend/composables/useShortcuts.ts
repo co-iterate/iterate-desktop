@@ -18,6 +18,23 @@ export function useShortcuts() {
     return false
   })
 
+  let compositionActive = false
+  const handleCompositionStart = () => {
+    compositionActive = true
+  }
+  const handleCompositionEnd = () => {
+    compositionActive = false
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('compositionstart', handleCompositionStart)
+    window.addEventListener('compositionend', handleCompositionEnd)
+    onScopeDispose(() => {
+      window.removeEventListener('compositionstart', handleCompositionStart)
+      window.removeEventListener('compositionend', handleCompositionEnd)
+    })
+  }
+
   // 加载快捷键配置
   async function loadShortcutConfig() {
     try {
@@ -137,11 +154,40 @@ export function useShortcuts() {
       && event.metaKey === shortcutKey.meta
   }
 
+  function fallbackShortcutKey(action: 'submit' | 'enhance' | 'continue'): ShortcutKey {
+    if (isMac.value) {
+      if (action === 'submit')
+        return { key: 'Enter', ctrl: false, alt: false, shift: false, meta: true }
+      if (action === 'enhance')
+        return { key: 'Enter', ctrl: false, alt: true, shift: false, meta: false }
+      return { key: 'Enter', ctrl: false, alt: false, shift: true, meta: false }
+    }
+
+    if (action === 'submit')
+      return { key: 'Enter', ctrl: false, alt: false, shift: true, meta: false }
+    if (action === 'enhance')
+      return { key: 'Enter', ctrl: true, alt: false, shift: true, meta: false }
+    return { key: 'Enter', ctrl: true, alt: false, shift: false, meta: false }
+  }
+
+  function isActiveShortcutContext(): boolean {
+    return typeof document === 'undefined'
+      || (document.visibilityState !== 'hidden' && document.hasFocus())
+  }
+
   function useShortcutKeydown(action: string, callback: () => void) {
     const handleKeydown = (event: KeyboardEvent) => {
       const binding = getShortcutByAction(action)
-      if (!binding?.enabled || !shortcutMatchesEvent(event, binding.key_combination))
+      if (
+        !binding?.enabled
+        || compositionActive
+        || event.isComposing
+        || event.keyCode === 229
+        || !isActiveShortcutContext()
+        || !shortcutMatchesEvent(event, binding.key_combination)
+      ) {
         return
+      }
 
       // Consume the native key event before it reaches WebKit/AppKit. Watching
       // useMagicKeys state can trigger the callback, but cannot prevent the
@@ -149,8 +195,11 @@ export function useShortcuts() {
       event.preventDefault()
       event.stopPropagation()
 
-      if (!event.repeat)
-        callback()
+      if (event.repeat) {
+        return
+      }
+
+      callback()
     }
 
     window.addEventListener('keydown', handleKeydown, true)
@@ -160,28 +209,22 @@ export function useShortcuts() {
   // 获取快速发送快捷键的显示文本
   const quickSubmitShortcutText = computed(() => {
     const binding = getShortcutByAction('submit')
-    if (!binding) {
-      return isMac.value ? '⌘Enter 快速发送' : 'Ctrl+Enter 快速发送'
-    }
-    return `${shortcutKeyToString(binding.key_combination)} ${binding.name}`
+    const key = binding?.key_combination ?? fallbackShortcutKey('submit')
+    return `${shortcutKeyToString(key)} ${binding?.name ?? '快速发送'}`
   })
 
   // 获取增强快捷键的显示文本
   const enhanceShortcutText = computed(() => {
     const binding = getShortcutByAction('enhance')
-    if (!binding) {
-      return isMac.value ? '⌥+回车 增强' : 'Alt+回车 增强'
-    }
-    return `${shortcutKeyToString(binding.key_combination)} 增强`
+    const key = binding?.key_combination ?? fallbackShortcutKey('enhance')
+    return `${shortcutKeyToString(key)} 增强`
   })
 
   // 获取继续快捷键的显示文本
   const continueShortcutText = computed(() => {
     const binding = getShortcutByAction('continue')
-    if (!binding) {
-      return isMac.value ? '⇧+回车 继续' : 'Shift+回车 继续'
-    }
-    return `${shortcutKeyToString(binding.key_combination)} ${binding.name}`
+    const key = binding?.key_combination ?? fallbackShortcutKey('continue')
+    return `${shortcutKeyToString(key)} ${binding?.name ?? '继续'}`
   })
 
   // 监听快速发送快捷键

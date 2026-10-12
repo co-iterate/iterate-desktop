@@ -1,5 +1,7 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -20,6 +22,9 @@ static BROWSER_PHONE_NOTIFY_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .build()
         .expect("browser phone notification client should build")
 });
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn is_closing_text(text: &str) -> bool {
     let t = text.to_lowercase();
@@ -410,6 +415,7 @@ pub async fn open_browser_url(url: String) -> Result<(), String> {
     {
         std::process::Command::new("cmd")
             .args(["/C", "start", &url])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("打开 URL 失败: {}", e))?;
     }
@@ -471,6 +477,7 @@ fn open_file_in_default_browser(path: &std::path::Path) -> Result<(), String> {
     {
         std::process::Command::new("cmd")
             .args(["/C", "start", "", &path.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("打开 HTML Artifact 失败: {}", e))?;
     }

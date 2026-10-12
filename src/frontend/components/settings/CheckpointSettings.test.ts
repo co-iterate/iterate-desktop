@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 
-const source = await readFile(new URL('./CheckpointSettings.vue', import.meta.url), 'utf8')
+const source = (await readFile(new URL('./CheckpointSettings.vue', import.meta.url), 'utf8'))
+  .replace(/\r\n/g, '\n')
 
 describe('CheckpointSettings auto checkpoint switch', () => {
   it('keeps the switch busy until initial config has loaded', () => {

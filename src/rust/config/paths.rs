@@ -37,6 +37,52 @@ fn resolve_iterate_bridge_state_dir(
         .unwrap_or_else(|| PathBuf::from("iterate"))
 }
 
+/// 测试里修改 HOME / XDG_CONFIG_HOME / ITERATE_CONFIG_DIR，或读取默认配置目录（如正式路线）的
+/// 测试都要先拿这把锁；各模块各用一把锁时，并发测试会互相切换配置目录。
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_config_env_for_test() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 测试专用：持有配置目录锁，并把 ITERATE_CONFIG_DIR 指到临时目录，结束时恢复。
+/// 用于不应读写真实用户配置（如正式路线）的测试。
+#[cfg(test)]
+pub(crate) struct TempConfigDirForTest {
+    previous: Option<OsString>,
+    _dir: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TempConfigDirForTest {
+    pub(crate) fn new() -> Self {
+        let lock = lock_config_env_for_test();
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let previous = std::env::var_os(ITERATE_CONFIG_DIR_ENV);
+        std::env::set_var(ITERATE_CONFIG_DIR_ENV, dir.path());
+        Self {
+            previous,
+            _dir: dir,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempConfigDirForTest {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => std::env::set_var(ITERATE_CONFIG_DIR_ENV, previous),
+            None => std::env::remove_var(ITERATE_CONFIG_DIR_ENV),
+        }
+    }
+}
+
 pub fn cunzhi_config_dir() -> Result<PathBuf> {
     let config_dir = resolve_cunzhi_config_dir(
         || std::env::var_os(ITERATE_CONFIG_DIR_ENV),
