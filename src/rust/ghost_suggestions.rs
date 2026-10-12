@@ -538,13 +538,9 @@ fn store_to_value(store: &GhostSuggestionStore) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use serde_json::json;
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static HOME_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     struct HomeGuard {
         previous: Option<OsString>,
@@ -575,7 +571,7 @@ mod tests {
     }
 
     fn with_temp_home<T>(test: impl FnOnce() -> T) -> T {
-        let _lock = HOME_ENV_LOCK.lock().expect("HOME env lock");
+        let _lock = crate::config::paths::lock_config_env_for_test();
         let _guard = HomeGuard::new();
         test()
     }

@@ -63,6 +63,7 @@ export function useAppManager() {
     mcp: {
       handleResponse: mcpHandler.handleMcpResponse,
       handleCancel: mcpHandler.handleMcpCancel,
+      handleCloseCurrentDialog: mcpHandler.handleMcpCloseCurrentDialog,
       handleMcpContinue: mcpHandler.handleMcpContinue,
       handleMcpLoopReply: mcpHandler.handleMcpLoopReply,
       handleMcpEnhance: mcpHandler.handleMcpEnhance,

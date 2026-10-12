@@ -444,13 +444,18 @@ mod tests {
 
     struct ConfigGuard {
         previous: Option<String>,
+        _config_env: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ConfigGuard {
         fn set(path: &std::path::Path) -> Self {
+            let config_env = crate::config::paths::lock_config_env_for_test();
             let previous = std::env::var("ITERATE_CONFIG_DIR").ok();
             std::env::set_var("ITERATE_CONFIG_DIR", path);
-            Self { previous }
+            Self {
+                previous,
+                _config_env: config_env,
+            }
         }
     }
 

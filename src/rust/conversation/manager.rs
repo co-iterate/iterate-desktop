@@ -304,6 +304,7 @@ impl ConversationManager {
                     .map_err(|error| format!("同步时间线附件失败: {}", error))?;
                 std::fs::rename(&tmp_path, &attachment_path)
                     .map_err(|error| format!("原子替换时间线附件失败: {}", error))?;
+                #[cfg(unix)]
                 File::open(&attachments_dir)
                     .and_then(|directory| directory.sync_all())
                     .map_err(|error| format!("同步时间线附件目录失败: {}", error))?;
@@ -509,9 +510,12 @@ impl ConversationManager {
             std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| format!("设置时间线备份权限失败: {}", error))?;
         }
-        File::open(&backup_path)
+        OpenOptions::new()
+            .write(true)
+            .open(&backup_path)
             .and_then(|file| file.sync_all())
             .map_err(|error| format!("同步时间线备份失败: {}", error))?;
+        #[cfg(unix)]
         if let Some(parent) = backup_path.parent() {
             File::open(parent)
                 .and_then(|directory| directory.sync_all())
@@ -888,6 +892,7 @@ impl ConversationManager {
                 .map_err(|error| format!("同步时间线临时文件失败: {}", error))?;
             std::fs::rename(&tmp_path, state_path)
                 .map_err(|error| format!("原子替换时间线状态失败: {}", error))?;
+            #[cfg(unix)]
             if let Some(parent) = state_path.parent() {
                 File::open(parent)
                     .and_then(|directory| directory.sync_all())

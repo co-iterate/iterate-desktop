@@ -197,6 +197,8 @@ mod pairing_session_state_tests {
 
     #[tokio::test]
     async fn stopping_quick_tunnel_expires_only_bound_unclaimed_grants() {
+        // 隔离配置目录：不读真实用户配置（正式路线可能被正在运行的应用改写），并与改配置目录的测试互斥
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
         let now = chrono::Utc::now();
@@ -286,6 +288,8 @@ mod pairing_session_state_tests {
 
     #[tokio::test]
     async fn android_pairing_preserves_client_identity_and_mobile_scopes() {
+        // 隔离配置目录：不读真实用户配置（正式路线可能被正在运行的应用改写），并与改配置目录的测试互斥
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
         let payload = build_mobile_pairing_payload(8080, false)
@@ -332,6 +336,8 @@ mod pairing_session_state_tests {
 
     #[tokio::test]
     async fn issued_pairing_session_moves_from_pending_to_claimed() {
+        // 隔离配置目录：不读真实用户配置（正式路线可能被正在运行的应用改写），并与改配置目录的测试互斥
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
 
@@ -369,6 +375,8 @@ mod pairing_session_state_tests {
 
     #[tokio::test]
     async fn replacement_issue_keeps_previous_unclaimed_qr_valid() {
+        // 隔离配置目录：不读真实用户配置（正式路线可能被正在运行的应用改写），并与改配置目录的测试互斥
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
 
@@ -402,6 +410,8 @@ mod pairing_session_state_tests {
 
     #[tokio::test]
     async fn claimed_pairing_token_is_idempotent_only_for_same_device() {
+        // 隔离配置目录：不读真实用户配置（正式路线可能被正在运行的应用改写），并与改配置目录的测试互斥
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
 
@@ -450,6 +460,8 @@ mod pairing_session_state_tests {
 
     #[tokio::test]
     async fn only_authenticated_matching_ios_socket_completes_pairing() {
+        // 隔离配置目录：不读真实用户配置（正式路线可能被正在运行的应用改写），并与改配置目录的测试互斥
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _guard = TEST_LOCK.lock().await;
         reset_state().await;
 
@@ -1742,6 +1754,7 @@ fn atomic_write_private_file(path: &FilePath, content: &[u8]) -> Result<(), Stri
             .map_err(|err| format!("同步设备授权临时文件失败: {}", err))?;
         std::fs::rename(&temp_path, path)
             .map_err(|err| format!("原子替换设备授权失败: {}", err))?;
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             File::open(parent)
                 .and_then(|directory| directory.sync_all())
@@ -15942,6 +15955,7 @@ mod tests {
         clear_room_submit_outcome_cache_for_tests();
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bridge_publish_room_submit_rejects_stale_window_request() {
         let _room_guard = ROOM_SUBMIT_TEST_LOCK.lock().await;
@@ -15989,6 +16003,7 @@ mod tests {
         clear_room_submit_outcome_cache_for_tests();
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bridge_publish_mcp_state_rejects_stale_window_request_without_side_effects() {
         let _route_guard = ROUTE_DEBUG_TEST_LOCK.lock().await;
@@ -16039,6 +16054,7 @@ mod tests {
         clear_mcp_state_route_for_test(&new_request_id, &project_path).await;
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn native_delivery_caches_and_broadcasts_core_request_without_frontend_or_apns() {
         let _guard = ROUTE_DEBUG_TEST_LOCK.lock().await;
@@ -18859,6 +18875,7 @@ mod tests {
     #[test]
     fn fallback_pairing_candidates_return_public_and_loopback_candidates() {
         let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
+        let _config_env = crate::config::paths::lock_config_env_for_test();
         let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
         // 用显式覆盖值，避免依赖本机真实配置（并行测试会临时替换配置路径，导致偶发失败）。
         let _env = EnvGuard::set("ITERATE_PUBLIC_BRIDGE_BASE_URL", "https://public.example.test");
@@ -18883,6 +18900,7 @@ mod tests {
     fn fallback_pairing_candidates_convert_http_public_override_to_ws_url() {
         // 公网入口自 2026-08 起只接受 https（normalize_public_origin）；https 覆盖值应换成 wss。
         let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
+        let _config_env = crate::config::paths::lock_config_env_for_test();
         let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
         let _env = EnvGuard::set(
             "ITERATE_PUBLIC_BRIDGE_BASE_URL",
@@ -18904,6 +18922,7 @@ mod tests {
     #[test]
     fn fallback_pairing_candidates_reject_plain_http_public_override() {
         let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
+        let _config_env = crate::config::paths::lock_config_env_for_test();
         let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
         let _env = EnvGuard::set(
             "ITERATE_PUBLIC_BRIDGE_BASE_URL",
@@ -19151,7 +19170,12 @@ mod tests {
         std::fs::write(&file_path, b"test image").expect("write test image");
         clear_markdown_image_registry_for_tests();
 
-        let message = format!("![截图]({})", file_path.to_string_lossy());
+        let encoded_path = percent_encoding::utf8_percent_encode(
+            &file_path.to_string_lossy(),
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string();
+        let message = format!("![截图](/image?path={encoded_path})");
         let rewritten = rewrite_markdown_local_images(&message).expect("image should rewrite");
         let image_id = rewritten
             .split("/image?id=")
@@ -20564,7 +20588,13 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
             vec![home.canonicalize().unwrap().display().to_string()]
         );
         assert_eq!(
-            normalize_file_browser_roots(&["/".to_string()]),
+            normalize_file_browser_roots(&[directory
+                .path()
+                .ancestors()
+                .last()
+                .expect("filesystem root")
+                .display()
+                .to_string(),]),
             Err("filesystem_root_not_allowed")
         );
         assert_eq!(
@@ -20648,6 +20678,7 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
         assert!(store.devices[0].file_browser_roots.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn paired_device_store_concurrent_updates_preserve_both_devices() {
         let directory = tempfile::tempdir().expect("temporary paired-device directory");

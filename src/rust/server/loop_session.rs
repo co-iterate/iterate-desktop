@@ -257,7 +257,11 @@ pub fn is_loop_start_source(source: &str) -> bool {
 }
 
 pub fn is_loop_stop_source(source: &str) -> bool {
-    matches!(source.trim(), "popup_loop_stop" | "web_bridge_loop_stop")
+    matches!(
+        source.trim(),
+        // 显式结束指令与“结束当前对话”（popup_closed）都终止循环，规则一致
+        "popup_loop_stop" | "web_bridge_loop_stop" | "explicit_conversation_end" | "popup_closed"
+    )
 }
 
 pub fn is_completed_message(message: &str) -> bool {
@@ -319,6 +323,18 @@ pub fn needs_user_attention_from_message(message: &str, has_options: bool) -> bo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conversation_end_sources_stop_the_loop() {
+        for source in [
+            "explicit_conversation_end",
+            "popup_closed",
+            " popup_loop_stop ",
+        ] {
+            assert!(super::is_loop_stop_source(source), "{source}");
+        }
+        assert!(!super::is_loop_stop_source("popup"));
+    }
+
     use super::*;
 
     #[test]
@@ -337,6 +353,7 @@ mod tests {
     fn loop_stop_source_accepts_popup_and_web_bridge() {
         assert!(is_loop_stop_source("popup_loop_stop"));
         assert!(is_loop_stop_source("web_bridge_loop_stop"));
+        assert!(is_loop_stop_source("explicit_conversation_end"));
         assert!(!is_loop_stop_source("loop_auto_continue"));
     }
 

@@ -546,17 +546,24 @@ mod tests {
     struct ConfigEnvGuard {
         previous_home: Option<OsString>,
         previous_xdg_config_home: Option<OsString>,
+        previous_iterate_config_dir: Option<OsString>,
+        _config_env: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ConfigEnvGuard {
         fn set(home: &Path) -> Self {
+            let config_env = crate::config::paths::lock_config_env_for_test();
             let previous_home = std::env::var_os("HOME");
             let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            let previous_iterate_config_dir = std::env::var_os("ITERATE_CONFIG_DIR");
             std::env::set_var("HOME", home);
             std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            std::env::set_var("ITERATE_CONFIG_DIR", home.join(".config/cunzhi"));
             Self {
                 previous_home,
                 previous_xdg_config_home,
+                previous_iterate_config_dir,
+                _config_env: config_env,
             }
         }
     }
@@ -573,6 +580,12 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", previous);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
+            }
+
+            if let Some(previous) = self.previous_iterate_config_dir.take() {
+                std::env::set_var("ITERATE_CONFIG_DIR", previous);
+            } else {
+                std::env::remove_var("ITERATE_CONFIG_DIR");
             }
         }
     }
@@ -859,9 +872,7 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap();
-        let _config_lock = checkpoint::STANDALONE_CONFIG_ENV_LOCK
-            .lock()
-            .expect("standalone config env lock should not be poisoned");
+        // 配置目录锁由下面的 ConfigEnvGuard 持有（同一把锁，不能重复获取）
         let temp = tempdir().unwrap();
         let project = temp.path().join("git-proj");
         fs::create_dir_all(&project).unwrap();

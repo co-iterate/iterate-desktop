@@ -37,15 +37,8 @@ try {
   if (-not $SkipTests) {
     corepack pnpm run lint:check
     if ($LASTEXITCODE -ne 0) { throw "Frontend lint failed" }
-    # Full Tauri lib tests currently fail before main on Windows with
-    # STATUS_ENTRYPOINT_NOT_FOUND (tauri-apps/tauri#13419). Type-check the
-    # Windows production graph, then execute the isolated registry suite. The
-    # repository also contains macOS-only integration tests that cannot be
-    # type-checked on Windows.
-    cargo check --lib --bins
-    if ($LASTEXITCODE -ne 0) { throw "Rust Windows production graph check failed" }
-    cargo test --test windows_window_registry
-    if ($LASTEXITCODE -ne 0) { throw "Windows registry Rust tests failed" }
+    corepack pnpm run test:rust
+    if ($LASTEXITCODE -ne 0) { throw "Rust test suite failed" }
     corepack pnpm run test:windows-experience
     if ($LASTEXITCODE -ne 0) { throw "Windows experience contract tests failed" }
   }

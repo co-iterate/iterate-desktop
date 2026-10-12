@@ -1,4 +1,6 @@
 use crate::log_important;
+#[cfg(target_os = "windows")]
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,7 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct WindowInstance {
     pub pid: u32,
     pub project_path: String,
@@ -23,7 +25,7 @@ pub struct WindowInstance {
     pub request_title: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct WindowRegistry {
     pub instances: Vec<WindowInstance>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -105,7 +107,7 @@ impl WindowRegistry {
 
     pub fn unregister(&mut self) -> Result<(), String> {
         let pid = process::id();
-        *self = update_registry_at_path(&Self::registry_path(), |registry| {
+        *self = update_registry_at_path(&Self::registry_path(), false, |registry| {
             registry.instances.retain(|instance| instance.pid != pid);
             registry.last_focused_at_by_pid.remove(&pid);
         })?;
@@ -131,7 +133,7 @@ impl WindowRegistry {
 
     pub fn clear_request_binding(&mut self) -> Result<(), String> {
         let pid = process::id();
-        *self = update_registry_at_path(&Self::registry_path(), |registry| {
+        *self = update_registry_at_path(&Self::registry_path(), false, |registry| {
             if let Some(instance) = registry
                 .instances
                 .iter_mut()
@@ -150,7 +152,7 @@ impl WindowRegistry {
     }
 
     fn get_all_instances_at_path(&mut self, path: &Path) -> Vec<WindowInstance> {
-        match update_registry_at_path(path, |_| {}) {
+        match update_registry_at_path(path, true, |_| {}) {
             Ok(registry) => *self = registry,
             Err(error) => log_important!(warn, "读取窗口注册表失败: {}", error),
         }
@@ -220,8 +222,11 @@ fn save_registry_atomically(path: &Path, registry: &WindowRegistry) -> Result<()
 
 fn update_registry_at_path(
     path: &Path,
+    cleanup_stale: bool,
     mutate: impl FnOnce(&mut WindowRegistry),
 ) -> Result<WindowRegistry, String> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = cleanup_stale;
     let lock_path = path.with_extension("json.lock");
     let lock_file = OpenOptions::new()
         .read(true)
@@ -230,6 +235,10 @@ fn update_registry_at_path(
         .open(&lock_path)
         .map_err(|error| format!("打开窗口注册表锁失败: {}", error))?;
 
+    #[cfg(target_os = "windows")]
+    lock_file
+        .lock_exclusive()
+        .map_err(|error| format!("锁定窗口注册表失败: {}", error))?;
     #[cfg(unix)]
     if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(format!(
@@ -239,10 +248,26 @@ fn update_registry_at_path(
     }
 
     let mut registry = load_registry_from_path(path);
+    #[cfg(target_os = "windows")]
+    let original = registry.clone();
+    #[cfg(target_os = "windows")]
+    if cleanup_stale {
+        registry.cleanup_stale_instances();
+    }
+    #[cfg(not(target_os = "windows"))]
     registry.cleanup_stale_instances();
     mutate(&mut registry);
+    #[cfg(target_os = "windows")]
+    let save_result = if registry == original {
+        Ok(())
+    } else {
+        save_registry_atomically(path, &registry)
+    };
+    #[cfg(not(target_os = "windows"))]
     let save_result = save_registry_atomically(path, &registry);
 
+    #[cfg(target_os = "windows")]
+    let _ = FileExt::unlock(&lock_file);
     #[cfg(unix)]
     let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
 
@@ -282,7 +307,7 @@ fn register_instance_at_path(
     let request_id = normalize_optional_trimmed(request_id);
     let request_title =
         normalize_optional_trimmed(request_title).map(|title| truncate_request_title(&title));
-    update_registry_at_path(path, move |registry| {
+    update_registry_at_path(path, true, move |registry| {
         if let Some(instance) = registry
             .instances
             .iter_mut()
@@ -313,7 +338,7 @@ fn mark_instance_focused_at_path(
     focused_at: String,
 ) -> Result<(WindowRegistry, bool), String> {
     let mut updated = false;
-    let registry = update_registry_at_path(path, |registry| {
+    let registry = update_registry_at_path(path, false, |registry| {
         if registry
             .instances
             .iter()
@@ -383,12 +408,24 @@ fn is_process_running(pid: u32) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid)])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+
+            let mut exit_code = 0u32;
+            let running = GetExitCodeProcess(handle, &mut exit_code) != 0
+                && exit_code == STILL_ACTIVE_EXIT_CODE;
+            let _ = CloseHandle(handle);
+            running
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -680,7 +717,7 @@ mod tests {
         let _config_guard = EnvGuard::remove("ITERATE_CONFIG_DIR");
 
         let normalized = normalize_project_path("Unknown", 42);
-        assert!(normalized.starts_with('/') || normalized == "Unknown:pid-42");
+        assert!(std::path::Path::new(&normalized).is_absolute() || normalized == "Unknown:pid-42");
     }
 
     #[test]
@@ -850,10 +887,16 @@ mod tests {
     fn locked_registrations_preserve_other_live_processes() {
         let temp_dir = tempfile::tempdir().expect("temp registry directory");
         let registry_path = std::sync::Arc::new(temp_dir.path().join("iterate_windows.json"));
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .expect("spawn second live popup process");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "window_registry::tests::window_registry_sleep_helper",
+        ])
+        .spawn()
+        .expect("spawn second live popup process");
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let first_path = std::sync::Arc::clone(&registry_path);
@@ -907,5 +950,11 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(paths, vec!["/tmp/project-a", "/tmp/project-b"]);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the cross-process registry test"]
+    fn window_registry_sleep_helper() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }

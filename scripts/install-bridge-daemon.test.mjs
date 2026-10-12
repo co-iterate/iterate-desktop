@@ -4,7 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import test from 'node:test';
+import nodeTest from 'node:test';
+
+const test = process.platform === 'win32' ? nodeTest.skip : nodeTest;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');

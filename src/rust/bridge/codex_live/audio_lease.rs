@@ -46,11 +46,12 @@ fn try_acquire_at(_path: &Path) -> Result<Option<AudioLeaseGuard>, String> {
     Err("当前系统不支持 Codex GPT-Live 跨进程音频锁".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
     #[test]
     fn lease_is_exclusive_until_guard_drops() {
         let dir = tempdir().unwrap();

@@ -745,6 +745,15 @@ pub fn handle_early_cli_args() -> bool {
 pub fn handle_cli_args() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // A no-argument launch is the only Windows entry point allowed to clear the
+    // manual-stop marker.  Keep the guard here as well as in mcp-server so an
+    // older host process cannot bypass the marker by spawning a newer iterate
+    // executable directly.
+    #[cfg(target_os = "windows")]
+    if blocks_manual_stop_cli_mode(&args) && crate::app::windows_lifecycle::is_manually_stopped() {
+        anyhow::bail!(crate::app::windows_lifecycle::MANUALLY_STOPPED_MESSAGE);
+    }
+
     if args
         .get(1)
         .is_some_and(|arg| arg == "--bridge-room-submit-token")
@@ -889,6 +898,16 @@ pub fn handle_cli_args() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn blocks_manual_stop_cli_mode(args: &[String]) -> bool {
+    args.iter().skip(1).any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--ui" | "--show-main-window" | "--serve" | "--bridge-only" | "--mcp-request"
+        )
+    })
 }
 
 fn required_option(options: &HashMap<String, String>, key: &str) -> Result<String> {
@@ -1203,8 +1222,15 @@ fn handle_mcp_request(request_file: &str) -> Result<()> {
 
 /// 处理 --serve 模式（HTTP 服务器模式）
 fn handle_serve_mode(port: u16, workspace: Option<String>) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if crate::app::windows_lifecycle::is_manually_stopped() {
+        anyhow::bail!(crate::app::windows_lifecycle::MANUALLY_STOPPED_MESSAGE);
+    }
+
     // 禁用日志输出到终端（--serve 模式下静默运行）
     log::set_max_level(log::LevelFilter::Off);
+    let _instance_guard =
+        crate::app::windows_lifecycle::register_current_instance("serve", Some(port))?;
 
     instance_debug_log(
         "[serve-mode-start]",
@@ -1318,6 +1344,9 @@ fn handle_serve_mode(port: u16, workspace: Option<String>) -> Result<()> {
         println!("Server ready! Listening on http://127.0.0.1:{}", port);
         println!("Use: python3 cunzhi.py {} --message \"Your message\"", port);
 
+        let shutdown_wait = crate::app::windows_lifecycle::wait_for_global_shutdown();
+        tokio::pin!(shutdown_wait);
+
         // 处理请求队列
         // 非首选端口的 serve 空闲太久就自行退出，避免同项目 busy 时开出的实例常驻（P-2026-9340）。
         let idle_exit_after = serve_idle_exit_after(port);
@@ -1373,6 +1402,13 @@ fn handle_serve_mode(port: u16, workspace: Option<String>) -> Result<()> {
                     println!("\nShutting down server...");
                     break;
                 }
+                _ = &mut shutdown_wait => {
+                    instance_debug_log(
+                        "[serve-global-shutdown]",
+                        format!("port={}, workspace={:?}", port, workspace),
+                    );
+                    break;
+                }
             }
         }
 
@@ -1392,7 +1428,14 @@ fn handle_serve_mode(port: u16, workspace: Option<String>) -> Result<()> {
 
 /// 处理 --bridge-only 模式（无 GUI 的 mobile bridge origin）
 fn handle_bridge_only_mode(port: u16) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if crate::app::windows_lifecycle::is_manually_stopped() {
+        anyhow::bail!(crate::app::windows_lifecycle::MANUALLY_STOPPED_MESSAGE);
+    }
+
     log::set_max_level(log::LevelFilter::Off);
+    let _instance_guard =
+        crate::app::windows_lifecycle::register_current_instance("bridge-only", Some(port))?;
     instance_debug_log(
         "[bridge-only-mode-start]",
         format!(
@@ -1406,8 +1449,14 @@ fn handle_bridge_only_mode(port: u16) -> Result<()> {
     eprintln!("Starting iterate bridge-only daemon on port {}...", port);
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move { crate::bridge::start_bridge_daemon(port).await })
-        .map_err(|err| anyhow::anyhow!("{}", err))?;
+    rt.block_on(async move {
+        tokio::select! {
+            result = crate::bridge::start_bridge_daemon(port) => {
+                result.map_err(|error| anyhow::anyhow!("{}", error))
+            }
+            _ = crate::app::windows_lifecycle::wait_for_global_shutdown() => Ok(()),
+        }
+    })?;
     Ok(())
 }
 
@@ -1446,7 +1495,7 @@ fn clean_dialog_dismissal_response(
 ) -> Option<DialogResponse> {
     (popup_ready && !response_present && child_exited_successfully).then(|| DialogResponse {
         keep_going: false,
-        response_source: "popup_closed".to_string(),
+        response_source: crate::conversation::POPUP_CLOSED_SOURCE.to_string(),
         error: None,
         ..Default::default()
     })
@@ -1812,23 +1861,13 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                         cleanup_temp_files();
                         emit_interaction_phase(request, InteractionPhase::Cleaning, &request_id);
 
-                        // 处理图片：将 base64 图片保存为文件
-                        let image_paths = if let Some(images) =
-                            response.get("images").and_then(|v| v.as_array())
-                        {
-                            save_images_to_files(images)
-                        } else {
-                            vec![]
-                        };
-
-                        let response_source = response
-                            .get("metadata")
-                            .and_then(|v| v.get("source"))
+                        let raw_user_input = response
+                            .get("user_input")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let file_paths: Vec<String> = response
-                            .get("file_paths")
+                        let submitted_options: Vec<String> = response
+                            .get("selected_options")
                             .and_then(|v| v.as_array())
                             .map(|arr| {
                                 arr.iter()
@@ -1836,38 +1875,80 @@ async fn handle_dialog_request(request: &DialogRequest) -> DialogResponse {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let metadata = response
+                        let submitted_source = response
                             .get("metadata")
-                            .cloned()
-                            .and_then(|value| {
-                                serde_json::from_value::<crate::mcp::ResponseMetadata>(value).ok()
-                            })
-                            .unwrap_or_default();
-                        let user_input = response
-                            .get("user_input")
+                            .and_then(|v| v.get("source"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let user_input = enrich_goal_user_input_with_attachment_paths(
-                            user_input,
-                            &response_source,
-                            &file_paths,
-                            &image_paths,
-                        );
+                        let explicit_end =
+                            crate::conversation::is_explicit_conversation_end_response(
+                                &raw_user_input,
+                                &submitted_options,
+                            );
+                        let popup_closed =
+                            crate::conversation::is_popup_closed_response_source(
+                                &submitted_source,
+                            );
+                        let interaction_ended = explicit_end || popup_closed;
 
-                        return DialogResponse {
-                            keep_going: true,
-                            user_input,
-                            response_source,
-                            selected_options: response
-                                .get("selected_options")
+                        // 结束当前交互时不携带选项或附件进入业务响应。
+                        let image_paths = if interaction_ended {
+                            vec![]
+                        } else if let Some(images) =
+                            response.get("images").and_then(|v| v.as_array())
+                        {
+                            save_images_to_files(images)
+                        } else {
+                            vec![]
+                        };
+
+                        let response_source = if explicit_end {
+                            crate::conversation::EXPLICIT_CONVERSATION_END_SOURCE.to_string()
+                        } else if popup_closed {
+                            crate::conversation::POPUP_CLOSED_SOURCE.to_string()
+                        } else {
+                            submitted_source
+                        };
+                        let file_paths: Vec<String> = if interaction_ended {
+                            vec![]
+                        } else {
+                            response
+                                .get("file_paths")
                                 .and_then(|v| v.as_array())
                                 .map(|arr| {
                                     arr.iter()
                                         .filter_map(|v| v.as_str().map(String::from))
                                         .collect()
                                 })
-                                .unwrap_or_default(),
+                                .unwrap_or_default()
+                        };
+                        let mut metadata = response
+                            .get("metadata")
+                            .cloned()
+                            .and_then(|value| {
+                                serde_json::from_value::<crate::mcp::ResponseMetadata>(value).ok()
+                            })
+                            .unwrap_or_default();
+                        if interaction_ended {
+                            metadata.source = Some(response_source.clone());
+                        }
+                        let user_input = enrich_goal_user_input_with_attachment_paths(
+                            raw_user_input,
+                            &response_source,
+                            &file_paths,
+                            &image_paths,
+                        );
+
+                        return DialogResponse {
+                            keep_going: !interaction_ended,
+                            user_input,
+                            response_source,
+                            selected_options: if interaction_ended {
+                                vec![]
+                            } else {
+                                submitted_options
+                            },
                             file_paths,
                             image_paths,
                             metadata,
@@ -2501,13 +2582,41 @@ mod tests {
 
     use std::fs::File;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn manual_stop_blocks_only_ui_and_owned_background_entry_points() {
+        for blocked in [
+            "--ui",
+            "--show-main-window",
+            "--serve",
+            "--bridge-only",
+            "--mcp-request",
+        ] {
+            assert!(blocks_manual_stop_cli_mode(&[
+                "iterate.exe".to_string(),
+                blocked.to_string(),
+            ]));
+        }
+
+        for allowed in ["--help", "--version", "--check-frontend-assets"] {
+            assert!(!blocks_manual_stop_cli_mode(&[
+                "iterate.exe".to_string(),
+                allowed.to_string(),
+            ]));
+        }
+        assert!(!blocks_manual_stop_cli_mode(&["iterate.exe".to_string()]));
+    }
+
     #[test]
     fn clean_dialog_dismissal_returns_false_without_an_error() {
         let response = clean_dialog_dismissal_response(true, false, true)
             .expect("ready popup with a clean exit and no response should be a dismissal");
 
         assert!(!response.keep_going);
-        assert_eq!(response.response_source, "popup_closed");
+        assert_eq!(
+            response.response_source,
+            crate::conversation::POPUP_CLOSED_SOURCE
+        );
         assert!(response.error.is_none());
     }
 

@@ -46,8 +46,6 @@ struct MonitorEntry {
 static AUTO_CHECKPOINT_MONITOR: Lazy<Mutex<HashMap<String, MonitorEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static AUTO_CHECKPOINT_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-pub(crate) static STANDALONE_CONFIG_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn monitor_poll_interval() -> Duration {
     std::env::var("ITERATE_CHECKPOINT_MONITOR_POLL_MS")
@@ -247,9 +245,7 @@ pub fn maybe_auto_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        filter_monitor_relevant_status, maybe_auto_checkpoint, STANDALONE_CONFIG_ENV_LOCK,
-    };
+    use super::{filter_monitor_relevant_status, maybe_auto_checkpoint};
     use crate::config::{save_standalone_config, AppConfig};
     use std::ffi::OsString;
     use std::fs;
@@ -259,6 +255,7 @@ mod tests {
     struct EnvRestore {
         home: Option<OsString>,
         xdg_config_home: Option<OsString>,
+        iterate_config_dir: Option<OsString>,
     }
 
     impl EnvRestore {
@@ -266,6 +263,7 @@ mod tests {
             Self {
                 home: std::env::var_os("HOME"),
                 xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+                iterate_config_dir: std::env::var_os("ITERATE_CONFIG_DIR"),
             }
         }
     }
@@ -282,6 +280,12 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", xdg_config_home);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
+            }
+
+            if let Some(iterate_config_dir) = self.iterate_config_dir.as_ref() {
+                std::env::set_var("ITERATE_CONFIG_DIR", iterate_config_dir);
+            } else {
+                std::env::remove_var("ITERATE_CONFIG_DIR");
             }
         }
     }
@@ -320,9 +324,7 @@ mod tests {
 
     #[test]
     fn maybe_auto_checkpoint_respects_standalone_config_switch_in_temp_repo() {
-        let _guard = STANDALONE_CONFIG_ENV_LOCK
-            .lock()
-            .expect("standalone config env lock should not be poisoned");
+        let _guard = crate::config::paths::lock_config_env_for_test();
         let _restore = EnvRestore::capture();
 
         let root = std::env::temp_dir().join(format!(
@@ -338,6 +340,7 @@ mod tests {
         fs::create_dir_all(&repo).expect("temp repo should exist");
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("ITERATE_CONFIG_DIR", home.join(".config/cunzhi"));
 
         let mut config = AppConfig::default();
         config.checkpoint_config.auto_checkpoint_enabled = false;

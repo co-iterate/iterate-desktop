@@ -13,6 +13,11 @@ pub fn run() {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    cunzhi::app::windows_lifecycle::activate_manual_launch_if_requested(
+        &std::env::args().collect::<Vec<_>>(),
+    )?;
+
     if handle_early_cli_args() {
         return Ok(());
     }

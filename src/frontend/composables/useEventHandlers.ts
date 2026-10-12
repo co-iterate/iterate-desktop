@@ -7,6 +7,7 @@ export function useEventHandlers(actions: any, _mcpRequest?: any) {
     // MCP 事件
     onMcpResponse: actions.mcp.handleResponse,
     onMcpCancel: actions.mcp.handleCancel,
+    onMcpCloseCurrentDialog: actions.mcp.handleCloseCurrentDialog,
 
     // 主题事件
     onThemeChange: actions.theme.setTheme,

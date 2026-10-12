@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isExplicitConversationEndInput } from '../../utils/conversationEndCommand'
 import type { McpRequest, PopupArtifact, PopupFileAttachment, PopupInputData, PopupTextSelection, ShortcutBinding } from '../../types/popup'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -315,8 +316,11 @@ function buildFilePaths(files: PopupFileAttachment[]): string[] {
 }
 
 function buildFinalUserInput(rawInput: string, files: PopupFileAttachment[]): string | null {
-  const fileRefs = buildFileRefText(files).trim()
   const trimmedInput = rawInput.trim()
+  // 结束指令必须原样交给 Rust 响应边界判断，不能在前面拼接文件引用。
+  if (isExplicitConversationEndInput(trimmedInput))
+    return trimmedInput
+  const fileRefs = buildFileRefText(files).trim()
   const combined = [fileRefs, trimmedInput]
     .filter(Boolean)
     .join('\n\n')
