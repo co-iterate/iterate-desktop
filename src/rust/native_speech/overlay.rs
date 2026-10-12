@@ -44,3 +44,30 @@ pub fn ensure_owner_overlay(
     .build()
     .map_err(|error| format!("failed to create owner speech overlay: {error}"))
 }
+
+#[cfg(target_os = "windows")]
+pub fn ensure_windows_overlay(app: &AppHandle) -> Result<WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window(SPEECH_OVERLAY_WINDOW_LABEL) {
+        return Ok(window);
+    }
+    WebviewWindowBuilder::new(
+        app,
+        SPEECH_OVERLAY_WINDOW_LABEL,
+        WebviewUrl::App(SPEECH_OVERLAY_URL.into()),
+    )
+    .title("iterate-speech-overlay")
+    .inner_size(96.0, 48.0)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .visible(false)
+    .focused(false)
+    .focusable(false)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .skip_taskbar(true)
+    .background_throttling(BackgroundThrottlingPolicy::Disabled)
+    .build()
+    .map_err(|error| format!("failed to create Windows speech overlay: {error}"))
+}

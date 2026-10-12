@@ -1720,5 +1720,48 @@ pub async fn setup_application(app_handle: &AppHandle) -> Result<(), String> {
         }
     }
 
+    // 只有主程序进程注册语音快捷键：MCP 弹窗进程没有转写结果的接收方，
+    // 抢到快捷键会让识别结果无处写回。
+    #[cfg(target_os = "windows")]
+    if !is_standalone {
+        use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+        if let Err(error) = crate::native_speech::overlay::ensure_windows_overlay(app_handle) {
+            log::warn!("Windows 语音浮层初始化失败: {}", error);
+        }
+
+        let app_handle_clone = app_handle.clone();
+        if let Ok(shortcut) =
+            crate::native_speech::windows::WINDOWS_SPEECH_SHORTCUT.parse::<Shortcut>()
+        {
+            let _ =
+                app_handle
+                    .global_shortcut()
+                    .on_shortcut(shortcut, move |app, _shortcut, event| {
+                        if event.state != ShortcutState::Pressed {
+                            return;
+                        }
+                        let enabled = app
+                            .state::<AppState>()
+                            .global_shortcut_enabled
+                            .load(Ordering::Relaxed);
+                        if !enabled {
+                            return;
+                        }
+
+                        if let Err(error) = crate::native_speech::windows::start_windows_dictation(
+                            app_handle_clone.clone(),
+                        ) {
+                            log::warn!("Windows 全局语音启动失败: {}", error);
+                        }
+                    });
+            log_important!(
+                info,
+                "Windows 全局语音快捷键 {} 已注册",
+                crate::native_speech::windows::WINDOWS_SPEECH_SHORTCUT
+            );
+        }
+    }
+
     Ok(())
 }

@@ -18,6 +18,21 @@ test('bridge health probe uses reqwest only on Windows and preserves the Unix cu
   assert.match(setup, /#\[cfg\(not\(target_os = "windows"\)\)\]\s*fn bridge_http_healthy[\s\S]*?command_stdout\("curl"/)
 })
 
+test('reqwest ALPN support always includes the HTTP/2 client implementation', () => {
+  const cargo = source('Cargo.toml')
+  const reqwestConfigs = [...cargo.matchAll(/reqwest\s*=\s*\{\s*version\s*=\s*"([^"]+)"[\s\S]*?features\s*=\s*\[([\s\S]*?)\]\s*\}/g)]
+    .map(match => ({ version: match[1], features: match[2] }))
+    .filter(config => config.features.includes('native-tls-alpn'))
+
+  assert.ok(reqwestConfigs.length > 0, 'expected at least one reqwest ALPN configuration')
+  for (const { version, features } of reqwestConfigs) {
+    // reqwest 0.11 始终编译 HTTP/2（没有 http2 特性开关）；0.12 起需要显式开启。
+    if (/^0\.11(\.|$)/.test(version))
+      continue
+    assert.match(features, /"http2"/, 'ALPN may negotiate h2, so reqwest must compile HTTP/2 support')
+  }
+})
+
 test('Windows shows the main window before background setup while non-Windows keeps blocking setup', () => {
   const builder = source('src/rust/app/builder.rs')
   const showIndex = builder.indexOf('window.show()')
@@ -96,15 +111,17 @@ test('frontend and package defaults preserve macOS behavior', () => {
   assert.equal(pkg.scripts['tauri:build'], 'cargo tauri build')
 })
 
-test('manual close blocks automatic zhi startup until a shortcut launch clears it', () => {
+test('manual close stops current processes while a later MCP call can summon iterate again', () => {
   const lifecycle = source('src/rust/app/windows_lifecycle.rs')
   const main = source('src/rust/main.rs')
   const mcpServer = source('src/bin/mcp-server.rs')
   assert.match(lifecycle, /args\.len\(\) != 1/)
   assert.match(lifecycle, /remove_file\(manual_stop_path\(\)\)/)
+  assert.match(lifecycle, /pub fn activate_mcp_launch\(\)[\s\S]*?reactivate_after_manual_stop\(\)/)
+  assert.match(lifecycle, /fn reactivate_after_manual_stop\(\)[\s\S]*?reset_shutdown_event\(\)/)
   assert.match(main, /activate_manual_launch_if_requested/)
-  assert.match(mcpServer, /is_manually_stopped\(\)/)
-  assert.match(mcpServer, /MANUALLY_STOPPED_MESSAGE/)
+  assert.match(mcpServer, /call_zhi[\s\S]*?activate_mcp_launch\(\)/)
+  assert.doesNotMatch(mcpServer, /call_zhi[\s\S]{0,500}?MANUALLY_STOPPED_MESSAGE/)
 })
 
 test('explicit conversation end is exact and is normalized at the response boundary', () => {
@@ -208,4 +225,172 @@ test('Windows centers the initial main window before showing it', () => {
 
   assert.match(builder, /if should_show_main_window_on_launch\(&args\)[\s\S]*?#\[cfg\(target_os = "windows"\)\][\s\S]*?if !is_standalone_mcp_launch\(&args\)[\s\S]*?center_window\(app_handle\.clone\(\)\)/)
   assert.match(builder, /#\[cfg\(not\(target_os = "windows"\)\)\][\s\S]*?window\.show\(\)[\s\S]*?window\.set_focus\(\)/)
+})
+
+test('Windows global speech uses a real local recognizer and reuses iterate post-processing', () => {
+  const setup = source('src/rust/app/setup.rs')
+  const speech = source('src/rust/native_speech/windows.rs')
+  const host = source('src/frontend/composables/useGlobalSpeechRuntimeHost.ts')
+  const input = source('src/frontend/composables/useGlobalSpeechInput.ts')
+  const overlay = source('src/rust/native_speech/overlay.rs')
+  const settings = source('src/frontend/components/settings/GlobalSpeechSettings.vue')
+  const cargo = source('Cargo.toml')
+
+  assert.match(setup, /WINDOWS_SPEECH_SHORTCUT/)
+  assert.match(speech, /WINDOWS_SPEECH_SHORTCUT: &str = "Shift\+Ctrl\+Space"/)
+  assert.match(speech, /System\.Speech\.Recognition\.SpeechRecognitionEngine/)
+  assert.match(speech, /SetInputToDefaultAudioDevice/)
+  assert.match(speech, /speech:\/\/windows-transcript/)
+  assert.match(speech, /speech:\/\/windows-state/)
+  assert.match(speech, /super::reveal_overlay\(&app\)/)
+  assert.match(speech, /super::hide_overlay\(&app\)/)
+  assert.match(speech, /GetForegroundWindow/)
+  assert.match(speech, /SetForegroundWindow/)
+  assert.match(speech, /keybd_event\(VK_CONTROL as u8/)
+  assert.match(host, /processWindowsTranscript[\s\S]*?applySpeechPostprocess/)
+  assert.match(host, /persistMemoryWriteback\(processed\)/)
+  assert.match(host, /commit_windows_speech_text/)
+  assert.match(host, /if \(windowsPlatform\) \{[\s\S]*?speech:\/\/windows-error[\s\S]*?return[\s\S]*?unlistenSnapshot/)
+  assert.match(input, /speech:\/\/windows-state/)
+  assert.match(input, /windowsState\.value = event\.payload/)
+  assert.match(overlay, /ensure_windows_overlay/)
+  assert.match(setup, /ensure_windows_overlay\(app_handle\)/)
+  assert.match(settings, /Windows 全局语音输入/)
+  assert.match(settings, /get_windows_speech_capability/)
+  assert.match(settings, /v-if="windowsPlatform"/)
+  assert.match(settings, /v-if="!windowsPlatform"/)
+  assert.doesNotMatch(settings, /Windows 全局语音输入[\s\S]*?Fn 听写、macOS 权限与写回诊断集中检查。[\s\S]{0,200}?v-if="windowsPlatform"/)
+  assert.match(cargo, /"Win32_UI_Input_KeyboardAndMouse"/)
+  assert.match(cargo, /"Win32_UI_WindowsAndMessaging"/)
+})
+
+test('Windows prevent-sleep uses SetThreadExecutionState on a dedicated guard thread', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const cargo = source('Cargo.toml')
+  assert.match(cargo, /"Win32_System_Power"/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\][\s\S]*?WindowsPreventSleepGuard/)
+  assert.match(commands, /SetThreadExecutionState\(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED\)/)
+  assert.match(commands, /name\("iterate-prevent-sleep"\.to_string\(\)\)/)
+  assert.match(commands, /SetThreadExecutionState\(ES_CONTINUOUS\)/)
+})
+
+test('Windows popup accepts Explorer file clipboard data and drive-letter paths', () => {
+  const popup = source('src/frontend/components/popup/PopupInput.vue')
+  const commands = source('src/rust/ui/commands.rs')
+  const cargo = source('Cargo.toml')
+
+  assert.match(popup, /Explorer copies absolute paths with drive letters or UNC prefixes/)
+  assert.match(popup, /decodedPath\.slice\(1\)/)
+  // 反斜杠/盘符/file:///C: 规则只在 Windows 上启用，macOS/Linux 保持原行为
+  assert.match(popup, /path\.split\(windowsPlatform \? \/\[\\\\\/\]\/ : '\/'\)/)
+  assert.match(popup, /if \(windowsPlatform && \(\/\^\[a-z\]:/)
+  assert.match(popup, /windowsPlatform && \/\^\\\/\[a-z\]:\\\/\/i\.test\(decodedPath\)/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\][\s\S]*?read_clipboard_file_paths[\s\S]*?CF_HDROP[\s\S]*?DragQueryFileW/)
+  assert.match(commands, /CLIPBOARD_OPEN_ATTEMPTS:\s*usize\s*=\s*5/)
+  assert.match(commands, /CLIPBOARD_RETRY_DELAY_MS:\s*u64\s*=\s*20/)
+  assert.match(commands, /for attempt in 0\.\.CLIPBOARD_OPEN_ATTEMPTS[\s\S]*?OpenClipboard[\s\S]*?std::thread::sleep/)
+  assert.match(commands, /#\[cfg\(not\(any\(target_os = "macos", target_os = "windows"\)\)\)\]/)
+  assert.match(cargo, /"Win32_System_DataExchange"/)
+  assert.match(cargo, /"Win32_System_Ole"/)
+  assert.match(cargo, /"Win32_UI_Shell"/)
+})
+
+test('Windows file and folder selection uses the native dialog plugin instead of an empty stub', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const builder = source('src/rust/app/builder.rs')
+  const windowsSelector = /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn select_files_and_folders[\s\S]*?\.blocking_pick_folder\(\)[\s\S]*?\.blocking_pick_files\(\)/
+  assert.match(commands, windowsSelector)
+  // Linux 等其他平台保持回流前的空实现
+  assert.match(commands, /#\[cfg\(not\(any\(target_os = "macos", target_os = "windows"\)\)\)\]\s*#\[tauri::command\]\s*pub async fn select_files_and_folders\([\s\S]{0,200}?Ok\(vec!\[\]\)/)
+  // 原生对话框依赖插件注册，否则运行时才报错
+  assert.match(builder, /#\[cfg\(target_os = "windows"\)\]\s*let builder = builder\.plugin\(tauri_plugin_dialog::init\(\)\)/)
+})
+
+test('Windows popup screenshot keeps the Mac capability with a native Windows capture path', () => {
+  const setup = source('src/rust/app/setup.rs')
+  const commands = source('src/rust/ui/commands.rs')
+  const input = source('src/frontend/components/popup/PopupInput.vue')
+  const cargo = source('Cargo.toml')
+  assert.match(setup, /#\[cfg\(target_os = "macos"\)\][\s\S]*?Shift\+Cmd\+K/)
+  assert.doesNotMatch(setup, /Shift\+Ctrl\+K/)
+  assert.match(setup, /capture_screenshot\(\)\.await/)
+  assert.match(input, /async function handleWindowsScreenshotShortcut\(event: KeyboardEvent\)/)
+  assert.match(input, /event\.code !== 'F8'[\s\S]*?event\.ctrlKey[\s\S]*?event\.altKey[\s\S]*?event\.shiftKey[\s\S]*?event\.metaKey/)
+  assert.match(input, /await webview\.hide\(\)[\s\S]*?invoke<string>\('capture_screenshot'\)[\s\S]*?await webview\.show\(\)[\s\S]*?await webview\.setFocus\(\)/)
+  assert.match(input, /window\.addEventListener\('keydown', handleWindowsScreenshotShortcut\)/)
+  assert.match(input, /window\.removeEventListener\('keydown', handleWindowsScreenshotShortcut\)/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\][\s\S]*?CreateDIBSection[\s\S]*?BitBlt/)
+  assert.match(commands, /PngEncoder::new[\s\S]*?ExtendedColorType::Rgba8/)
+  assert.doesNotMatch(commands, /iterate_screenshot_[\s\S]*?System\.Windows\.Forms/)
+  assert.match(cargo, /"Win32_Graphics_Gdi"/)
+  assert.match(cargo, /"Win32_UI_WindowsAndMessaging"/)
+  assert.match(cargo, /image = \{ version = "0\.25\.10"/)
+})
+
+test('Windows opens projects and threads in the official Codex Desktop app', () => {
+  const commands = source('src/rust/ui/commands.rs')
+
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*fn codex_desktop_cli_candidates/)
+  assert.match(commands, /var_os\("LOCALAPPDATA"\)[\s\S]*?\.join\("OpenAI"\)[\s\S]*?\.join\("Codex"\)[\s\S]*?\.join\("bin"\)/)
+  assert.match(commands, /directory\.join\("codex\.exe"\)/)
+  assert.match(commands, /fn codex_desktop_app_candidates\(\)[\s\S]*?var_os\("ProgramFiles"\)[\s\S]*?\.join\("WindowsApps"\)/)
+  assert.match(commands, /starts_with\("openai\.codex_"\)[\s\S]*?\.join\("app"\)\.join\("ChatGPT\.exe"\)/)
+  assert.match(commands, /Get-AppxPackage -Name OpenAI\.Codex[\s\S]*?Select-Object -First 1 -ExpandProperty InstallLocation/)
+  assert.match(commands, /fn launch_codex_desktop_project[\s\S]*?\.arg\(project_path\)[\s\S]*?\.args\(\["app", project_path\]\)/)
+  assert.match(commands, /fn launch_codex_desktop_deeplink[\s\S]*?resolve_codex_desktop_app_exe\(\)[\s\S]*?\.arg\(url\)/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_codex_project/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_codex_thread/)
+  assert.match(commands, /#\[cfg\(not\(any\(target_os = "macos", target_os = "windows"\)\)\)\]/)
+})
+
+test('Windows Codex Desktop supports project, thread, and foreground-gated new-chat routes', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const appContent = source('src/frontend/components/AppContent.vue')
+  const builder = source('src/rust/app/builder.rs')
+  const cargo = source('Cargo.toml')
+
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*fn codex_desktop_cli_candidates/)
+  assert.match(commands, /var_os\("LOCALAPPDATA"\)[\s\S]*?\.join\("OpenAI"\)[\s\S]*?\.join\("Codex"\)[\s\S]*?\.join\("bin"\)/)
+  assert.match(commands, /directory\.join\("codex\.exe"\)/)
+  assert.match(commands, /fn codex_desktop_app_candidates\(\)[\s\S]*?var_os\("ProgramFiles"\)[\s\S]*?\.join\("WindowsApps"\)/)
+  assert.match(commands, /starts_with\("openai\.codex_"\)[\s\S]*?\.join\("app"\)\.join\("ChatGPT\.exe"\)/)
+  assert.match(commands, /Get-AppxPackage -Name OpenAI\.Codex[\s\S]*?Select-Object -First 1 -ExpandProperty InstallLocation/)
+  assert.match(commands, /fn launch_codex_desktop_project[\s\S]*?\.arg\(project_path\)[\s\S]*?\.args\(\["app", project_path\]\)/)
+  assert.match(commands, /fn launch_codex_desktop_deeplink[\s\S]*?resolve_codex_desktop_app_exe\(\)[\s\S]*?\.arg\(url\)/)
+
+  assert.match(commands, /fn windows_foreground_executable_path[\s\S]*?GetForegroundWindow[\s\S]*?GetWindowThreadProcessId[\s\S]*?QueryFullProcessImageNameW/)
+  assert.match(commands, /fn is_codex_desktop_foreground_path[\s\S]*?file_name\.as_deref\(\) != Some\("chatgpt\.exe"\)[\s\S]*?contains\("\/windowsapps\/openai\.codex_"\)/)
+  assert.match(commands, /Codex 未成为前台窗口，为避免误发按键已取消自动发送/)
+  assert.match(commands, /post_return_keypress_to_codex[\s\S]*?keybd_event\(VK_RETURN as u8/)
+  assert.match(commands, /post_new_task_keypress_to_codex[\s\S]*?VK_CONTROL[\s\S]*?const VK_N: u8 = b'N'[\s\S]*?keybd_event\(VK_N/)
+
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_codex_project/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_codex_thread/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_new_codex_chat\(thread_id: String\)[\s\S]*?codex_thread_deeplink\(&thread_id\)[\s\S]*?from_millis\(300\)[\s\S]*?post_new_task_keypress_to_codex\(\)/)
+  // 新对话只预填、不自动按回车：Codex 成为前台不代表已切到新对话
+  const windowsNewChat = commands.match(/#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn open_new_codex_chat_with_text[\s\S]*?\n\}\n/)?.[0] ?? ''
+  assert.match(windowsNewChat, /build_codex_new_thread_deeplink[\s\S]*?windows_deeplink_prefilled/)
+  assert.doesNotMatch(windowsNewChat, /post_return_keypress_to_codex\(\)/)
+  assert.match(commands, /#\[cfg\(target_os = "windows"\)\]\s*#\[tauri::command\]\s*pub async fn probe_codex_automation_permission[\s\S]*?resolve_codex_desktop_app_exe/)
+  assert.match(builder, /open_codex_thread,[\s\S]*?open_new_codex_chat,[\s\S]*?open_new_codex_chat_with_text,/)
+
+  assert.match(appContent, /return trimmed\.startsWith\('\/'\)[\s\S]*?\^\[a-z\]:\[\\\\\/\]\/i\.test\(trimmed\)[\s\S]*?trimmed\.startsWith\('\\\\\\\\'\)/)
+  assert.match(appContent, /function normalizeCodexThreadId[\s\S]*?codex_thread_id[\s\S]*?codexThreadId/)
+  assert.match(appContent, /const codexThreadId = normalizeCodexThreadId\(props\.mcpRequest\)[\s\S]*?if \(windowsPlatform && !codexThreadId\)[\s\S]*?invoke\('open_new_codex_chat', \{ threadId: codexThreadId \}\)/)
+  assert.match(cargo, /"Win32_UI_Input_KeyboardAndMouse"/)
+  assert.match(cargo, /"Win32_UI_WindowsAndMessaging"/)
+})
+
+test('Windows popup activation restores and foregrounds the native window before retrying input focus', () => {
+  const commands = source('src/rust/ui/commands.rs')
+  const popup = source('src/frontend/components/popup/McpPopup.vue')
+  const cargo = source('Cargo.toml')
+
+  assert.match(cargo, /"Win32_UI_WindowsAndMessaging"/)
+  assert.match(commands, /pub async fn activate_app_window[\s\S]*?ShowWindow\(raw_hwnd, SW_RESTORE\)[\s\S]*?BringWindowToTop\(raw_hwnd\)[\s\S]*?SetForegroundWindow\(raw_hwnd\)[\s\S]*?\.set_focus\(\)/)
+  assert.match(popup, /focusRetryTimer = setTimeout[\s\S]*?if \(activateWindow\)[\s\S]*?invoke\('activate_app_window'\)[\s\S]*?\.finally\(\(\) => \{\s*attemptFocus\(\)/)
+  assert.match(popup, /activateWindow \? 450 : 180/)
+  // 激活意图跨调度保留，且只在 Windows 新请求出现时发起
+  assert.match(popup, /const activateWindow = Boolean\(options\.activateWindow\) \|\| pendingWindowActivation/)
+  assert.match(popup, /scheduleInputFocus\('request-visible', \{ activateWindow: windowsPlatform \}\)/)
 })

@@ -1610,12 +1610,9 @@ async fn call_zhi(
     argument_codex_thread_id: Option<String>,
 ) -> Result<CallToolResult, ErrorData> {
     #[cfg(target_os = "windows")]
-    if cunzhi::app::windows_lifecycle::is_manually_stopped() {
-        return Err(ErrorData::internal_error(
-            cunzhi::app::windows_lifecycle::MANUALLY_STOPPED_MESSAGE.to_string(),
-            None,
-        ));
-    }
+    cunzhi::app::windows_lifecycle::activate_mcp_launch().map_err(|error| {
+        ErrorData::internal_error(format!("重新启动 iterate 失败: {error}"), None)
+    })?;
 
     let explicit_codex_thread_id = args
         .codex_thread_id

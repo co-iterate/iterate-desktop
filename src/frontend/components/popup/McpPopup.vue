@@ -495,9 +495,20 @@ function handleQuoteSelectionShortcut(event: KeyboardEvent) {
 }
 
 let focusRetryTimer: ReturnType<typeof setTimeout> | null = null
+// 每次调度/清理都递增；异步回调只在代次未变时执行，避免并发调度遗留定时器、请求结束后仍激活窗口
+let focusGeneration = 0
+// 当前请求要求激活窗口（#40）时，后续普通聚焦调度继承该意图，直到激活真正执行
+let pendingWindowActivation = false
 let focusWindowListenersCleanup: (() => void) | null = null
 
+/// 请求结束/组件卸载时调用：取消待执行聚焦，并清除未执行的激活意图
+function resetFocusScheduling() {
+  pendingWindowActivation = false
+  clearFocusRetryTimer()
+}
+
 function clearFocusRetryTimer() {
+  focusGeneration += 1
   if (focusRetryTimer) {
     clearTimeout(focusRetryTimer)
     focusRetryTimer = null
@@ -555,9 +566,11 @@ function handleMiddleZoneClick(event: MouseEvent) {
   void inputRef.value.focusInput?.()
 }
 
+const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
+
 async function scheduleInputFocus(
   reason: string,
-  options: { preserveExistingFocus?: boolean } = {},
+  options: { preserveExistingFocus?: boolean, activateWindow?: boolean } = {},
 ) {
   if (!isVisible.value || loading.value || !inputRef.value)
     return
@@ -567,9 +580,15 @@ async function scheduleInputFocus(
     return
   }
 
+  const activateWindow = Boolean(options.activateWindow) || pendingWindowActivation
+  if (activateWindow)
+    pendingWindowActivation = true
   clearFocusRetryTimer()
+  const generation = focusGeneration
 
   await nextTick()
+  if (generation !== focusGeneration)
+    return
 
   const attemptFocus = () => {
     if (!isVisible.value || loading.value || !inputRef.value)
@@ -590,9 +609,23 @@ async function scheduleInputFocus(
   }
 
   focusRetryTimer = setTimeout(() => {
-    attemptFocus()
     focusRetryTimer = null
-  }, 180)
+    if (generation !== focusGeneration || !isVisible.value || loading.value)
+      return
+    if (activateWindow) {
+      pendingWindowActivation = false
+      void invoke('activate_app_window')
+        .catch((error) => {
+          console.log(`[McpPopup] 延迟激活窗口失败: ${reason}`, error)
+        })
+        .finally(() => {
+          attemptFocus()
+        })
+    }
+    else {
+      attemptFocus()
+    }
+  }, activateWindow ? 450 : 180)
 
   console.log(`[McpPopup] 已调度输入框聚焦: ${reason}`)
 }
@@ -700,11 +733,12 @@ watch(() => props.request, async (newRequest) => {
     void nextTick().then(() => {
       loading.value = false
       flushTimelinePrefill()
-      void scheduleInputFocus('request-visible')
+      // Windows 上新请求出现时把弹窗带到前台（#40）；其他平台保持原行为
+      void scheduleInputFocus('request-visible', { activateWindow: windowsPlatform })
     })
   }
   else {
-    clearFocusRetryTimer()
+    resetFocusScheduling()
   }
 }, { immediate: true })
 
@@ -867,7 +901,7 @@ onMounted(async () => {
 
 // 组件卸载时清理监听器
 onUnmounted(() => {
-  clearFocusRetryTimer()
+  resetFocusScheduling()
   focusWindowListenersCleanup?.()
   focusWindowListenersCleanup = null
   if (telegramUnlisten) {
