@@ -10,7 +10,8 @@
 </p>
 
 <h3 align="center">
-  <a href="https://github.com/kexin94yyds/iterate-releases/releases/latest">下载最新版</a>
+  <a href="https://github.com/kexin94yyds/iterate-releases/releases/latest">下载桌面版</a>
+  · <a href="https://apps.apple.com/cn/app/iterate-remote/id6796915922">下载 iPhone 版</a>
   · <a href="#文档">查看文档</a>
   · <a href="CONTRIBUTING.md">参与共创</a>
 </h3>
@@ -39,13 +40,24 @@ iterate 连接正在运行的 AI 编程工具，在它准备过早结束、等�
 
 ## 下载与安装
 
-正式安装包通过独立的 [iterate Releases](https://github.com/kexin94yyds/iterate-releases/releases) 仓库发布。
+桌面安装包通过独立的 [iterate Releases](https://github.com/kexin94yyds/iterate-releases/releases) 仓库发布；iPhone、iPad 与 Apple Watch 客户端通过 App Store 分发。
 
 | 平台 | 获取方式 | 说明 |
 | --- | --- | --- |
-| macOS | [下载最新版本](https://github.com/kexin94yyds/iterate-releases/releases/latest) | 打开 DMG，将 `iterate.app` 放入“应用程序” |
-| Windows | [下载最新版本](https://github.com/kexin94yyds/iterate-releases/releases/latest) | 解压 `iterate-windows-x64.zip`，运行 `Install iterate.bat` |
+| macOS（Apple Silicon） | [直接下载 DMG](https://github.com/kexin94yyds/iterate-releases/releases/latest/download/iterate_aarch64.dmg) | 适用于 M1 及更新芯片；打开 DMG，将 `iterate.app` 放入“应用程序” |
+| iPhone / iPad / Apple Watch | [在 App Store 下载 iterate Remote](https://apps.apple.com/cn/app/iterate-remote/id6796915922) | 手机端是桌面端的 Companion，不能独立连接 MCP |
+| Windows x64 | [直接下载 ZIP](https://github.com/kexin94yyds/iterate-releases/releases/latest/download/iterate-windows-x64.zip) | 解压后运行 `Install iterate.bat` |
 | 从源码构建 | [构建文档](BUILDING.md) | Node.js、pnpm、Rust 与 Tauri 2 |
+
+### 第一次使用：先打通桌面，再连接手机
+
+1. 在 Mac 上安装并打开 iterate。
+2. 打开 App 内“使用说明书”，复制安装提示词，让当前 AI 客户端完成 MCP 配置；随后完全重启 Windsurf、Cursor、Codex 或其他客户端。
+3. 在 AI 客户端发起一次带非空 `message` 的 `zhi` / `call_zhi`，确认桌面端出现 iterate 弹窗，并提交一次回复。
+4. 在 iPhone 上安装 iterate Remote，再从桌面端打开“连接 iPhone”或二维码入口。
+5. 用 iPhone 相机扫描桌面端显示的二维码，完成配对；最后从手机回复一次测试任务，确认原 AI 会话收到回复。
+
+手机端必须与正在运行的桌面 iterate 配合使用。若桌面端提示尚未配置正式公网路线，请先按连接向导完成准备；这一步不能只靠安装 iPhone App 跳过。
 
 安装后还要把 MCP command 配进当前 AI 客户端：
 
@@ -89,7 +101,7 @@ iterate 连接正在运行的 AI 编程工具，在它准备过早结束、等�
 | MCP / CLI | ✅ | `iterate` 与 `mcp-server` 提供本地服务、工具与桥接能力 |
 | 多会话与历史状态 | ✅ | 管理并恢复并行 AI 任务，保留明确的任务路由 |
 | 多模态与语音 | ✅ | 支持文本、图片、文件、路径、Markdown 与本地语音链路 |
-| iPhone 远程继续 | ✅ 独立分发 | 本仓库公开配对/Bridge 协议与兼容层；官方 iOS 客户端源码不在本仓库 |
+| iPhone 远程继续 | ✅ [App Store 独立分发](https://apps.apple.com/cn/app/iterate-remote/id6796915922) | 本仓库公开配对/Bridge 协议与兼容层；官方 iOS 客户端源码不在本仓库 |
 | Android 远程继续 | 设计中 | 已建立 [Android v0 设计与实现路线](https://github.com/co-iterate/iterate-desktop/issues/22)；目前尚无可下载 APK |
 | IDE / 浏览器扩展 | 独立分发 | 官方扩展属于 iterate 生态，但不包含在本 desktop-source 仓库 |
 
