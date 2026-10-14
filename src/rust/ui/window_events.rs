@@ -59,6 +59,10 @@ pub fn start_window_registry_cleanup_task() {
 pub fn setup_window_event_listeners(app_handle: &AppHandle) {
     // 为所有窗口设置焦点追踪
     for (label, window) in app_handle.webview_windows() {
+        #[cfg(target_os = "windows")]
+        if label == "main" {
+            crate::ui::webview_recovery::install(&window);
+        }
         let label_clone = label.clone();
         window.on_window_event(move |event| {
             if let WindowEvent::Focused(true) = event {

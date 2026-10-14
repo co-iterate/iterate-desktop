@@ -1,7 +1,10 @@
 /// Formal routes share the same origin-health and current-install proof gates.
 /// Keep transport identifiers exact; aliases and unknown transports are rejected.
 pub fn is_supported_formal_transport(transport: &str) -> bool {
-    matches!(transport, "cloudflare_named_tunnel" | "self_hosted_frp")
+    matches!(
+        transport,
+        "cloudflare_named_tunnel" | "self_hosted_frp" | "aliyun_ssh_reverse_tunnel"
+    )
 }
 
 /// Verification timestamps are not part of a route's identity.

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useMessage } from 'naive-ui'
 import { onMounted, onUnmounted, ref } from 'vue'
+import CrossDeviceSettings from '../common/CrossDeviceSettings.vue'
 import AudioSettings from '../settings/AudioSettings.vue'
 import BrowserSettings from '../settings/BrowserSettings.vue'
 import CheckpointSettings from '../settings/CheckpointSettings.vue'
@@ -136,6 +137,27 @@ function handleWindowSizeUpdate(size: { width: number, height: number, fixed: bo
         </template>
         <div class="setting-content">
           <McpClientSettings />
+        </div>
+      </n-collapse-item>
+
+      <n-collapse-item name="cross-device">
+        <template #header>
+          <div class="flex items-center w-full">
+            <div class="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900 flex items-center justify-center mr-4">
+              <div class="i-carbon-screen text-lg text-blue-600 dark:text-blue-400" />
+            </div>
+            <div>
+              <div class="text-lg font-medium tracking-tight mb-1">
+                跨设备提醒
+              </div>
+              <div class="text-sm opacity-60 font-normal">
+                本机保存 IP 与配对配置，标题栏一键开启或关闭
+              </div>
+            </div>
+          </div>
+        </template>
+        <div class="setting-content">
+          <CrossDeviceSettings />
         </div>
       </n-collapse-item>
 

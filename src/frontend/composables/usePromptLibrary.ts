@@ -48,51 +48,33 @@ const isSearchOpen = ref(false)
 const isImporting = ref(false)
 let _loaded = false
 
-async function _load() {
-  try {
-    // 先尝试从 localStorage 读取
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const store: PromptLibraryStore = JSON.parse(raw)
-      items.value = store.items ?? []
-    }
+const saveError = ref('')
+let savedItems: PromptLibraryItem[] = []
+let pendingSave = Promise.resolve()
 
-    // 如果 localStorage 为空，从共享文件读取（跨进程兜底）
-    if (items.value.length === 0) {
-      try {
-        const fileContent: string = await invoke('load_prompt_library_file')
-        if (fileContent) {
-          const store: PromptLibraryStore = JSON.parse(fileContent)
-          if (store.items && store.items.length > 0) {
-            items.value = store.items
-            // 回填到当前进程的 localStorage
-            localStorage.setItem(STORAGE_KEY, fileContent)
-            console.log('[PromptLibrary] loaded from shared file:', store.items.length, 'items')
-          }
-        }
-      }
-      catch (e) {
-        console.warn('[PromptLibrary] file fallback failed:', e)
-      }
-    }
+async function _load() {
+  await pendingSave
+  try {
+    const content = await invoke<string>('load_prompt_library_file')
+    const store: PromptLibraryStore = JSON.parse(content)
+    items.value = store.items ?? []
+    savedItems = structuredClone(store.items ?? [])
+    localStorage.setItem(STORAGE_KEY, content)
+    saveError.value = ''
   }
-  catch (e) {
-    console.error('[PromptLibrary] load failed:', e)
-  }
+  catch (cause) { saveError.value = String(cause) }
 }
 
 function _save() {
-  const store: PromptLibraryStore = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    items: items.value,
-  }
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(store))
-
-  // 同步写入文件（供 Bridge Server API 读取）
-  invoke('save_prompt_library_file', { content: JSON.stringify(store) }).catch((e: unknown) => {
-    console.warn('[PromptLibrary] file sync failed:', e)
-  })
+  const snapshot = JSON.parse(JSON.stringify(items.value)) as PromptLibraryItem[]
+  pendingSave = pendingSave.then(async () => {
+    if (saveError.value)
+      return
+    const store: PromptLibraryStore = { version: 1, updatedAt: new Date().toISOString(), items: snapshot }
+    await invoke('save_prompt_library_file', { content: JSON.stringify(store), expectedItems: savedItems })
+    savedItems = snapshot
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(store))
+  }).catch((cause: unknown) => { saveError.value = String(cause) })
 }
 
 export function usePromptLibrary() {
@@ -385,13 +367,15 @@ export function usePromptLibrary() {
   // Init: only load from localStorage once, then sync to file
   if (!_loaded) {
     _loaded = true // 防止重复调用
-    _load().then(() => {
-      if (items.value.length > 0)
-        _save()
+    void _load()
+    window.addEventListener('iterate:settings-synced', () => {
+      if (!saveError.value)
+        void _load()
     })
   }
 
   return {
+    saveError,
     items,
     searchQuery,
     isSearchOpen,

@@ -564,7 +564,7 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
     bridgeOriginHealthy,
     aiSetupPrompt: computed(() => (
       formalRoute.value?.configured
-        ? buildFormalRouteRepairPrompt(formalRoute.value.base_url || '', state.value.error?.code || error.value)
+        ? buildFormalRouteRepairPrompt(formalRoute.value.base_url || '', state.value.error?.code || error.value, formalRoute.value.transport)
         : buildFormalRouteSetupPrompt()
     )),
     bootstrap,

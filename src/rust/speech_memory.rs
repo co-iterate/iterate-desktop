@@ -128,10 +128,20 @@ pub fn load_entries() -> Result<Vec<Value>, String> {
 }
 
 pub fn save_entries(entries: Vec<Value>) -> Result<Vec<Value>, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let _guard = SPEECH_MEMORY_TABLE_WRITE_LOCK
         .lock()
         .map_err(|_| "语音记忆写入锁不可用".to_string())?;
     let _file_lock = acquire_table_file_lock()?;
+    save_entries_to(speech_memory_path(), entries)
+}
+
+pub fn save_entries_checked(entries: Vec<Value>, expected: Option<Value>) -> Result<Vec<Value>, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
+    let _guard = SPEECH_MEMORY_TABLE_WRITE_LOCK.lock().map_err(|_| "语音记忆写入锁不可用")?;
+    let _file_lock = acquire_table_file_lock()?;
+    let current = Value::Array(load_entries()?);
+    if expected.as_ref() != Some(&current) { return Err("语音规则或训练计数已改变，请重新加载后重试".into()); }
     save_entries_to(speech_memory_path(), entries)
 }
 
@@ -140,6 +150,7 @@ pub fn load_correction_entries() -> Result<Vec<Value>, String> {
 }
 
 pub fn save_correction_entries(entries: Vec<Value>) -> Result<Vec<Value>, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let _guard = SPEECH_MEMORY_TABLE_WRITE_LOCK
         .lock()
         .map_err(|_| "语音记忆写入锁不可用".to_string())?;
@@ -227,6 +238,7 @@ pub fn record_muscle_memory_hit(
     id: Option<String>,
     spoken_phrase: Option<String>,
 ) -> Result<Vec<Value>, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let _guard = SPEECH_MEMORY_TABLE_WRITE_LOCK
         .lock()
         .map_err(|_| "语音记忆写入锁不可用".to_string())?;
@@ -269,6 +281,7 @@ fn record_correction_memory_counter(
     intended_text: Option<String>,
     counter_key: &str,
 ) -> Result<Vec<Value>, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let _guard = SPEECH_MEMORY_TABLE_WRITE_LOCK
         .lock()
         .map_err(|_| "语音记忆写入锁不可用".to_string())?;
@@ -435,6 +448,7 @@ fn update_vocabulary_terms(
     terms: Vec<String>,
     increment_existing: bool,
 ) -> Result<SpeechVocabularyStore, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let _guard = SPEECH_VOCABULARY_WRITE_LOCK
         .lock()
         .map_err(|_| "语音词典写入锁不可用".to_string())?;

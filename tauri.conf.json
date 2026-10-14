@@ -63,6 +63,7 @@
             "core:window:allow-hide",
             "core:window:allow-close",
             "core:window:allow-minimize",
+            "core:window:allow-request-user-attention",
             "core:window:allow-unminimize",
             "core:window:allow-set-focus",
             "core:window:allow-set-always-on-top",
@@ -77,6 +78,8 @@
             "core:webview:allow-webview-position",
             "core:webview:allow-webview-size",
             "shell:allow-open",
+            "clipboard-manager:allow-write-text",
+            "clipboard-manager:allow-read-text",
             "global-shortcut:allow-register",
             "global-shortcut:allow-unregister",
             "global-shortcut:allow-is-registered"
