@@ -4,6 +4,7 @@ import { onMounted, ref } from 'vue'
 
 interface ReplyConfig {
   enable_continue_reply: boolean
+  copy_submission_to_clipboard: boolean
   auto_continue_threshold: number
   continue_prompt: string
   loop_prompt: string
@@ -21,6 +22,7 @@ const DEFAULT_GOAL_PROMPT_TEMPLATE = `1. 先把这句话整理成可执行目标
 
 const localConfig = ref<ReplyConfig>({
   enable_continue_reply: true,
+  copy_submission_to_clipboard: false,
   auto_continue_threshold: 1000,
   continue_prompt: '请按照最佳实践继续',
   loop_prompt: '进入自主循环模式。\n\n## 执行规则\n1. 基于当前上下文，按最佳实践继续执行当前任务\n2. 每轮完成后立即调用 iterate/zhi 汇报进度，不要等待用户\n3. 如果任务未完成且无需用户决策，继续自动执行下一步\n\n## 停止条件（满足任一即停止）\n- 任务已全部完成\n- 遇到必须由用户决定的问题\n- 遇到无法自动解决的错误（连续失败2次）\n- 不确定下一步该做什么\n\n## 汇报格式\n每轮简要说明：做了什么 → 结果如何 → 下一步计划',
@@ -74,6 +76,26 @@ onMounted(() => {
       </div>
       <n-switch
         v-model:value="localConfig.enable_continue_reply"
+        size="small"
+        @update:value="updateConfig"
+      />
+    </div>
+
+    <!-- 发送前备份到剪贴板 -->
+    <div class="flex items-center justify-between">
+      <div class="flex items-center">
+        <div class="w-1.5 h-1.5 bg-info rounded-full mr-3 flex-shrink-0" />
+        <div>
+          <div class="text-sm font-medium leading-relaxed">
+            发送时备份到剪贴板
+          </div>
+          <div class="text-xs opacity-60">
+            点击发送或继续时复制当前选项与输入，便于 MCP 失联后手动粘贴
+          </div>
+        </div>
+      </div>
+      <n-switch
+        v-model:value="localConfig.copy_submission_to_clipboard"
         size="small"
         @update:value="updateConfig"
       />

@@ -82,6 +82,36 @@ pub(super) struct Receipt {
     digest: String,
     #[serde(default = "receipt_scope")]
     pub receipt_scope: String,
+    /// Set while a cross-device source has accepted this reply but not yet
+    /// confirmed consumption, so a later lookup can advance the receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_device_route: Option<CrossDeviceRoute>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct CrossDeviceRoute {
+    pub request_id: String,
+    pub project_path: String,
+}
+
+pub(super) const CROSS_DEVICE_PENDING_REASON: &str = "source_confirmation_pending";
+
+/// Advance an accepted-but-unconfirmed cross-device reply once the source has
+/// consumed the winner. Only the receipt changes; nothing is resubmitted.
+pub(super) fn refresh_cross_device_receipt(path: &Path, receipt: Receipt) -> Receipt {
+    let pending = receipt.status == "uncertain"
+        && receipt.reason.as_deref() == Some(CROSS_DEVICE_PENDING_REASON);
+    let Some(route) = receipt.cross_device_route.clone().filter(|_| pending) else {
+        return receipt;
+    };
+    if !crate::cross_device::local_bridge_winner_consumed(&route.request_id, &route.project_path) {
+        return receipt;
+    }
+    let mut delivered = receipt.clone();
+    delivered.cross_device_route = None;
+    finish(path, delivered, "delivered", None)
+        .or_else(|_| lookup(path, &receipt.operation_id).map(|latest| latest.unwrap_or(receipt.clone())))
+        .unwrap_or(receipt)
 }
 fn receipt_scope() -> String {
     "bridge_delivery".into()
@@ -152,6 +182,7 @@ pub(super) fn reserve(
                 reason: None,
                 digest: digest.into(),
                 receipt_scope: receipt_scope(),
+                cross_device_route: None,
             };
             let bytes = serde_json::to_vec(&receipt).map_err(|_| "reply_store_unavailable")?;
             file.write_all(&bytes)
@@ -177,7 +208,9 @@ pub(super) fn finish(
 ) -> Result<Receipt, String> {
     receipt.status = status.into();
     receipt.reason = reason.map(str::to_owned);
-    let temp: PathBuf = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Unique per writer: concurrent refreshes of one receipt must not collide.
+    let temp: PathBuf =
+        path.with_extension(format!("{}.{}.tmp", std::process::id(), uuid::Uuid::new_v4()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -209,6 +242,26 @@ mod tests {
             epoch: "test-bridge-epoch".into(),
             seen: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    #[test]
+    fn refresh_leaves_ordinary_uncertain_receipts_unchanged() {
+        let path = path();
+        let guard = replay_guard();
+        let Reservation::New(first) = guard.reserve(&path, "op2", "digest2", &guard.epoch).unwrap()
+        else { panic!() };
+        let stored = finish(&path, first, "uncertain", Some("delivery_not_confirmed")).unwrap();
+        let refreshed = refresh_cross_device_receipt(&path, stored);
+        assert_eq!(refreshed.status, "uncertain");
+        assert_eq!(refreshed.reason.as_deref(), Some("delivery_not_confirmed"));
+        // A pending cross-device receipt whose request no longer exists stays pending.
+        let mut pending = refreshed;
+        pending.cross_device_route = Some(CrossDeviceRoute {
+            request_id: "missing-request".into(), project_path: "/tmp/missing".into(),
+        });
+        let pending = finish(&path, pending, "uncertain", Some(CROSS_DEVICE_PENDING_REASON)).unwrap();
+        assert_eq!(refresh_cross_device_receipt(&path, pending).status, "uncertain");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

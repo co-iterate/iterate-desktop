@@ -114,7 +114,7 @@ use super::route_debug::{
     record_last_active_route, record_last_completed_route, record_last_notification_route,
     route_debug_status_value,
 };
-use super::route_part::normalize_route_part;
+use super::route_part::{normalize_route_part, project_paths_match};
 use super::serve_request_fallback::load_live_serve_request_fallback;
 use super::tailscale_diagnostics::{
     tailscale_dns_name, tailscale_funnel_config_matches,
@@ -602,6 +602,7 @@ pub(super) const MCP_ACTION_CACHE_TTL_SECS: i64 = 30 * 60;
 const MCP_STATE_CACHE_TTL_SECS: i64 = 6 * 60 * 60;
 const MCP_ACTION_CACHE_MAX_ENTRIES: usize = 256;
 const MCP_STATE_CACHE_MAX_ENTRIES: usize = 512;
+const CLOSED_MCP_STATE_ROUTE_MAX_ENTRIES: usize = 2048;
 const ROOT_TUNNEL_STATUS_FILE: &str = "/tmp/iterate-root-tunnel-status.json";
 const ROOT_TUNNEL_METRICS_URL: &str = "http://127.0.0.1:60123/metrics";
 const ROOT_TUNNEL_EXPECTED_HA_CONNECTIONS: f64 = 4.0;
@@ -1103,6 +1104,11 @@ pub static MCP_STATE_CACHE: Lazy<Arc<RwLock<HashMap<String, serde_json::Value>>>
 static MCP_STATE_CACHE_TOUCHED_AT: Lazy<
     Arc<RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 > = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+// 已关闭的 serve 请求可能还有短暂存活的回复路由文件：按精确请求号记住“已关闭”，
+// 让 request_sync 和迟到的状态发布都不会把它复活（#44）。
+static CLOSED_MCP_STATE_ROUTES: Lazy<Arc<RwLock<HashMap<String, (String, i64)>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 static ACTIVE_SESSION_REGISTRY: Lazy<Arc<RwLock<HashMap<String, ActiveSessionEntry>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
@@ -6293,8 +6299,43 @@ async fn handle_axum_connection(
                                                 )
                                             .await
                                         };
-                                        if handled.delivered {
-                                            log::info!("[Bridge] mcp_action 已在 Rust 端直接处理 (project: {})", target_project_path);
+                                        // Cross-device arbitration owns the outcome even when it is
+                                        // pending or rejected; the legacy frontend fallback would only
+                                        // resubmit a reply the receipt already decided.
+                                        let arbitrated = handled.attempts.iter()
+                                            .any(|attempt| attempt.method == "cross_device_source");
+                                        if arbitrated {
+                                            // This socket has no receipt to query; tell the sender
+                                            // whether its reply won, is pending, or was rejected.
+                                            let attempt = handled.attempts.iter()
+                                                .find(|attempt| attempt.method == "cross_device_source");
+                                            let reason = attempt.and_then(|attempt| attempt.reason.clone());
+                                            let status = if handled.delivered {
+                                                "delivered"
+                                            } else if reason.as_deref() == Some("source_confirmation_pending") {
+                                                "pending"
+                                            } else {
+                                                "rejected"
+                                            };
+                                            let result = serde_json::json!({
+                                                "message_type": "mcp_action_result",
+                                                "payload": {
+                                                    "request_id": request_id,
+                                                    "project_path": target_project_path,
+                                                    "client_action_id": bridge_msg.payload.get("client_action_id"),
+                                                    "action": bridge_msg.payload.get("action"),
+                                                    "status": status,
+                                                    "delivered": handled.delivered,
+                                                    "reason": reason,
+                                                    "method": "cross_device_source",
+                                                },
+                                            });
+                                            if ws_sender.send(Message::Text(result.to_string())).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        if handled.delivered || arbitrated {
+                                            log::info!("[Bridge] mcp_action 已在 Rust 端直接处理 (project: {}, delivered={})", target_project_path, handled.delivered);
                                             mcp_action_handled_by_rust = true;
                                         } else {
                                             // 回退：缓存 action，等前端轮询消费
@@ -6600,6 +6641,15 @@ async fn handle_axum_connection(
                                                 None
                                             }
                                         }
+                                    };
+                                    // Registry and serve-file fallbacks can briefly outlive an
+                                    // explicit close; never resurrect a closed request.
+                                    let cached_payload = match cached_payload {
+                                        Some(payload) => match extract_request_id_from_mcp_state(&payload) {
+                                            Some(id) if closed_mcp_state_project_for_request(&id).await.is_some() => None,
+                                            _ => Some(payload),
+                                        },
+                                        None => None,
                                     };
 
                                     bridge_debug_log(&format!(
@@ -13396,9 +13446,91 @@ fn persist_live_goal_progress_from_apns_update(request: &ApnsLiveActivityUpdateR
     }
 }
 
+/// 已关闭路由机制（#44）：显式关闭的 mcp_state 清理缓存并记住该请求，拒绝迟到的复活。
+fn is_explicit_closed_mcp_state(payload: &serde_json::Value) -> bool {
+    payload.get("request") == Some(&serde_json::Value::Null)
+        && payload.get("showMcpPopup").and_then(|value| value.as_bool()) == Some(false)
+}
+
+fn closed_mcp_state_route(payload: &serde_json::Value) -> Result<(String, String), &'static str> {
+    let request_id = normalize_route_part(payload.get("request_id").and_then(|value| value.as_str()))
+        .ok_or("closed_request_id_missing")?;
+    let raw_path = normalize_route_part(payload.get("project_path").and_then(|value| value.as_str()))
+        .ok_or("closed_project_path_missing")?;
+    if raw_path == "." || !std::path::Path::new(&raw_path).is_absolute() {
+        return Err("closed_project_path_invalid");
+    }
+    Ok((request_id, normalize_bridge_project_path(&raw_path)))
+}
+
+fn mcp_state_matches_exact_route(payload: &serde_json::Value, request_id: &str, project_path: &str) -> bool {
+    extract_request_id_from_mcp_state(payload).as_deref() == Some(request_id)
+        && extract_project_path_from_mcp_state(payload)
+            .is_some_and(|path| project_paths_match(&normalize_bridge_project_path(&path), project_path))
+}
+
+async fn closed_mcp_state_project_for_request(request_id: &str) -> Option<String> {
+    let routes = CLOSED_MCP_STATE_ROUTES.read().await;
+    let (path, closed_at) = routes.get(request_id)?;
+    (chrono::Utc::now().timestamp().saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+        .then(|| path.clone())
+}
+
+async fn cleanup_closed_mcp_state_route(request_id: &str, project_path: &str) -> Result<(usize, bool), &'static str> {
+    let mut closed_routes = CLOSED_MCP_STATE_ROUTES.write().await;
+    let now = chrono::Utc::now().timestamp();
+    closed_routes.retain(|_, (_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS);
+    if closed_routes.get(request_id).is_some_and(|(path, _)| path != project_path) {
+        return Err("closed_route_mismatch");
+    }
+    let mut cache = MCP_STATE_CACHE.write().await;
+    let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
+    let mut registry = ACTIVE_SESSION_REGISTRY.write().await;
+
+    if cache.get(request_id).is_some_and(|payload| !mcp_state_matches_exact_route(payload, request_id, project_path))
+        || registry.get(request_id).is_some_and(|entry| normalize_bridge_project_path(&entry.project_path) != project_path)
+    {
+        return Err("closed_route_mismatch");
+    }
+
+    if !closed_routes.contains_key(request_id) && closed_routes.len() >= CLOSED_MCP_STATE_ROUTE_MAX_ENTRIES {
+        if let Some(oldest_id) = closed_routes.iter()
+            .min_by_key(|(_, (_, closed_at))| *closed_at)
+            .map(|(id, _)| id.clone()) {
+            closed_routes.remove(&oldest_id);
+        }
+    }
+    closed_routes.insert(request_id.to_string(), (project_path.to_string(), now));
+
+    let mut removed = 0;
+    if cache.remove(request_id).is_some() {
+        touched_at.remove(request_id);
+        removed += 1;
+    }
+    if cache.get(project_path).is_some_and(|payload| mcp_state_matches_exact_route(payload, request_id, project_path)) {
+        cache.remove(project_path);
+        touched_at.remove(project_path);
+        removed += 1;
+    }
+    let removed_active = registry.remove(request_id).is_some();
+    Ok((removed, removed_active))
+}
+
 async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) -> bool {
     let request_id = extract_request_id_from_mcp_state(&payload);
     let project_path = extract_project_path_from_mcp_state(&payload);
+    // Hold the closed-route lock until the cache and registry writes finish, in
+    // the same order as cleanup_closed_mcp_state_route, so a close cannot slip
+    // between this check and the write.
+    let closed_routes = CLOSED_MCP_STATE_ROUTES.read().await;
+    if let Some(request_id) = request_id.as_deref() {
+        let now = chrono::Utc::now().timestamp();
+        if closed_routes.get(request_id)
+            .is_some_and(|(_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+        {
+            return false;
+        }
+    }
 
     let mut cache = MCP_STATE_CACHE.write().await;
     // A late ready notification/retry must not overwrite richer frontend state already cached.
@@ -13433,6 +13565,8 @@ async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) -> bool
     record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
     let mut active_registry = ACTIVE_SESSION_REGISTRY.write().await;
     update_active_session_registry(&mut active_registry, &payload);
+    drop(active_registry);
+    drop(closed_routes);
 
     bridge_debug_log(&format!(
         "[Bridge Timing] early mcp_state cached: request_id={:?}, project_path={:?}, cache_keys={}, source={}",
@@ -13647,6 +13781,35 @@ async fn handle_bridge_publish(
         return stale_request_response();
     }
 
+    if message.message_type == "mcp_state" && is_explicit_closed_mcp_state(&message.payload) {
+        let (request_id, project_path) = match closed_mcp_state_route(&message.payload) {
+            Ok(route) => route,
+            Err(reason) => return json_error_response(StatusCode::BAD_REQUEST, reason),
+        };
+        let (removed_cache_keys, removed_active) =
+            match cleanup_closed_mcp_state_route(&request_id, &project_path).await {
+                Ok(result) => result,
+                Err(reason) => return json_error_response(StatusCode::CONFLICT, reason),
+            };
+        record_last_completed_route(Some(&request_id), Some(&project_path), "mcp-state-closed").await;
+        clear_active_desktop_popup_route(Some(&request_id), Some(&project_path), "mcp-state-closed")
+            .await;
+        bridge_debug_log(&format!(
+            "[Bridge] closed mcp_state: request_id={}, project_path={}, removed_cache_keys={}, removed_active={}",
+            request_id, project_path, removed_cache_keys, removed_active
+        ));
+        let _ = tx.send(message);
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if message.message_type == "mcp_state" {
+        if let Some(request_id) = publish_request_id.as_deref() {
+            if closed_mcp_state_project_for_request(request_id).await.is_some() {
+                return stale_request_response();
+            }
+        }
+    }
+
     if message.message_type == "mcp_action" && has_room_submit_metadata(&message.payload) {
         let action = message
             .payload
@@ -13737,6 +13900,10 @@ async fn handle_bridge_publish(
         return (status, Json(outcome)).into_response();
     }
 
+    // Held from the final closed check until the broadcast, in the same order
+    // as cleanup_closed_mcp_state_route, so a close cannot be overtaken by
+    // this publish writing the cache or broadcasting an older state.
+    let mut closed_routes_guard = None;
     if message.message_type == "mcp_state" {
         // 服务端注入 timelineNodes：从 ConversationManager 查找当前对话路径
         let has_frontend_timeline = message
@@ -13951,6 +14118,16 @@ async fn handle_bridge_publish(
         let request_id = extract_request_id_from_mcp_state(&message.payload);
         let project_path = extract_project_path_from_mcp_state(&message.payload);
         record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
+        let closed_routes = CLOSED_MCP_STATE_ROUTES.read().await;
+        if let Some(rid) = request_id.as_deref() {
+            let now = chrono::Utc::now().timestamp();
+            if closed_routes.get(rid)
+                .is_some_and(|(_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+            {
+                return stale_request_response();
+            }
+        }
+        closed_routes_guard = Some(closed_routes);
         let mut cache = MCP_STATE_CACHE.write().await;
         let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
         prune_json_cache(
@@ -14029,6 +14206,8 @@ async fn handle_bridge_publish(
             ));
         }
     }
+
+    drop(closed_routes_guard);
 
     if let Some(web_push_message) = web_push_message {
         tokio::spawn(async move {
@@ -14611,6 +14790,26 @@ fn image_content_type_for_path(file_path: &std::path::Path) -> &'static str {
 pub async fn send_to_web_bridge(message: BridgeMessage) -> Result<(), String> {
     // 只通过 HTTP POST 转发到 Bridge Server（避免重复推送）
     // handle_bridge_publish 会负责缓存写入和广播到所有 WebSocket 客户端
+    // 显式关闭状态必须确认送达，调用方据此判断其他端是否已收到关闭（#44）
+    if message.message_type == "mcp_state" && is_explicit_closed_mcp_state(&message.payload) {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|error| format!("创建 Bridge HTTP 客户端失败: {}", error))?;
+        let url = "http://127.0.0.1:8080/bridge/publish";
+        let request = client
+            .post(url)
+            .json(&message)
+            .timeout(std::time::Duration::from_secs(2));
+        let request = crate::bridge::auth::authorize_internal_bridge_request(request, "POST", url)?;
+        request
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
             .no_proxy() // 绕过代理
@@ -16378,7 +16577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_submit_preflight_cleans_expired_serve_response_route() {
+    async fn room_submit_preflight_rejects_expired_route_without_deleting_it() {
         let _guard = ROOM_SUBMIT_TEST_LOCK.lock().await;
         clear_room_submit_outcome_cache_for_tests();
 
@@ -16462,7 +16661,9 @@ mod tests {
             outcome.delivery_attempts[0].reason.as_deref(),
             Some("response_route_expired")
         );
-        assert!(!route_file.exists());
+        // The live serve process renews this route; deleting it would make
+        // the popup permanently undeliverable after a missed renewal.
+        assert!(route_file.exists());
 
         let _ = std::fs::remove_file(&route_file);
         let _ = std::fs::remove_file(&response_file);
@@ -20838,7 +21039,9 @@ async fn handle_api_mobile_reply_status(
         .join("mobile-replies")
         .join(format!("{}.json", key));
     match super::mobile_reply::lookup(&path, &operation) {
-        Ok(Some(receipt)) => Json(receipt).into_response(),
+        Ok(Some(receipt)) => {
+            Json(super::mobile_reply::refresh_cross_device_receipt(&path, receipt)).into_response()
+        }
         Ok(None) => Json(serde_json::json!({"operation_id": operation, "status": "absent", "receipt_scope": "bridge_delivery"})).into_response(),
         Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
     }
@@ -20911,10 +21114,11 @@ async fn handle_api_mobile_reply(
         request_id,
         replay_epoch.is_some()
     ));
-    let receipt =
+    let mut receipt =
         match super::mobile_reply::reserve_with_epoch(&path, operation, &digest, replay_epoch) {
             Ok(super::mobile_reply::Reservation::Existing(value)) => {
-                return Json(value).into_response()
+                return Json(super::mobile_reply::refresh_cross_device_receipt(&path, value))
+                    .into_response()
             }
             Ok(super::mobile_reply::Reservation::New(value)) => value,
             Err(error) => {
@@ -20977,8 +21181,29 @@ async fn handle_api_mobile_reply(
             )
             .await
         };
+        let cross_pending = result.attempts.iter().any(|attempt| {
+            attempt.method == "cross_device_source"
+                && attempt.reason.as_deref() == Some(super::mobile_reply::CROSS_DEVICE_PENDING_REASON)
+        });
+        let cross_rejection = result.attempts.iter()
+            .find(|attempt| attempt.method == "cross_device_source" && !attempt.delivered)
+            .and_then(|attempt| attempt.reason.clone())
+            .filter(|reason| reason != super::mobile_reply::CROSS_DEVICE_PENDING_REASON);
         if result.delivered {
             ("delivered", None)
+        } else if let Some(reason) = cross_rejection {
+            // Arbitration decided: the request was closed or another reply won.
+            let stored = super::mobile_reply::finish(&path, receipt, "rejected", Some(&reason));
+            return match stored {
+                Ok(value) => Json(value).into_response(),
+                Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
+            };
+        } else if cross_pending {
+            receipt.cross_device_route = Some(super::mobile_reply::CrossDeviceRoute {
+                request_id: request_id.to_string(),
+                project_path: project.clone(),
+            });
+            ("uncertain", Some(super::mobile_reply::CROSS_DEVICE_PENDING_REASON))
         } else {
             ("uncertain", Some("delivery_not_confirmed"))
         }

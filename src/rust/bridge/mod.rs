@@ -13,6 +13,7 @@ mod markdown_images;
 mod mcp_action_delivery;
 mod mcp_action_handler;
 mod mcp_action_payload;
+pub(crate) use mcp_action_payload::{build_goal_payload_parts as android_goal_payload_parts, build_goal_submit_prompt as android_goal_submit_prompt};
 mod mcp_action_recording;
 mod mcp_state_extract;
 mod mobile_file_upload;

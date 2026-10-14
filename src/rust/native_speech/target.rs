@@ -8,6 +8,10 @@ pub struct FrontmostApplication {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
+    fn speech_bridge_copy_current_bundle_identifier(
+        bundle_id: *mut std::ffi::c_char,
+        capacity: usize,
+    ) -> bool;
     fn speech_bridge_copy_frontmost_application(
         bundle_id: *mut std::ffi::c_char,
         bundle_id_capacity: usize,
@@ -18,6 +22,36 @@ unsafe extern "C" {
         bundle_id: *const std::ffi::c_char,
         pid: i32,
     ) -> bool;
+}
+
+/// Read the running bundle, including identities preserved by the installer.
+#[cfg(target_os = "macos")]
+pub fn current_bundle_identifier() -> Option<String> {
+    let mut buffer = [0_i8; 1024];
+    if !unsafe { speech_bridge_copy_current_bundle_identifier(buffer.as_mut_ptr(), buffer.len()) } {
+        return None;
+    }
+    let identifier = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }.to_str().ok()?;
+    (!identifier.is_empty()).then(|| identifier.to_owned())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn matches_own_bundle(candidate: &str, current: Option<&str>) -> bool {
+    current.is_some_and(|identifier| !identifier.is_empty() && candidate == identifier)
+}
+
+#[cfg(test)]
+mod bundle_identity_tests {
+    use super::matches_own_bundle;
+
+    #[test]
+    fn uses_runtime_identity_without_recognizing_other_installations() {
+        assert!(matches_own_bundle("dev.example.custom", Some("dev.example.custom")));
+        assert!(!matches_own_bundle("com.kexin94yyds.iterate", Some("dev.example.custom")));
+        assert!(!matches_own_bundle("dev.example.custom.other", Some("dev.example.custom")));
+        assert!(!matches_own_bundle("dev.example.custom", None));
+        assert!(!matches_own_bundle("", Some("")));
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -14,6 +14,37 @@ use super::ws::{
 use crate::conversation::ConversationManager;
 use tauri::{AppHandle, Emitter, Manager};
 
+/// None: not a cross-device source request; keep the local delivery paths.
+/// The source popup records the timeline when it consumes the winner, so the
+/// Bridge must not deliver or record this reply a second time.
+async fn submit_cross_device_source(
+    project_path: &str,
+    request_id: Option<&str>,
+    response: &serde_json::Value,
+) -> Option<RoomDeliveryResult> {
+    let request_id = request_id?;
+    let result =
+        crate::cross_device::submit_local_bridge_response(request_id, project_path, response).await?;
+    bridge_debug_log(&format!(
+        "cross-device source reply: request_id={}, project={}, result={:?}",
+        request_id, project_path, result
+    ));
+    Some(match result {
+        Ok(true) => RoomDeliveryResult::delivered(RoomDeliveryAttempt::internal(
+            "cross_device_source", project_path, Some(request_id), true, None,
+        )),
+        // The winner is accepted but the source has not confirmed consumption.
+        // Do not claim delivery; resending the same reply is idempotent.
+        Ok(false) => RoomDeliveryResult::rejected(RoomDeliveryAttempt::internal(
+            "cross_device_source", project_path, Some(request_id), false,
+            Some("source_confirmation_pending"),
+        )),
+        Err(reason) => RoomDeliveryResult::rejected(RoomDeliveryAttempt::internal(
+            "cross_device_source", project_path, Some(request_id), false, Some(&reason),
+        )),
+    })
+}
+
 pub(super) async fn try_handle_mcp_action_directly(
     app_handle: &AppHandle,
     project_path: &str,
@@ -268,12 +299,9 @@ pub(super) async fn try_handle_mcp_action_directly(
         }
     };
 
-    crate::ui::live_goal::apply_live_goal_intent_from_response(
-        Some(app_handle),
-        &response,
-        Some(project_path),
-        request_id,
-    );
+    if let Some(result) = submit_cross_device_source(project_path, request_id, &response).await {
+        return result;
+    }
 
     if let Some(state) = app_handle.try_state::<crate::config::AppState>() {
         let response_str = match serde_json::to_string(&response) {
@@ -362,6 +390,10 @@ pub(super) async fn try_handle_mcp_action_directly(
                 request_id, project_path
             );
 
+            crate::ui::live_goal::apply_live_goal_intent_from_response(
+                Some(app_handle), &response, Some(project_path), request_id,
+            );
+
             if let Err(err) = record_mcp_action_response_node(
                 app_handle,
                 action,
@@ -412,6 +444,9 @@ pub(super) async fn try_handle_mcp_action_directly(
                 &bridge_debug_log,
             );
             if serve_attempt.delivered {
+                crate::ui::live_goal::apply_live_goal_intent_from_response(
+                    Some(app_handle), &response, Some(project_path), request_id,
+                );
                 if let Err(e) = app_handle.emit(
                     "bridge-mcp-action-handled",
                     serde_json::json!({
@@ -611,6 +646,10 @@ pub(super) async fn try_handle_mcp_action_headless(
         }
     };
 
+    if let Some(result) = submit_cross_device_source(project_path, request_id, &response).await {
+        return result;
+    }
+
     let response_str = match serde_json::to_string(&response) {
         Ok(value) => value,
         Err(err) => {
@@ -624,13 +663,6 @@ pub(super) async fn try_handle_mcp_action_headless(
             ));
         }
     };
-
-    crate::ui::live_goal::apply_live_goal_intent_from_response::<tauri::Wry>(
-        None,
-        &response,
-        Some(project_path),
-        request_id,
-    );
 
     let serve_attempt = try_write_serve_response_file(
         request_id,
@@ -646,6 +678,10 @@ pub(super) async fn try_handle_mcp_action_headless(
         ));
         return RoomDeliveryResult::rejected(serve_attempt);
     }
+
+    crate::ui::live_goal::apply_live_goal_intent_from_response::<tauri::Wry>(
+        None, &response, Some(project_path), request_id,
+    );
 
     if matches!(action, "submit" | "continue" | "enhance") {
         let persistent_manager = ConversationManager::new_with_forced_persistence();

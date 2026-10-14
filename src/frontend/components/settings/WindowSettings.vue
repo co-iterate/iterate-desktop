@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { NRadioButton, NRadioGroup } from 'naive-ui'
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 
 const props = defineProps({
@@ -28,6 +29,38 @@ const emit = defineEmits(['toggleAlwaysOnTop', 'updateWindowSize'])
 const localFixed = ref(props.fixedWindowSize)
 const localWidth = ref(props.windowWidth)
 const localHeight = ref(props.windowHeight)
+const popupPlacement = ref<'left' | 'center'>('left')
+const savingPopupPlacement = ref(false)
+const popupPlacementError = ref('')
+
+async function loadPopupPlacement() {
+  try {
+    const config = await invoke<{ popup_placement?: string }>('get_window_config')
+    popupPlacement.value = config.popup_placement === 'center' ? 'center' : 'left'
+  }
+  catch (error) {
+    popupPlacementError.value = `加载弹窗位置失败：${error}`
+  }
+}
+
+async function updatePopupPlacement(value: string | number | null) {
+  if (value !== 'left' && value !== 'center')
+    return
+  if (savingPopupPlacement.value || popupPlacement.value === value)
+    return
+  savingPopupPlacement.value = true
+  popupPlacementError.value = ''
+  try {
+    await invoke('set_window_settings', { windowSettings: { popup_placement: value } })
+    popupPlacement.value = value
+  }
+  catch (error) {
+    popupPlacementError.value = `保存弹窗位置失败：${error}`
+  }
+  finally {
+    savingPopupPlacement.value = false
+  }
+}
 
 // 实时窗口大小
 const currentWidth = ref(0)
@@ -246,6 +279,7 @@ function removeWindowResizeListener() {
 
 // 组件挂载时获取当前窗口大小并设置监听器
 onMounted(async () => {
+  await loadPopupPlacement()
   await loadWindowConstraints()
   getCurrentWindowSize()
   loadWindowSettingsForMode(localFixed.value)
@@ -261,6 +295,34 @@ onUnmounted(() => {
 <template>
   <!-- 设置内容 -->
   <n-space vertical size="large">
+    <div class="flex items-start">
+      <div class="w-1.5 h-1.5 bg-success rounded-full mr-3 mt-2 flex-shrink-0" />
+      <div>
+        <div class="text-sm font-medium leading-relaxed mb-1">
+          弹窗位置
+        </div>
+        <div class="text-xs opacity-60 mb-3">
+          新的 iterate 弹窗显示在鼠标所在屏幕的工作区
+        </div>
+        <NRadioGroup
+          :value="popupPlacement"
+          :disabled="savingPopupPlacement"
+          size="small"
+          @update:value="updatePopupPlacement"
+        >
+          <NRadioButton value="left">
+            靠左
+          </NRadioButton>
+          <NRadioButton value="center">
+            居中
+          </NRadioButton>
+        </NRadioGroup>
+        <div v-if="popupPlacementError" class="text-xs text-red-500 mt-2" role="alert">
+          {{ popupPlacementError }}
+        </div>
+      </div>
+    </div>
+
     <!-- 置顶显示设置 -->
     <div class="flex items-center justify-between">
       <div class="flex items-center">

@@ -12,7 +12,7 @@ import {
   resolveMobileConnectionBootstrap,
   singleFlight,
 } from './mobileConnectionMachine.ts'
-import { buildFormalRouteRepairPrompt, buildFormalRouteSetupPrompt } from './mobileConnectionPrompts.ts'
+import { buildAliyunIpRouteSetupPrompt, buildFormalRouteRepairPrompt, buildFormalRouteSetupPrompt } from './mobileConnectionPrompts.ts'
 
 const healthyPublic = {
   transport_mode: 'public_tunnel',
@@ -255,7 +255,13 @@ test('formal AI prompts are redacted, route-scoped, and contain no developer hos
   const prompt = await readFile(new URL('./mobileConnectionPrompts.ts', import.meta.url), 'utf8')
   const setupPrompt = buildFormalRouteSetupPrompt()
   const repairPrompt = buildFormalRouteRepairPrompt('https://user-owned.example.com', 'probe timeout / raw detail')
+  const aliyunSetup = buildAliyunIpRouteSetupPrompt()
 
+  assert.match(aliyunSetup, /公网 Host（含端口）/)
+  assert.match(aliyunSetup, /X-Forwarded-For/)
+  assert.match(aliyunSetup, /X-Forwarded-Proto/)
+  assert.match(aliyunSetup, /\/api\/config、\/api\/active-sessions 及 \/ws WebSocket Upgrade 都必须返回 401/)
+  assert.match(aliyunSetup, /不得关闭 Bridge 鉴权/)
   assert.match(prompt, /buildFormalRouteSetupPrompt/)
   assert.match(prompt, /buildFormalRouteRepairPrompt/)
   assert.match(prompt, /\$\{safeBaseUrl\}/)
@@ -317,6 +323,21 @@ test('bootstrap branches only on persisted formal route status', async () => {
   assert.ok(pairingRead > bootstrapStart)
   assert.ok(formalDecision > pairingRead)
   assert.doesNotMatch(setup.slice(bootstrapStart), /readQuickTunnelStatus/)
+})
+
+test('verified Aliyun IP route permits a matching secure pairing candidate', () => {
+  assert.equal(resolveMobileConnectionBootstrap({
+    formal_route: {
+      ...healthyFormalRoute,
+      transport: 'aliyun_ssh_reverse_tunnel',
+      base_url: 'https://8.129.82.226:8443',
+    },
+    candidates: [{
+      ...healthyPublic,
+      base_url: 'https://8.129.82.226:8443',
+      ws_url: 'wss://8.129.82.226:8443/ws',
+    }],
+  }), 'issue_pairing')
 })
 
 test('wizard reopens only an unclaimed fresh QR without preparing the bridge again', async () => {

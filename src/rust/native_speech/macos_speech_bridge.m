@@ -7,6 +7,30 @@
 #include "macos_speech_abi.h"
 #include <string.h>
 
+static NSString *SpeechErrorDiagnostic(NSString *stage, NSError *error) {
+    NSArray<NSString *> *domains = @[@"kAFAssistantErrorDomain", @"SFSpeechErrorDomain",
+        @"NSOSStatusErrorDomain", @"AVFoundationErrorDomain", @"NSCocoaErrorDomain"];
+    NSString *domain = error == nil ? @"none" :
+        ([domains containsObject:error.domain] ? error.domain : @"other");
+    return [NSString stringWithFormat:@"stage=%@ domain=%@ code=%ld",
+        stage, domain, (long)(error == nil ? 0 : error.code)];
+}
+
+bool speech_bridge_copy_current_bundle_identifier(char *bundleId, size_t capacity) {
+    if (bundleId == NULL || capacity == 0) {
+        return false;
+    }
+    @autoreleasepool {
+        NSString *identifier = NSBundle.mainBundle.bundleIdentifier;
+        const char *utf8 = identifier.UTF8String;
+        if (identifier.length == 0 || utf8 == NULL || strlen(utf8) + 1 > capacity) {
+            return false;
+        }
+        memcpy(bundleId, utf8, strlen(utf8) + 1);
+        return true;
+    }
+}
+
 bool speech_bridge_copy_frontmost_application(char *bundleId,
                                               size_t bundleIdCapacity,
                                               int32_t *pid) {
@@ -234,6 +258,8 @@ static _Atomic uint64_t g_speech_generation = 0;
     [self resetRecognition:YES];
 
     if (self.speechRecognizer == nil || !self.speechRecognizer.isAvailable) {
+        [self emitEvent:@"diag-error" text:SpeechErrorDiagnostic(@"recognizer-unavailable", nil)
+               identity:identity generation:generation];
         [self emitEvent:@"error"
                    text:@"macOS 语音识别当前不可用"
                identity:identity
@@ -334,6 +360,9 @@ static _Atomic uint64_t g_speech_generation = 0;
                                                 }
 
                                                 if (error != nil) {
+                                                    [strongSelf emitEvent:@"diag-error"
+                                                                     text:SpeechErrorDiagnostic(@"recognition-task", error)
+                                                                 identity:capturedIdentity generation:generation];
                                                     NSString *message = error.localizedDescription ?: @"未知错误";
                                                     [strongSelf emitEvent:@"error"
                                                                      text:message
@@ -348,6 +377,8 @@ static _Atomic uint64_t g_speech_generation = 0;
     NSError *startError = nil;
     [self.audioEngine prepare];
     if (![self.audioEngine startAndReturnError:&startError]) {
+        [self emitEvent:@"diag-error" text:SpeechErrorDiagnostic(@"audio-engine-start", startError)
+               identity:identity generation:generation];
         NSString *message = startError.localizedDescription ?: @"音频引擎启动失败";
         [self emitEvent:@"error" text:message identity:identity generation:generation];
         [self resetRecognition:YES];
@@ -386,6 +417,8 @@ static _Atomic uint64_t g_speech_generation = 0;
             }
 
             if (status != SFSpeechRecognizerAuthorizationStatusAuthorized) {
+                [strongSelf emitEvent:@"diag-error" text:SpeechErrorDiagnostic(@"speech-authorization", nil)
+                             identity:identity generation:generation];
                 [strongSelf emitEvent:@"error"
                                  text:@"语音识别权限未开启"
                              identity:identity
@@ -407,6 +440,8 @@ static _Atomic uint64_t g_speech_generation = 0;
                                              }
 
                                              if (!granted) {
+                                                 [innerSelf emitEvent:@"diag-error" text:SpeechErrorDiagnostic(@"microphone-authorization", nil)
+                                                             identity:identity generation:generation];
                                                  [innerSelf emitEvent:@"error"
                                                                  text:@"麦克风权限未开启"
                                                              identity:identity

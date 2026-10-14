@@ -1,4 +1,4 @@
-import { computed } from 'vue'
+import { computed, onScopeDispose } from 'vue'
 import { useAppInitialization } from './useAppInitialization'
 import { useAudioManager } from './useAudioManager'
 import { useMcpHandler } from './useMcpHandler'
@@ -16,6 +16,12 @@ export function useAppManager() {
   const audioManager = useAudioManager()
   const mcpHandler = useMcpHandler()
   const appInit = useAppInitialization(mcpHandler)
+  const refreshSyncedSettings = async () => {
+    await settings.reloadAllSettings()
+    await theme.loadTheme()
+  }
+  window.addEventListener('iterate:settings-synced', refreshSyncedSettings)
+  onScopeDispose(() => window.removeEventListener('iterate:settings-synced', refreshSyncedSettings))
 
   // 创建统一的配置对象
   const appConfig = computed(() => {

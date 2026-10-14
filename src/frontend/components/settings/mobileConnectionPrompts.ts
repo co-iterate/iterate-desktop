@@ -68,11 +68,19 @@ C. 如果 configured=false：
 如果任何必要授权、域名、正式端口、端点身份或安全登记命令不满足，保留现状并报告最少人工步骤；不得宣称二维码已经启用。`
 }
 
-export function buildFormalRouteRepairPrompt(baseUrl: string, code: string) {
+export function buildFormalRouteRepairPrompt(baseUrl: string, code: string, transport?: string | null) {
   const safeBaseUrl = /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(baseUrl.trim())
     ? baseUrl.trim()
     : '已配置的正式 HTTPS 域名（请从 iterate 脱敏状态中读取）'
   const safeCode = String(code || 'formal_route_unhealthy').replace(/[^\w.:-]/g, '_').slice(0, 120)
+  if (transport === 'aliyun_ssh_reverse_tunnel') {
+    return `请只修复当前电脑上 iterate 已配置的阿里云 IP + SSH 正式手机路线。
+
+已配置地址：${safeBaseUrl}
+脱敏错误码：${safeCode}
+
+先运行 --mobile-route-status 和 --mobile-route-verify；检查本机 8080、Windows 出站 SSH 自动重连、阿里云回环 18080、IP:8443 的可信 HTTPS 证书及 WSS，并验证公网端点属于当前安装。确认 nginx 保留公网 Host（含端口）、传递真实客户端 X-Forwarded-For，且无凭据访问 /api/config、/api/active-sessions 与 /ws WebSocket Upgrade 均返回 401。只恢复这条路线，保留现有 443 网站和其他接口，不得关闭 Bridge 鉴权。不要输出私钥、凭据或配对链接；需要改变安全边界或产生费用时先请用户决定。完成后再次运行 --mobile-route-verify，并报告实际恢复动作和结果。`
+  }
   return `请只修复这台 Mac 上 iterate 已经配置的正式 iPhone 公网路线，不要创建或切换到另一条路线。
 
 已配置地址：${safeBaseUrl}
@@ -86,4 +94,16 @@ export function buildFormalRouteRepairPrompt(baseUrl: string, code: string) {
 - 只允许做与现有 ${safeBaseUrl} 直接相关、可回滚的本机恢复；云端或管理员操作必须先说明并等待我确认。
 
 完成后再次运行 --mobile-route-verify，只报告根因、实际恢复动作、脱敏健康状态和回滚方式。若仍失败，保留现有配置并报告最少的人工步骤。`
+}
+
+export function buildAliyunIpRouteSetupPrompt() {
+  return `请为当前 Windows 电脑上的 iterate 配置长期稳定的阿里云 IP 正式手机路线，公网入口使用可信 IP 证书的 https://服务器公网IP:8443。
+
+1. 先确认本机 Bridge 的 http://127.0.0.1:8080/api/version 正常，并只读检查阿里云 8443 端口、现有 443 网站和现有服务。
+2. 建立 Windows 可自动重连的出站 SSH，将阿里云仅监听 127.0.0.1:18080 的反向端口转发到本机 127.0.0.1:8080。
+3. 在阿里云单独配置 IP:8443 的 HTTPS/WSS 反向代理与可信 IP 证书及自动续期；nginx 必须保留公网 Host（含端口）、传递真实客户端 X-Forwarded-For，并设置 X-Forwarded-Proto 为 https。只放通必要的 8443，不改现有 443 网站和其他接口。
+4. 从公网验证证书、/.well-known/iterate/health 的当前安装身份、WebSocket 路径和 SSH 断线重连；无凭据请求 /api/config、/api/active-sessions 及 /ws WebSocket Upgrade 都必须返回 401，不得关闭 Bridge 鉴权。失败时停止新增服务并恢复此次配置。
+5. 验证成功后，使用当前 iterate 可执行文件执行 --mobile-route-register --transport aliyun_ssh_reverse_tunnel --base-url "https://服务器公网IP:8443" --source ai_configured，再运行 --mobile-route-verify。
+
+不得在输出中展示 SSH 私钥、凭据、配对链接或原始日志。任何需要新增费用、改变现有公网服务或安全边界的步骤，先说明影响并取得用户决定。`
 }

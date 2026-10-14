@@ -47,6 +47,8 @@ struct ServeResponseRoute {
     project_path: String,
     response_file: PathBuf,
     created_at: i64,
+    #[serde(default)]
+    original_created_at: Option<i64>,
 }
 
 pub(super) fn load_live_serve_request_fallback(
@@ -96,7 +98,11 @@ fn load_live_serve_request_fallback_from_dir(
         .map_err(|_| ServeRequestFallbackMiss::InvalidRouteFile)?;
 
     let route_age_secs = now_unix_secs.saturating_sub(route.created_at);
+    let original_created_at = route.original_created_at.unwrap_or(route.created_at);
     if route.created_at > now_unix_secs.saturating_add(CLOCK_SKEW_ALLOWANCE_SECS) {
+        return Err(ServeRequestFallbackMiss::StaleRoute);
+    }
+    if original_created_at > route.created_at {
         return Err(ServeRequestFallbackMiss::StaleRoute);
     }
 
@@ -111,7 +117,7 @@ fn load_live_serve_request_fallback_from_dir(
     let registered_at = chrono::DateTime::parse_from_rfc3339(&live_binding.registered_at)
         .map_err(|_| ServeRequestFallbackMiss::NoLiveWindowBinding)?
         .timestamp();
-    if registered_at.saturating_sub(route.created_at).abs() > CLOCK_SKEW_ALLOWANCE_SECS {
+    if registered_at.saturating_sub(original_created_at).abs() > CLOCK_SKEW_ALLOWANCE_SECS {
         return Err(ServeRequestFallbackMiss::NoLiveWindowBinding);
     }
 
@@ -148,9 +154,18 @@ fn load_live_serve_request_fallback_from_dir(
 }
 
 fn is_serve_request_id(request_id: &str) -> bool {
-    request_id.strip_prefix("serve-").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.len() <= 20 && suffix.bytes().all(|b| b.is_ascii_digit())
-    })
+    let Some(suffix) = request_id.strip_prefix("serve-") else {
+        return false;
+    };
+    if !suffix.is_empty() && suffix.len() <= 20 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let Some((timestamp, uuid)) = suffix.split_once('-') else {
+        return false;
+    };
+    timestamp.len() == 13
+        && timestamp.bytes().all(|b| b.is_ascii_digit())
+        && uuid::Uuid::parse_str(uuid).is_ok()
 }
 
 fn validate_secure_temp_directory(temp_dir: &Path) -> Result<(), ServeRequestFallbackMiss> {
@@ -311,6 +326,23 @@ mod tests {
     }
 
     #[test]
+    fn loads_current_serve_request_id_with_uuid() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1790436233047-8218c42c-7a73-452d-a8a2-5a8ec969e763";
+        let project_path = "/tmp/iterate-desktop";
+        write_fixture(temp_dir.path(), request_id, project_path, NOW);
+        let fallback = load_live_serve_request_fallback_from_dir(
+            temp_dir.path(),
+            request_id,
+            project_path,
+            &[window_instance(request_id, project_path)],
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(fallback.payload["request"]["id"], request_id);
+    }
+
+    #[test]
     fn rejects_non_serve_request_ids() {
         let temp_dir = private_temp_dir();
         let result = load_live_serve_request_fallback_from_dir(
@@ -321,6 +353,16 @@ mod tests {
             NOW,
         );
         assert_eq!(result.unwrap_err(), ServeRequestFallbackMiss::InvalidRoute);
+        for request_id in [
+            "serve-1790436233047-../../secret",
+            "serve-1790436233047-not-a-uuid",
+            "serve-1790436233047-8218c42c-7a73-452d-a8a2-5a8ec969e763/evil",
+        ] {
+            let result = load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, "/tmp/cunzhi", &[], NOW,
+            );
+            assert_eq!(result.unwrap_err(), ServeRequestFallbackMiss::InvalidRoute);
+        }
     }
 
     #[test]
@@ -414,6 +456,37 @@ mod tests {
 
         assert_eq!(fallback.payload["request"]["id"], request_id);
         assert_eq!(fallback.age_ms, 24 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn renewed_route_still_matches_original_window_creation_time() {
+        let temp_dir = private_temp_dir();
+        let request_id = "serve-1786277363180";
+        let project_path = "/tmp/cunzhi";
+        let original_created_at = NOW - 24 * 60 * 60;
+        write_fixture(temp_dir.path(), request_id, project_path, NOW);
+        let route_path = temp_dir.path().join(format!("iterate_response_route_{request_id}.json"));
+        let mut route: serde_json::Value = serde_json::from_slice(&fs::read(&route_path).unwrap()).unwrap();
+        route["original_created_at"] = serde_json::json!(original_created_at);
+        fs::write(&route_path, serde_json::to_vec(&route).unwrap()).unwrap();
+        let mut live_window = window_instance(request_id, project_path);
+        live_window.registered_at = chrono::DateTime::from_timestamp(original_created_at, 0)
+            .unwrap().to_rfc3339();
+
+        let fallback = load_live_serve_request_fallback_from_dir(
+            temp_dir.path(), request_id, project_path, &[live_window.clone()], NOW,
+        ).unwrap();
+        assert_eq!(fallback.payload["request"]["id"], request_id);
+        assert_eq!(fallback.age_ms, 0);
+
+        live_window.registered_at = chrono::DateTime::from_timestamp(NOW, 0)
+            .unwrap().to_rfc3339();
+        assert_eq!(
+            load_live_serve_request_fallback_from_dir(
+                temp_dir.path(), request_id, project_path, &[live_window], NOW,
+            ).unwrap_err(),
+            ServeRequestFallbackMiss::NoLiveWindowBinding,
+        );
     }
 
     #[test]

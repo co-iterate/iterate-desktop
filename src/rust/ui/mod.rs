@@ -20,6 +20,8 @@ pub mod updater;
 pub mod window;
 pub mod window_events;
 pub mod window_registry;
+#[cfg(target_os = "windows")]
+pub mod webview_recovery;
 
 pub use audio::*;
 pub use audio_assets::*;
