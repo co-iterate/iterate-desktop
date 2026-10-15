@@ -64,6 +64,7 @@
     "test:ui": "cd src/frontend/test && vite",
     "test:ui:build": "cd src/frontend/test && vite build",
     "test:conversation-end": "node --test src/frontend/utils/conversationEndCommand.test.ts",
+    "test:desktop-community-activation": "node --test scripts/desktop-community-activation.test.mjs",
     "test:windows-experience": "node --test scripts/windows-experience-contract.test.mjs",
     "tauri:build:windows": "pwsh -NoProfile -File ./scripts/build-windows-installer.ps1"
   },

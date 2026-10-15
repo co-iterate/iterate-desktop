@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { isExplicitConversationEndInput } from '../../utils/conversationEndCommand'
 import type { McpRequest, PopupArtifact, PopupFileAttachment, PopupInputData, PopupTextSelection, ShortcutBinding } from '../../types/popup'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-
 import { useShortcuts } from '../../composables/useShortcuts'
+
+import { isExplicitConversationEndInput } from '../../utils/conversationEndCommand'
 import { stripAutoPrompt } from '../../utils/textUtils'
 import TimelineDotBar from '../conversation/TimelineDotBar.vue'
 import PopupActions from './PopupActions.vue'

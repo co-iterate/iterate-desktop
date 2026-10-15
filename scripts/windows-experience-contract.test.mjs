@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 function source(path) {
-  return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
+  // Windows checkouts use CRLF; assertions match LF source text.
+  return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 }
 
 test('Windows registry liveness check does not spawn tasklist', () => {

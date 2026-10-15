@@ -266,6 +266,12 @@ if [[ ! -x "${RELEASE_ITERATE_BIN}" ]]; then
   exit 1
 fi
 
+ACTIVATION_GATE_STATUS="$("${RELEASE_ITERATE_BIN}" --activation-gate-status)"
+if [[ "${ACTIVATION_GATE_STATUS}" != "activation_gate_required=false" ]]; then
+  echo "Community macOS artifact unexpectedly requires activation: ${ACTIVATION_GATE_STATUS}" >&2
+  exit 1
+fi
+
 "${RELEASE_ITERATE_BIN}" --check-frontend-assets --frontend-dist "${REPO_ROOT}/dist"
 
 DMG_PATH="$(find "${BUNDLE_DMG_DIR}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
