@@ -69,7 +69,7 @@
     "tauri:build:windows": "pwsh -NoProfile -File ./scripts/build-windows-installer.ps1"
   },
   "dependencies": {
-    "@tauri-apps/api": "2.11.0",
+    "@tauri-apps/api": "2.11.1",
     "@tauri-apps/plugin-global-shortcut": "2.3.1",
     "@tauri-apps/plugin-shell": "2.3.5",
     "@types/markdown-it": "^14.1.2",
