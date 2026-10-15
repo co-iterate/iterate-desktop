@@ -74,7 +74,7 @@
     "@tauri-apps/plugin-shell": "2.3.5",
     "@types/markdown-it": "^14.1.2",
     "@vueuse/core": "^13.3.0",
-    "@vueuse/integrations": "^13.4.0",
+    "@vueuse/integrations": "^14.4.0",
     "highlight.js": "^11.11.1",
     "markdown-it": "^14.1.0",
     "mermaid": "^11.12.2",
