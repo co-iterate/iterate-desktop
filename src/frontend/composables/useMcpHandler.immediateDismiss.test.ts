@@ -65,7 +65,7 @@ describe('MCP response immediate dismissal', () => {
     assert.ok(timelineIndex > ackIndex)
 
     assert.match(cliSource, /ITERATE_RESPONSE_FILE/)
-    assert.match(cliSource, /if response_file\.exists\(\) \{[\s\S]*kill_child_best_effort[\s\S]*"response_file_observed"/)
+    assert.match(cliSource, /if response_ready \{[\s\S]*kill_child_best_effort[\s\S]*"response_file_observed"/)
     assert.match(cliSource, /tokio::time::sleep\(tokio::time::Duration::from_millis\(50\)\)\.await/)
   })
 
