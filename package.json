@@ -94,7 +94,7 @@
     "@unocss/preset-web-fonts": "^66.2.1",
     "@vitejs/plugin-vue": "^5.2.4",
     "eslint": "^9.29.0",
-    "eslint-plugin-format": "^1.0.1",
+    "eslint-plugin-format": "^2.0.1",
     "naive-ui": "^2.41.1",
     "unocss": "^66.2.1",
     "vite": "^6.3.5"
