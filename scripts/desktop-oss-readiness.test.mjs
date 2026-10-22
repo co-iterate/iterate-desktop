@@ -11,6 +11,7 @@ import {
   auditPackageScripts,
   auditSourceAssetPolicy,
   auditPackageScriptRuns,
+  auditVideoAudioTrack,
   auditWorkflowActionPins,
   prunePackageScripts,
   scanTextFindings,
@@ -131,6 +132,19 @@ test('desktop source gate rejects future audio even when its bytes look textual'
     auditSourceAssetPolicy('src/rust/assets/resources/README.md'),
     [],
   )
+})
+
+test('desktop source gate accepts silent video but rejects any audio track', () => {
+  const handler = type => Buffer.concat([Buffer.from([0, 0, 0, 33]), Buffer.from('hdlr'), Buffer.alloc(8), Buffer.from(type), Buffer.alloc(13)])
+  const silent = Buffer.concat([Buffer.from('ftypisom'), handler('vide')])
+  const withAudio = Buffer.concat([silent, handler('soun')])
+
+  assert.deepEqual(auditVideoAudioTrack('src/frontend/public/onboarding/demo.mp4', silent), [])
+  assert.deepEqual(
+    auditVideoAudioTrack('src/frontend/public/onboarding/demo.mp4', withAudio),
+    [{ code: 'video-audio-track-not-allowed', path: 'src/frontend/public/onboarding/demo.mp4' }],
+  )
+  assert.deepEqual(auditVideoAudioTrack('src/frontend/public/onboarding/demo.png', withAudio), [])
 })
 
 test('sensitive content findings never echo matched secret material', () => {

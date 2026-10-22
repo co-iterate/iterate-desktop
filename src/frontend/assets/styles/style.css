@@ -136,6 +136,12 @@ body {
   transition: border-color 100ms ease, box-shadow 100ms ease;
 }
 
+/* 弹窗主输入框撑满剩余高度，最少 3 行；高度由 flex 决定，超出时框内滚动 */
+.popup-main-input-shell--fill > .popup-main-input {
+  flex: 1 1 0;
+  max-height: none;
+}
+
 .popup-main-input:hover:not(:disabled) {
   border-color: #333333;
 }

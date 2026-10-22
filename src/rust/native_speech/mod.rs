@@ -30,6 +30,7 @@ pub mod hud_animation;
 pub mod native_backend;
 pub mod overlay;
 pub mod owner;
+pub mod paste_probe;
 pub mod phase1;
 #[cfg(target_os = "macos")]
 pub mod runtime_paths;
@@ -50,7 +51,6 @@ const INSERT_TEXT_EVENT: &str = "speech://insert-text";
 const OVERLAY_WIDTH: f64 = 96.0;
 const OVERLAY_HEIGHT: f64 = 48.0;
 const OVERLAY_BOTTOM_MARGIN: f64 = 34.0;
-const OWN_BUNDLE_ID: &str = "com.kexin94yyds.iterate";
 const LOG_PATH: &str = "/tmp/iterate-native-speech.log";
 #[cfg(target_os = "macos")]
 const SPEECH_TARGET_REGISTRY_FILE: &str = "iterate_speech_targets.json";
@@ -184,6 +184,8 @@ pub(crate) enum SpeechWritebackDispatch {
     ExternalAcknowledged,
     ExternalDispatchedUnverified,
     ExternalUnknownAfterDispatch,
+    /// Cmd+V was posted but no reader ever requested the promised text.
+    ExternalNotConsumed,
     Popup(PopupSpeechWriteback),
 }
 
@@ -191,6 +193,7 @@ pub(crate) enum SpeechWritebackDispatch {
 pub enum ExternalPasteDispatch {
     DispatchedUnverified,
     UnknownAfterDispatch,
+    NotConsumed,
 }
 
 #[cfg(target_os = "macos")]
@@ -309,6 +312,7 @@ pub struct SpeechRuntimeOwner {
     pub owner_exe_mtime: Option<String>,
     pub owner_acquired_at: Option<String>,
     pub owner_is_current_process: bool,
+    pub owner_lease_verified: bool,
     pub owner_matches_current_binary: Option<bool>,
     pub current_pid: u32,
     pub current_path: Option<String>,
@@ -425,9 +429,10 @@ struct FnOwnerState {
     lock: Option<FnOwnerLock>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Default)]
 struct FnOwnerMetadata {
+    epoch: Option<String>,
     pid: Option<u32>,
     bundle_id: Option<String>,
     exe_path: Option<String>,
@@ -791,6 +796,74 @@ fn remove_registered_popup_speech_target(request_id: &str) -> Result<(), String>
     });
     cleanup_popup_speech_target_registry(&mut registry);
     write_popup_speech_target_registry(&registry)
+}
+
+/// Registry read that reports failure instead of returning an empty registry,
+/// so "could not read" is never mistaken for "not registered".
+#[cfg(target_os = "macos")]
+fn read_popup_speech_target_registry_checked() -> Option<PopupSpeechTargetRegistry> {
+    let path = speech_target_registry_path();
+    let uid = unsafe { libc::geteuid() };
+    let mut file = runtime_paths::open_private_lock_file(&path, uid).ok()?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    // Writers truncate before writing, so empty content may be a write in
+    // progress: treat it as unknown rather than as an empty registry.
+    if content.trim().is_empty() {
+        return None;
+    }
+    let mut registry = serde_json::from_str::<PopupSpeechTargetRegistry>(&content).ok()?;
+    cleanup_popup_speech_target_registry(&mut registry);
+    Some(registry)
+}
+
+/// Read-only exact check that a captured popup target is still live: same
+/// process, request and window, registered in this process or the shared
+/// registry (dead processes are dropped while reading). Never writes.
+/// None: the registry could not be read, so liveness is unknown.
+#[cfg(target_os = "macos")]
+fn popup_speech_target_is_live(pid: i32, request_id: &str, window_label: &str) -> Option<bool> {
+    popup_target_liveness(
+        current_active_popup_speech_target().as_ref(),
+        read_popup_speech_target_registry_checked().as_ref(),
+        pid,
+        request_id,
+        window_label,
+    )
+}
+
+/// Some(true) when this process or the registry holds the exact target,
+/// Some(false) when a readable registry does not, None when unreadable.
+fn popup_target_liveness(
+    active: Option<&PopupSpeechTarget>,
+    registry: Option<&PopupSpeechTargetRegistry>,
+    pid: i32,
+    request_id: &str,
+    window_label: &str,
+) -> Option<bool> {
+    let matches = |target: &PopupSpeechTarget| {
+        popup_target_pid_i32(target) == Some(pid)
+            && target.request_id == request_id
+            && target.window_label == window_label
+    };
+    if active.is_some_and(matches) {
+        return Some(true);
+    }
+    registry.map(|registry| registry.targets.iter().any(matches))
+}
+
+/// A retained popup target is reused only while its popup is still registered.
+/// An unreadable registry keeps the previous behavior instead of dropping a
+/// target that may still be valid.
+#[cfg(target_os = "macos")]
+fn retained_target_is_still_valid(target: &SpeechTarget) -> bool {
+    match target {
+        SpeechTarget::IteratePopupInput { window_label, request_id, pid: Some(pid) } => {
+            popup_speech_target_is_live(*pid, request_id, window_label).unwrap_or(true)
+        }
+        SpeechTarget::IteratePopupInput { pid: None, .. } => false,
+        SpeechTarget::ExternalApp { .. } => true,
+    }
 }
 
 fn registered_popup_speech_target_for_pid(pid: i32) -> Option<PopupSpeechTarget> {
@@ -1228,7 +1301,7 @@ fn fn_owner_lock_matches_path(file: &File, lock_path: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_own_bundle_id(bundle_id: &str) -> bool {
-    bundle_id == OWN_BUNDLE_ID
+    target::matches_own_bundle(bundle_id, target::current_bundle_identifier().as_deref())
 }
 
 #[cfg(target_os = "macos")]
@@ -1548,6 +1621,11 @@ fn log_paste_dispatch_route(
 pub fn capture_frontmost_target_app() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        let Some(own_bundle_id) = target::current_bundle_identifier() else {
+            clear_last_target_app_bundle_id();
+            debug_log("[target-capture-rejected]", "reason=current-bundle-identity-unavailable");
+            return Err("无法确认当前应用身份，已停止语音目标捕获。".to_string());
+        };
         let (bundle_id, frontmost_pid) = frontmost_app_identity()?;
         let mut guard = last_speech_target()
             .lock()
@@ -1566,7 +1644,7 @@ pub fn capture_frontmost_target_app() -> Result<(), String> {
                     .unwrap_or_else(|| "<none>".to_string())
             ),
         );
-        if is_own_bundle_id(&bundle_id) {
+        if target::matches_own_bundle(&bundle_id, Some(&own_bundle_id)) {
             if let Some(pid) = frontmost_pid {
                 if let Some(target) = current_active_popup_speech_target()
                     .filter(|target| popup_target_pid_i32(target) == Some(pid))
@@ -1587,6 +1665,19 @@ pub fn capture_frontmost_target_app() -> Result<(), String> {
                     return Ok(());
                 }
 
+                // A popup that was submitted or closed unregisters itself; do not keep
+                // sending to it (text was silently lost, 2026-10-15).
+                if guard.as_ref().is_some_and(|target| !retained_target_is_still_valid(target)) {
+                    debug_log(
+                        "[target-capture-invalidated]",
+                        format!(
+                            "reason=retained-popup-unregistered frontmost_pid={} retained_target={}",
+                            pid,
+                            guard.as_ref().map(SpeechTarget::summary).unwrap_or_default()
+                        ),
+                    );
+                    *guard = None;
+                }
                 let is_mcp_request = is_mcp_request_process(pid);
                 if should_preserve_retained_target_for_own_main_process(
                     guard.as_ref(),
@@ -2154,8 +2245,9 @@ fn current_fn_owner_metadata() -> FnOwnerMetadata {
         .unwrap_or((None, None));
 
     FnOwnerMetadata {
+        epoch: None,
         pid: Some(std::process::id()),
-        bundle_id: Some(OWN_BUNDLE_ID.to_string()),
+        bundle_id: target::current_bundle_identifier(),
         exe_path,
         exe_mtime,
         team_id,
@@ -2201,8 +2293,31 @@ fn read_fn_owner_metadata_from_file(file: &mut File) -> Option<FnOwnerMetadata> 
     Some(parse_fn_owner_metadata(&content))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn parse_fn_owner_metadata(content: &str) -> FnOwnerMetadata {
+    if content.trim_start().starts_with('{') {
+        let Ok(owner) = serde_json::from_str::<owner::OwnerMetadata>(content) else {
+            return FnOwnerMetadata::default();
+        };
+        if owner.pid == 0 || owner.executable.is_empty() || owner.acquired_unix_ms == 0
+            || !owner.role.is_owner_eligible() {
+            return FnOwnerMetadata::default();
+        }
+        let Some(epoch) = owner.epoch.as_deref().and_then(session::OwnerEpoch::parse_canonical) else {
+            return FnOwnerMetadata::default();
+        };
+        return FnOwnerMetadata {
+            epoch: Some(epoch.to_canonical_string()),
+            pid: Some(owner.pid),
+            exe_path: Some(owner.executable),
+            team_id: (owner.signing_identity != "unknown").then_some(owner.signing_identity),
+            cdhash: (owner.signing_hash != "unknown").then_some(owner.signing_hash),
+            acquired_at: i64::try_from(owner.acquired_unix_ms).ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|time| time.to_rfc3339()),
+            ..Default::default()
+        };
+    }
     let mut metadata = FnOwnerMetadata::default();
 
     for token in content.lines().map(str::trim) {
@@ -2223,6 +2338,46 @@ fn parse_fn_owner_metadata(content: &str) -> FnOwnerMetadata {
     }
 
     metadata
+}
+
+#[cfg(test)]
+mod owner_metadata_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn reads_current_owner_json_fields() {
+        let mut owner = owner::OwnerMetadata::new(owner::SpeechProcessRole::CanonicalGui,
+            42, "/Applications/Custom.app/Contents/MacOS/iterate", "local-signing", "abc123");
+        owner.epoch = Some(session::OwnerEpoch([7; 16]).to_canonical_string());
+        owner.acquired_unix_ms = 1_700_000_000_123;
+        let parsed = parse_fn_owner_metadata(&serde_json::to_string(&owner).unwrap());
+        assert_eq!(parsed.pid, Some(42));
+        assert_eq!(parsed.exe_path.as_deref(), Some(owner.executable.as_str()));
+        assert_eq!(parsed.cdhash.as_deref(), Some("abc123"));
+        assert_eq!(parsed.epoch, owner.epoch);
+        assert_eq!(parsed.acquired_at.as_deref(), Some("2023-11-14T22:13:20.123+00:00"));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_json_without_legacy_fallback() {
+        for content in ["{invalid\npid=42", "{}", r#"{"pid":42,"executable":"/app"}"#] {
+            assert_eq!(parse_fn_owner_metadata(content).pid, None);
+        }
+        let mut owner = owner::OwnerMetadata::new(owner::SpeechProcessRole::CanonicalGui,
+            42, "/app", "signer", "hash");
+        owner.epoch = Some("invalid".into());
+        owner.acquired_unix_ms = 1000;
+        assert_eq!(parse_fn_owner_metadata(&serde_json::to_string(&owner).unwrap()).pid, None);
+    }
+
+    #[test]
+    fn preserves_legacy_owner_metadata() {
+        let parsed = parse_fn_owner_metadata("pid=42\nexe_path=/old/app\ncdhash=old\n");
+        assert_eq!(parsed.pid, Some(42));
+        assert_eq!(parsed.exe_path.as_deref(), Some("/old/app"));
+        assert_eq!(parsed.cdhash.as_deref(), Some("old"));
+        assert_eq!(parsed.epoch, None);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2402,18 +2557,38 @@ mod tests {
     }
 
     #[test]
+    fn popup_target_liveness_distinguishes_closed_from_unreadable() {
+        let target = |request: &str| -> PopupSpeechTarget {
+            serde_json::from_value(serde_json::json!({
+                "window_label": "main", "request_id": request, "pid": 4242
+            }))
+            .unwrap()
+        };
+        let registry = PopupSpeechTargetRegistry { targets: vec![target("open")] };
+        assert_eq!(popup_target_liveness(None, Some(&registry), 4242, "open", "main"), Some(true));
+        // The popup was submitted and unregistered: do not keep sending to it.
+        assert_eq!(popup_target_liveness(None, Some(&registry), 4242, "closed", "main"), Some(false));
+        assert_eq!(popup_target_liveness(None, Some(&registry), 4243, "open", "main"), Some(false));
+        // Unreadable registry is unknown, never "closed".
+        assert_eq!(popup_target_liveness(None, None, 4242, "closed", "main"), None);
+        assert_eq!(popup_target_liveness(Some(&target("closed")), None, 4242, "closed", "main"), Some(true));
+    }
+
+    #[test]
     fn external_paste_aborts_when_focus_belongs_to_iterate() {
         let focused = focused_process(94984, Some("com.kexin94yyds.iterate"));
 
-        assert_eq!(
+        // Own-app identity is read from the running bundle; the test binary has
+        // none, so only require that the paste is aborted.
+        assert!(matches!(
             select_paste_dispatch_route(
                 Some(76052),
                 Some(&focused),
                 "com.openai.codex",
                 FocusDispatchMode::FrontmostPidFallback,
             ),
-            PasteDispatchRoute::Abort("focused-own-app"),
-        );
+            PasteDispatchRoute::Abort("focused-own-app" | "focused-bundle-mismatch"),
+        ));
     }
 
     #[test]
@@ -2831,20 +3006,35 @@ mod tests {
 fn build_owner_status() -> SpeechRuntimeOwner {
     #[cfg(target_os = "macos")]
     {
-        let fn_listener_owner = fn_owner_state()
+        let legacy_listener_owner = fn_owner_state()
             .lock()
             .map(|state| state.lock.is_some())
             .unwrap_or(false);
         let current = current_fn_owner_metadata();
-        let owner = read_fn_owner_metadata().unwrap_or_else(|| {
-            if fn_listener_owner {
+        let mut owner = read_fn_owner_metadata().unwrap_or_else(|| {
+            if legacy_listener_owner {
                 current.clone()
             } else {
                 FnOwnerMetadata::default()
             }
         });
-        let owner_is_current_process = owner.pid == Some(std::process::id());
+        // A lock file survives its owner. Do not present a definitely dead PID as an owner.
+        if owner.pid.is_some_and(|pid| i32::try_from(pid).ok().is_none_or(|pid| {
+            (unsafe { libc::kill(pid, 0) }) != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })) {
+            owner = FnOwnerMetadata::default();
+        }
+        let owner_pid_is_current = owner.pid == Some(std::process::id());
         let owner_matches_current_binary = owner_matches_current_binary(&owner, &current);
+        let phase1_listener_owner = phase1::diagnostic_owner_epoch()
+            .is_some_and(|epoch| owner.epoch.as_deref() == Some(epoch.to_canonical_string().as_str()));
+        let fn_listener_owner = owner_pid_is_current
+            && owner_matches_current_binary == Some(true)
+            && (legacy_listener_owner || phase1_listener_owner);
+        if owner_pid_is_current && !fn_listener_owner {
+            owner = FnOwnerMetadata::default();
+        }
 
         SpeechRuntimeOwner {
             fn_listener_owner,
@@ -2855,7 +3045,8 @@ fn build_owner_status() -> SpeechRuntimeOwner {
             owner_cdhash: owner.cdhash,
             owner_exe_mtime: owner.exe_mtime,
             owner_acquired_at: owner.acquired_at,
-            owner_is_current_process,
+            owner_is_current_process: fn_listener_owner,
+            owner_lease_verified: fn_listener_owner,
             owner_matches_current_binary,
             current_pid: std::process::id(),
             current_path: current.exe_path,
@@ -2878,6 +3069,7 @@ fn build_owner_status() -> SpeechRuntimeOwner {
             owner_exe_mtime: None,
             owner_acquired_at: None,
             owner_is_current_process: true,
+            owner_lease_verified: true,
             owner_matches_current_binary: Some(true),
             current_pid: std::process::id(),
             current_path: current_exe_path_string(),
@@ -3360,6 +3552,55 @@ pub fn stop_native_speech() -> Result<(), String> {
     phase1::request_desired_state(session::DesiredState::Off)
 }
 
+/// Narrow restart of the canonical GUI, the recovery P-2026-2291 keeps
+/// needing.  A detached shell waits for this process to exit before reopening
+/// the same bundle, so the new owner never races the old one for the Fn lock
+/// (P-2026-9368).  It holds the watchdog's install lock meanwhile so the
+/// watchdog does not open a second GUI (P-2026-9369).
+#[tauri::command]
+pub async fn repair_speech_runtime(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        phase1::get_speech_control_snapshot()
+            .map_err(|_| "只有持有 Fn 的主窗口能修复语音，请在主窗口的设置里操作。".to_string())?;
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let bundle = exe
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+            .ok_or_else(|| format!("找不到当前 App 包：{}", exe.display()))?
+            .to_path_buf();
+        const RELAUNCH: &str = r#"lock=/tmp/iterate-install.lock
+owned=0
+mkdir "$lock" 2>/dev/null && owned=1
+while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+open -n -g "$2"
+sleep 8
+[ "$owned" = 1 ] && rmdir "$lock" 2>/dev/null
+exit 0"#;
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(RELAUNCH)
+            .arg("iterate-speech-repair")
+            .arg(std::process::id().to_string())
+            .arg(&bundle)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("无法启动修复进程：{error}"))?;
+        debug_log(
+            "[speech-repair-restart]",
+            format!("pid={} bundle={}", std::process::id(), bundle.display()),
+        );
+        crate::ui::exit::force_exit_app(app).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("修复语音目前只支持 macOS".to_string())
+    }
+}
+
 #[tauri::command]
 pub fn set_codex_live_audio_reserved(app: AppHandle, reserved: bool) -> Result<bool, String> {
     CODEX_LIVE_AUDIO_RESERVED.store(reserved, Ordering::Relaxed);
@@ -3422,6 +3663,7 @@ pub fn commit_speech_text(_app: AppHandle, text: String) -> Result<(), String> {
                 ExternalPasteDispatch::UnknownAfterDispatch => Err(
                     "写回已经发出，但无法确认最终投递结果；为避免重复输入，本轮不会重试。".into(),
                 ),
+                ExternalPasteDispatch::NotConsumed => Err(NOT_CONSUMED_MESSAGE.into()),
             }
         }
         SpeechTarget::IteratePopupInput { .. } => {
@@ -3527,6 +3769,36 @@ fn dispatch_cross_process_popup(
     Ok(())
 }
 
+/// Writeback failed or could not be confirmed: keep the transcript instead of
+/// dropping it. Runs after the paste path has restored the previous clipboard,
+/// so the transcript stays on the clipboard and a visible notice is shown.
+pub(crate) fn preserve_unwritten_transcript(text: &str, reason: &'static str) {
+    #[cfg(target_os = "macos")]
+    {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let saved = write_clipboard_text(text).is_ok();
+        // Never log the transcript itself.
+        debug_log(
+            "[writeback-preserved]",
+            format!("reason={reason} clipboard={saved} text_len={}", text.chars().count()),
+        );
+        let message = match (reason, saved) {
+            ("unknown-after-dispatch", true) => "无法确认是否已写入，文字已复制到剪贴板，请检查后再粘贴",
+            ("not-consumed", true) => NOT_CONSUMED_MESSAGE,
+            (_, true) => "语音未能写入目标，文字已复制到剪贴板，可直接粘贴",
+            (_, false) => "语音未能写入目标，复制到剪贴板也失败了，请重新说一遍",
+        };
+        let _ = Command::new("/usr/bin/osascript")
+            .args(["-e", &format!("display notification \"{message}\" with title \"iterate 语音\"")])
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (text, reason);
+}
+
 pub(crate) fn dispatch_speech_writeback(
     identity: session::SpeechLayerIdentity,
     text: String,
@@ -3544,6 +3816,7 @@ pub(crate) fn dispatch_speech_writeback(
             ExternalPasteDispatch::UnknownAfterDispatch => {
                 Ok(SpeechWritebackDispatch::ExternalUnknownAfterDispatch)
             }
+            ExternalPasteDispatch::NotConsumed => Ok(SpeechWritebackDispatch::ExternalNotConsumed),
         },
         SpeechTarget::IteratePopupInput {
             window_label,
@@ -3632,13 +3905,25 @@ pub fn paste_text(text: String) -> Result<(), String> {
     let identity = phase1::get_speech_control_snapshot()?
         .identity
         .ok_or_else(|| "speech writeback identity is unavailable".to_string())?;
+    let recovery_text = text.clone();
     match paste_text_with_identity(text, identity)? {
         ExternalPasteDispatch::DispatchedUnverified => Ok(()),
         ExternalPasteDispatch::UnknownAfterDispatch => {
             Err("写回已经发出，但无法确认最终投递结果；为避免重复输入，本轮不会重试。".into())
         }
+        ExternalPasteDispatch::NotConsumed => {
+            preserve_unwritten_transcript(&recovery_text, "not-consumed");
+            Err(NOT_CONSUMED_MESSAGE.into())
+        }
     }
 }
+
+/// Shown when the target never read the promised text (P-2026-2291 family).
+const NOT_CONSUMED_MESSAGE: &str =
+    "没粘进去，文字已复制，按 ⌘V 粘贴；反复出现请到设置里点「修复语音」";
+
+/// How long the target has to read the promised text after Cmd+V.
+const PASTE_CONSUME_TIMEOUT: Duration = Duration::from_millis(1000);
 
 fn paste_text_with_identity(
     text: String,
@@ -3766,14 +4051,33 @@ fn paste_text_with_identity(
                     .unwrap_or_else(|| "<unavailable>".to_string())
             ),
         );
-        if let Err(error) = write_clipboard_text(trimmed) {
-            record_paste_error(&error);
-            return Err(error);
-        }
-        debug_log(
-            "[paste-clipboard-written]",
-            format!("id={paste_id} new text copied to clipboard"),
-        );
+        // Publish the transcript as a pasteboard promise so the target's read
+        // proves the paste landed.  If AppKit refuses the promise, fall back
+        // to a plain copy and keep the old unverified behavior.
+        let promise = match paste_probe::publish(trimmed) {
+            Ok(promise) => {
+                debug_log(
+                    "[paste-clipboard-written]",
+                    format!("id={paste_id} promised transient text published"),
+                );
+                Some(promise)
+            }
+            Err(error) => {
+                debug_log(
+                    "[paste-promise-unavailable]",
+                    format!("id={paste_id} error={error}"),
+                );
+                if let Err(error) = write_clipboard_text(trimmed) {
+                    record_paste_error(&error);
+                    return Err(error);
+                }
+                debug_log(
+                    "[paste-clipboard-written]",
+                    format!("id={paste_id} new text copied to clipboard"),
+                );
+                None
+            }
+        };
 
         let frontmost_before_paste = frontmost_app_identity().ok();
         let frontmost_before_bundle_id = frontmost_before_paste
@@ -4047,6 +4351,31 @@ fn paste_text_with_identity(
                 }
             }
         };
+        let dispatch = match (dispatch, promise.as_ref()) {
+            (ExternalPasteDispatch::DispatchedUnverified, Some(promise)) => {
+                match promise.wait_consumed(PASTE_CONSUME_TIMEOUT) {
+                    Some(latency) => {
+                        debug_log(
+                            "[paste-consumed]",
+                            format!("id={paste_id} latency_ms={}", latency.as_millis()),
+                        );
+                        ExternalPasteDispatch::DispatchedUnverified
+                    }
+                    None => {
+                        debug_log(
+                            "[paste-not-consumed]",
+                            format!(
+                                "id={paste_id} timeout_ms={} target={bundle_id}",
+                                PASTE_CONSUME_TIMEOUT.as_millis()
+                            ),
+                        );
+                        ExternalPasteDispatch::NotConsumed
+                    }
+                }
+            }
+            (dispatch, _) => dispatch,
+        };
+        drop(promise);
         match dispatch {
             ExternalPasteDispatch::DispatchedUnverified => {
                 record_paste_status("paste-dispatched-unverified")
@@ -4054,9 +4383,14 @@ fn paste_text_with_identity(
             ExternalPasteDispatch::UnknownAfterDispatch => {
                 record_paste_status("paste-unknown-after-dispatch")
             }
+            ExternalPasteDispatch::NotConsumed => {
+                record_paste_error("target never read the pasted text")
+            }
         }
 
-        if previous.is_some() {
+        // A paste nobody read keeps the transcript on the clipboard; the
+        // caller preserves it there instead of restoring the old contents.
+        if previous.is_some() && dispatch != ExternalPasteDispatch::NotConsumed {
             thread::sleep(Duration::from_millis(1200));
             restore_previous_clipboard(previous.as_ref());
         }

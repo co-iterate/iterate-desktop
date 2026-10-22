@@ -81,6 +81,56 @@ fn find_knowledge_dir(_project_path: Option<&str>) -> Option<PathBuf> {
     configured.filter(|path| path.is_dir())
 }
 
+/// 测试里修改 CUNZHI_KNOWLEDGE_DIR，或会走到 append_conversation_log 的测试都要先拿这把锁；
+/// 否则并发测试会互相切换知识库目录，或把测试记录写进用户真实的 ~/.cunzhi-knowledge。
+#[cfg(test)]
+pub(crate) static KNOWLEDGE_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_knowledge_env_for_test() -> std::sync::MutexGuard<'static, ()> {
+    KNOWLEDGE_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 测试专用：持有知识库目录锁，并把 CUNZHI_KNOWLEDGE_DIR 指到临时目录，结束时恢复。
+/// 用于会写对话日志、但不应污染真实知识库的测试（如后台自动检查点）。
+#[cfg(test)]
+pub(crate) struct TempKnowledgeDirForTest {
+    previous: Option<std::ffi::OsString>,
+    dir: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TempKnowledgeDirForTest {
+    pub(crate) fn new() -> Self {
+        let lock = lock_knowledge_env_for_test();
+        let dir = tempfile::tempdir().expect("temp knowledge dir");
+        let previous = std::env::var_os("CUNZHI_KNOWLEDGE_DIR");
+        std::env::set_var("CUNZHI_KNOWLEDGE_DIR", dir.path());
+        Self {
+            previous,
+            dir,
+            _lock: lock,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempKnowledgeDirForTest {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => std::env::set_var("CUNZHI_KNOWLEDGE_DIR", previous),
+            None => std::env::remove_var("CUNZHI_KNOWLEDGE_DIR"),
+        }
+    }
+}
+
 fn strip_auto_prompt(input: &str) -> Cow<'_, str> {
     const EXACT_SENTINELS: &[&str] = &[
         "<!-- CONTEXT_INJECTION_START -->",
@@ -526,10 +576,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
-
-    static KNOWLEDGE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     struct KnowledgeEnvGuard {
         previous: Option<OsString>,
@@ -704,10 +751,7 @@ mod tests {
 
     #[test]
     fn append_conversation_log_writes_markdown_file() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("demo-project");
         let project_knowledge_dir = project_dir.join(".cunzhi-knowledge");
@@ -753,10 +797,7 @@ mod tests {
 
     #[test]
     fn append_conversation_log_writes_attachment_paths() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("demo-project");
         let project_knowledge_dir = project_dir.join(".cunzhi-knowledge");
@@ -805,10 +846,7 @@ mod tests {
 
     #[test]
     fn append_conversation_log_includes_workspace_checkpoint_line() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("demo-project");
         let project_knowledge_dir = project_dir.join(".cunzhi-knowledge");
@@ -868,10 +906,7 @@ mod tests {
 
     #[test]
     fn e2e_checkpoint_subject_matches_git_log_and_conversation_md() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         // 配置目录锁由下面的 ConfigEnvGuard 持有（同一把锁，不能重复获取）
         let temp = tempdir().unwrap();
         let project = temp.path().join("git-proj");

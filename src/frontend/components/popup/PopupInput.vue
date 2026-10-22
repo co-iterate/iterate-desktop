@@ -11,8 +11,10 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { useSortable } from '@vueuse/integrations/useSortable'
 import { useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+import { useCrossDevice } from '../../composables/useCrossDevice'
 import { GHOST_SUGGESTION_TOKEN_PATTERN, useGhostSuggestions } from '../../composables/useGhostSuggestions'
 import { useKeyboard } from '../../composables/useKeyboard'
+import { usePopupCompactMode } from '../../composables/usePopupCompactMode'
 import { usePromptLibrary } from '../../composables/usePromptLibrary'
 import { SpeechInsertGuard } from '../../services/speechInsertGuard'
 import { isExplicitConversationEndInput } from '../../utils/conversationEndCommand'
@@ -74,6 +76,7 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const emit = defineEmits<Emits>()
+const CONTEXT_INJECTION_START = '<!-- CONTEXT_INJECTION_START -->'
 
 let customPromptConfigCache: CustomPromptConfigSnapshot | null = null
 let customPromptConfigPromise: Promise<CustomPromptConfigSnapshot | null> | null = null
@@ -91,6 +94,7 @@ const selectedOptions = ref<string[]>([])
 const windowsPlatform = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
 const uploadedImages = ref<string[]>([])
 const attachedFiles = ref<PopupFileAttachment[]>([])
+const { crossState } = useCrossDevice()
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
 const activeSuggestionIndex = ref(0)
 const acceptedSuggestionToken = ref('')
@@ -136,6 +140,33 @@ const normalPrompts = computed(() =>
 const conditionalPrompts = computed(() =>
   customPrompts.value.filter(prompt => prompt.type === 'conditional'),
 )
+
+// 简洁弹窗：快捷模板和上下文追加收进一行状态条，只影响显示，不影响注入
+const { popupCompactMode } = usePopupCompactMode()
+const popupExtrasExpanded = ref(false)
+const showTemplateSection = computed(() =>
+  customPromptEnabled.value && customPrompts.value.length > 0,
+)
+const showContextAppendSection = computed(() =>
+  props.enableContextAppend && customPromptEnabled.value && conditionalPrompts.value.length > 0,
+)
+const hasPopupExtras = computed(() => showTemplateSection.value || showContextAppendSection.value)
+const showPopupExtras = computed(() => !popupCompactMode.value || popupExtrasExpanded.value)
+// 与 generateConditionalContent 的判断保持一致：真正会被拼进回复的条目
+const injectingConditionalPrompts = computed(() => {
+  if (!props.enableContextAppend)
+    return []
+  return conditionalPrompts.value.filter((prompt) => {
+    if (prompt.is_active === false)
+      return false
+    const template = (prompt.current_state ?? false) ? prompt.template_true : prompt.template_false
+    return Boolean(template && template.trim())
+  })
+})
+const popupExtrasSummaryTitle = computed(() => {
+  const names = injectingConditionalPrompts.value.map(prompt => prompt.condition_text || prompt.name)
+  return names.length > 0 ? `正在追加：${names.join('、')}` : '当前没有追加内容'
+})
 
 // 拖拽排序相关状态
 const promptContainer = ref<HTMLElement | null>(null)
@@ -196,6 +227,7 @@ const { start, stop } = useSortable(promptContainer, sortablePrompts, {
 
 // 使用键盘快捷键 composable
 const { pasteShortcut } = useKeyboard()
+const isWindows = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('WIN')
 
 const message = useMessage()
 let localFocusTimer: ReturnType<typeof setTimeout> | null = null
@@ -436,6 +468,10 @@ function extractClipboardPaths(rawText: string): string[] {
 }
 
 function addFileAttachments(files: PopupFileAttachment[]): void {
+  if (crossState.value.mirror) {
+    message.warning('跨设备镜像仅支持文本和选项，请在源设备发送附件')
+    return
+  }
   let addedCount = 0
 
   files.forEach((file) => {
@@ -453,6 +489,10 @@ function addFileAttachments(files: PopupFileAttachment[]): void {
 }
 
 async function addImagePath(path: string): Promise<boolean> {
+  if (crossState.value.mirror) {
+    message.warning('请在源设备发送附件')
+    return false
+  }
   try {
     const dataUrl = await invoke('read_file_base64', { path }) as string
     if (!uploadedImages.value.includes(dataUrl)) {
@@ -469,6 +509,10 @@ async function addImagePath(path: string): Promise<boolean> {
 }
 
 async function addAttachmentPaths(paths: string[]): Promise<void> {
+  if (crossState.value.mirror) {
+    message.warning('请在源设备发送附件')
+    return
+  }
   if (paths.length === 0)
     return
 
@@ -522,6 +566,11 @@ function handleInputPaste(event: ClipboardEvent) {
 
   const clipboardText = event.clipboardData?.getData('text') ?? ''
 
+  // A Windows path copied as text is a reply, not an attachment request.
+  // Actual image clipboard items still follow the image handling below.
+  if (isWindows && clipboardText.length > 0 && !hasImage)
+    return
+
   // `/end` starts with a slash but is a conversation command, not a file path.
   // Let the browser paste it normally; the Rust response boundary decides
   // whether it ends this interaction.
@@ -546,6 +595,10 @@ function handleInputPaste(event: ClipboardEvent) {
 }
 
 async function handleImageFiles(files: FileList | File[]): Promise<void> {
+  if (crossState.value.mirror) {
+    message.warning('跨设备镜像仅支持文本和选项')
+    return
+  }
   console.log('=== 处理图片文件 ===')
   console.log('文件数量:', files.length)
 
@@ -1435,8 +1488,17 @@ function resizeTextareaNow() {
   if (!inputElement)
     return
 
+  // 输入框由 flex 撑满剩余空白；这里只把下限随内容抬到最多 6 行，没有空白时也能边打边长
+  // 量文字本身的高度前先临时取消撑满，否则量到的是撑满后的框高
+  inputElement.style.minHeight = ''
+  inputElement.style.flex = 'none'
   inputElement.style.height = 'auto'
-  inputElement.style.height = `${Math.ceil(inputElement.scrollHeight + 2)}px`
+  const contentHeight = Math.ceil(inputElement.scrollHeight + 2)
+  inputElement.style.flex = ''
+  inputElement.style.height = ''
+  const lineHeight = Number.parseFloat(window.getComputedStyle(inputElement).lineHeight) || 24
+  const maxAutosizeHeight = lineHeight * 6 + 18
+  inputElement.style.minHeight = `${Math.min(contentHeight, maxAutosizeHeight)}px`
   textareaIsScrolled.value = inputElement.scrollHeight > inputElement.clientHeight + 1
 }
 
@@ -1622,7 +1684,9 @@ function generateConditionalContent(): string {
     }
   })
 
-  return conditionalTexts.length > 0 ? `\n\n${conditionalTexts.join('\n')}` : ''
+  return conditionalTexts.length > 0
+    ? `\n\n${CONTEXT_INJECTION_START}\n${conditionalTexts.join('\n')}`
+    : ''
 }
 
 // 获取条件性prompt的自适应描述
@@ -1659,6 +1723,12 @@ async function initializeDragSort() {
     }
   }, 300)
 }
+
+// 简洁弹窗展开时模板容器才被渲染，需要重新绑定拖拽排序
+watch(showPopupExtras, (visible) => {
+  if (visible && showTemplateSection.value)
+    initializeDragSort()
+})
 
 // 保存prompt排序
 async function savePromptOrder() {
@@ -1887,6 +1957,10 @@ async function initializeAsyncListeners() {
         void loadCustomPrompts({ forceRefresh: true })
       }),
       listen<string>('screenshot-captured', (event) => {
+        if (crossState.value.mirror) {
+          message.warning('请在源设备发送附件')
+          return
+        }
         console.log('收到截图事件，图片数据长度:', event.payload.length)
         if (event.payload && !uploadedImages.value.includes(event.payload)) {
           uploadedImages.value.push(event.payload)
@@ -2168,11 +2242,11 @@ defineExpose({
 </script>
 
 <template>
-  <div class="space-y-3">
-    <!-- 文本输入框 - 放在最上面，方便直接输入 -->
-    <div v-if="!loading" class="space-y-2">
+  <div class="space-y-3 flex flex-col flex-grow">
+    <!-- 文本输入框 - 放在最上面，方便直接输入；内容短时向下撑满弹窗空白 -->
+    <div v-if="!loading" class="space-y-2 flex flex-col flex-grow">
       <div
-        class="popup-main-input-shell"
+        class="popup-main-input-shell popup-main-input-shell--fill flex flex-col flex-grow"
         :class="{ 'popup-main-input-shell--dragover': isInputDragOver }"
         :style="ghostMetricsStyle"
         @dragover="handleInputDragOver"
@@ -2317,12 +2391,33 @@ defineExpose({
 
     <!-- 补充说明区域 - 放在最后一排 -->
     <div v-if="!loading" class="space-y-3">
-      <h4 v-if="hasOptions" class="text-sm font-medium text-white">
+      <h4 v-if="hasOptions && showPopupExtras" class="text-sm font-medium text-white">
         补充说明 (可选)
       </h4>
 
+      <!-- 简洁弹窗状态条：快捷模板和上下文追加默认收起，点击展开 -->
+      <button
+        v-if="popupCompactMode && hasPopupExtras"
+        type="button"
+        class="w-full flex items-center gap-2 px-2 py-1 rounded border-0 bg-transparent cursor-pointer text-left text-xs text-on-surface-secondary hover:bg-container-tertiary transition-colors"
+        :title="popupExtrasSummaryTitle"
+        :aria-expanded="popupExtrasExpanded"
+        data-guide="popup-extras-bar"
+        @click="popupExtrasExpanded = !popupExtrasExpanded"
+      >
+        <div class="i-carbon-settings-adjust w-3 h-3 text-primary-500 flex-shrink-0" />
+        <span v-if="showContextAppendSection">追加 {{ injectingConditionalPrompts.length }} 项</span>
+        <span v-if="showContextAppendSection && showTemplateSection" class="opacity-50">·</span>
+        <span v-if="showTemplateSection">模板 {{ normalPrompts.length }} 个</span>
+        <span class="flex-1" />
+        <div
+          class="i-carbon-chevron-right w-3 h-3 transition-transform flex-shrink-0"
+          :class="{ 'rotate-90': popupExtrasExpanded }"
+        />
+      </button>
+
       <!-- 自定义prompt按钮区域 -->
-      <div v-if="customPromptEnabled && customPrompts.length > 0" class="space-y-2" data-guide="custom-prompts">
+      <div v-if="showPopupExtras && showTemplateSection" class="space-y-2" data-guide="custom-prompts">
         <div class="text-xs text-on-surface-secondary flex items-center gap-2">
           <div class="flex items-center gap-1.5 flex-shrink-0">
             <div class="i-carbon-bookmark w-3 h-3 text-primary-500" />
@@ -2553,7 +2648,7 @@ defineExpose({
       </div>
 
       <!-- 上下文追加区域 -->
-      <div v-if="props.enableContextAppend && customPromptEnabled && conditionalPrompts.length > 0" class="space-y-2" data-guide="context-append">
+      <div v-if="showPopupExtras && showContextAppendSection" class="space-y-2" data-guide="context-append">
         <div class="text-xs text-on-surface-secondary flex items-center gap-2">
           <div class="i-carbon-settings-adjust w-3 h-3 text-primary-500" />
           <span>上下文追加:</span>
@@ -2591,9 +2686,14 @@ defineExpose({
       </div>
 
       <!-- 图片提示区域 -->
-      <div v-if="uploadedImages.length === 0 && attachedFiles.length === 0" class="text-center">
+      <div v-if="uploadedImages.length === 0 && attachedFiles.length === 0 && (crossState.mirror || showPopupExtras)" class="text-center">
         <div class="text-xs text-on-surface-secondary">
-          💡 提示：可以在输入框中粘贴图片、Finder 复制的文件或绝对路径，也可以把文件拖进来 ({{ pasteShortcut }})
+          <template v-if="crossState.mirror">
+            跨设备镜像仅支持文本和选项；图片和文件请在源设备发送。
+          </template>
+          <template v-else-if="showPopupExtras">
+            💡 提示：{{ isWindows ? '粘贴的路径会作为文字保留；图片可直接粘贴，文件可拖入' : '可以在输入框中粘贴图片、Finder 复制的文件或绝对路径，也可以把文件拖进来' }} ({{ pasteShortcut }})<span v-if="crossState.enabled">（附件仅在源设备处理）</span>
+          </template>
         </div>
       </div>
     </div>

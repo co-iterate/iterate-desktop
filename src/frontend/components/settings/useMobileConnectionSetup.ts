@@ -112,6 +112,8 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
   const formalRoute = ref<FormalMobileRouteStatus | null>(null)
   const error = ref('')
   const notice = ref('')
+  // 托管服务明确拒绝了这台电脑的自动开通（准入关闭 / 不在名单），自建设置页据此说明原因
+  const managedAdmission = ref<'' | 'closed' | 'not_allowed'>('')
   const bridgeOriginHealthy = ref(false)
   const now = ref(Date.now())
 
@@ -294,6 +296,7 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
       const action = resolveMobileConnectionBootstrap(pairingStatus)
       if (action === 'setup_required') {
         notice.value = '正在为这台电脑开通连接…'
+        managedAdmission.value = ''
         try {
           const managedRoute = await invoke<FormalMobileRouteStatus>('ensure_managed_mobile_route')
           if (!lifecycleIsActive(generation))
@@ -312,6 +315,12 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
           notice.value = ''
           // 不支持托管的平台，或未配置托管服务的构建（如社区构建）：直接进入自建连接设置
           if (code === 'managed_platform_unsupported' || code === 'managed_not_configured') {
+            dispatch({ type: 'SETUP_REQUIRED' })
+            return
+          }
+          // 服务在线但不给这台电脑开通：重试网络没有用，转入自建设置；开放后「重新检测」会再次尝试托管
+          if (code === 'managed_enrollment_closed' || code === 'managed_enrollment_not_allowed') {
+            managedAdmission.value = code === 'managed_enrollment_closed' ? 'closed' : 'not_allowed'
             dispatch({ type: 'SETUP_REQUIRED' })
             return
           }
@@ -561,10 +570,11 @@ export function useMobileConnectionSetup(options: SetupOptions = {}) {
     remainingSeconds,
     error,
     notice,
+    managedAdmission,
     bridgeOriginHealthy,
     aiSetupPrompt: computed(() => (
       formalRoute.value?.configured
-        ? buildFormalRouteRepairPrompt(formalRoute.value.base_url || '', state.value.error?.code || error.value)
+        ? buildFormalRouteRepairPrompt(formalRoute.value.base_url || '', state.value.error?.code || error.value, formalRoute.value.transport)
         : buildFormalRouteSetupPrompt()
     )),
     bootstrap,

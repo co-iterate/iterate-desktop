@@ -28,7 +28,11 @@ fn configured_public_bridge_base_url() -> Option<String> {
         if route.schema_version == 1
             && crate::tunnel::formal_transport::is_supported_formal_transport(&route.transport)
         {
-            if let Some(base_url) = normalize_public_origin(&route.base_url) {
+            // 阿里云 IP 路线还要求地址是公网 IP（#44）
+            if let Some(base_url) = normalize_public_origin(&route.base_url).filter(|base_url| {
+                route.transport != "aliyun_ssh_reverse_tunnel"
+                    || crate::tunnel::commands::aliyun_ip_origin_is_public(base_url)
+            }) {
                 return Some(base_url);
             }
         }

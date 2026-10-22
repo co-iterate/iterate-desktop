@@ -2,14 +2,20 @@
 import { invoke } from '@tauri-apps/api/core'
 import { useMessage } from 'naive-ui'
 import { computed, onUnmounted, ref } from 'vue'
+import CrossDeviceToggle from '../common/CrossDeviceToggle.vue'
 import IntroTab from '../tabs/IntroTab.vue'
 import McpToolsTab from '../tabs/McpToolsTab.vue'
 import PromptsTab from '../tabs/PromptsTab.vue'
 import SettingsTab from '../tabs/SettingsTab.vue'
 
+const props = defineProps<Props>()
+
+const emit = defineEmits<Emits>()
+
 interface Props {
   currentTheme: string
   alwaysOnTop: boolean
+  isMuted: boolean
   audioNotificationEnabled: boolean
   audioUrl: string
   windowWidth: number
@@ -22,6 +28,7 @@ interface Props {
 interface Emits {
   themeChange: [theme: string]
   toggleAlwaysOnTop: []
+  toggleMute: []
   toggleAudioNotification: []
   updateAudioUrl: [url: string]
   testAudio: []
@@ -32,9 +39,6 @@ interface Emits {
   toggleCodexLive: []
   toggleCodexLiveMute: []
 }
-
-const props = defineProps<Props>()
-const emit = defineEmits<Emits>()
 
 const codexLiveActive = computed(() => ['preparing', 'connecting', 'active', 'reconnecting'].includes(props.codexLivePhase))
 const codexLiveTitle = computed(() => `${props.codexLiveStatus}（${codexLiveActive.value ? '短按静音，长按 5 秒结束' : '长按 5 秒启动'}）`)
@@ -153,6 +157,21 @@ function testPopup() {
             <h1 class="text-4xl font-medium text-white">
               iterate
             </h1>
+            <CrossDeviceToggle />
+            <n-button
+              size="small"
+              type="tertiary"
+              circle
+              :title="props.isMuted ? '免打扰已开启（点击恢复弹窗通知）' : '免打扰已关闭（点击暂停弹窗通知）'"
+              :aria-label="props.isMuted ? '免打扰已开启（点击恢复弹窗通知）' : '免打扰已关闭（点击暂停弹窗通知）'"
+              :aria-pressed="props.isMuted"
+              data-guide="notification-mute"
+              @click="$emit('toggleMute')"
+            >
+              <template #icon>
+                <div :class="props.isMuted ? 'i-carbon-notification-off' : 'i-carbon-notification'" class="w-4 h-4" />
+              </template>
+            </n-button>
             <n-button
               size="small"
               type="tertiary"

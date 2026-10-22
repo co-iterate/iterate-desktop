@@ -87,12 +87,17 @@ async fn record_request_node(app_handle: &AppHandle, req: &Value, project_path: 
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let conversation_route_id = extract_conversation_route_id_from_request(req).or_else(|| {
-        crate::ui::live_goal::live_goal_codex_thread_id_for_project_with_app(
-            Some(app_handle),
-            Some(project_path),
-        )
-    });
+    // Claude Code 调用方（P-2026-9373）：只认 `claude-code:<sessionId>`，不借 Codex 线程 / live goal。
+    let conversation_route_id = if crate::mcp::caller_identity::is_claude_code_caller_request(req) {
+        crate::mcp::caller_identity::claude_timeline_route_from_request(req)
+    } else {
+        extract_conversation_route_id_from_request(req).or_else(|| {
+            crate::ui::live_goal::live_goal_codex_thread_id_for_project_with_app(
+                Some(app_handle),
+                Some(project_path),
+            )
+        })
+    };
     let route_id = conversation_route_id.as_deref().or(raw_request_id);
     let request_key = resolve_tree_route_key(route_id, Some(project_path));
     eprintln!(
@@ -106,6 +111,7 @@ async fn record_request_node(app_handle: &AppHandle, req: &Value, project_path: 
     append_timeline_debug_log(
         "rust/ipc::record_request_node:start",
         serde_json::json!({
+            "caller_client": req.get("caller_client"),
             "request_key": request_key,
             "raw_request_id": raw_request_id,
             "conversation_route_id": conversation_route_id,
@@ -601,6 +607,30 @@ mod tests {
         assert_eq!(
             extract_conversation_route_id_from_request(&req).as_deref(),
             Some("thread-1")
+        );
+    }
+
+    #[test]
+    fn claude_caller_request_does_not_resolve_codex_route() {
+        let req = serde_json::json!({
+            "id": "serve-1",
+            "caller_client": "claude_code",
+            "caller_session_id": "7dbca76e-c67a-4cee-ad28-52ad4d90bd28",
+            "timeline_route_id": "claude-code:7dbca76e-c67a-4cee-ad28-52ad4d90bd28",
+            "codex_thread_id": null
+        });
+
+        assert!(crate::mcp::caller_identity::is_claude_code_caller_request(
+            &req
+        ));
+        assert_eq!(
+            crate::mcp::caller_identity::claude_timeline_route_from_request(&req).as_deref(),
+            Some("claude-code:7dbca76e-c67a-4cee-ad28-52ad4d90bd28")
+        );
+        // 旧的通用提取也只会拿到 Claude route，不会落到 Codex 线程。
+        assert_eq!(
+            extract_conversation_route_id_from_request(&req).as_deref(),
+            Some("claude-code:7dbca76e-c67a-4cee-ad28-52ad4d90bd28")
         );
     }
 

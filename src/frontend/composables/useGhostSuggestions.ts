@@ -395,6 +395,9 @@ function setupSyncListener() {
     return
 
   syncListenerReady = true
+  window.addEventListener('iterate:settings-synced', () => {
+    void syncFromSharedFile()
+  })
   window.addEventListener('storage', (event) => {
     if (event.key === STORAGE_KEY)
       reloadFromStorage()

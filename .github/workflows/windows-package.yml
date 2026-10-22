@@ -30,6 +30,7 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: thin
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
       CARGO_PROFILE_RELEASE_OPT_LEVEL: 3
+      ITERATE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.ITERATE_RELEASE_PRIVATE_KEY_B64 }}
       ITERATE_RELEASE_PUBLIC_KEY_B64: ${{ secrets.ITERATE_RELEASE_PUBLIC_KEY_B64 }}
       ITERATE_REQUIRE_ACTIVATION: '0'
 
@@ -131,6 +132,14 @@ jobs:
 
           Compress-Archive -Path "$packageDir" -DestinationPath "$packageName.zip" -Force
 
+      - name: Sign Windows portable asset
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ITERATE_RELEASE_PRIVATE_KEY_B64)) {
+            throw "ITERATE_RELEASE_PRIVATE_KEY_B64 is required for public release assets"
+          }
+          node ./scripts/release-sign-assets.mjs --out-dir . "${{ inputs.package_name }}.zip"
+
       - name: Smoke Windows package layout
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/windows-install-smoke.ps1 -PackageDir windows-package
@@ -147,6 +156,8 @@ jobs:
           name: ${{ inputs.package_name }}
           path: |
             ${{ inputs.package_name }}.zip
+            ${{ inputs.package_name }}.zip.sha256
+            ${{ inputs.package_name }}.zip.sig
             ${{ inputs.package_name }}-setup.exe
           retention-days: 1
 
