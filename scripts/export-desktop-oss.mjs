@@ -29,6 +29,8 @@ const PRIVATE_SCRIPT_PATH_FRAGMENTS = [
 
 const FORBIDDEN_AUDIO_EXTENSIONS = new Set(['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav'])
 
+const VIDEO_EXTENSIONS = new Set(['.m4v', '.mov', '.mp4'])
+
 const SENSITIVE_TEXT_PATTERNS = [
   {
     code: 'private-key-material',
@@ -311,6 +313,17 @@ export function auditSourceAssetPolicy(filePath) {
   return []
 }
 
+// Videos may ship only as silent clips: any ISO BMFF handler of type `soun` means an audio track.
+export function auditVideoAudioTrack(filePath, bytes) {
+  if (!VIDEO_EXTENSIONS.has(path.extname(filePath).toLowerCase()))
+    return []
+  for (let index = bytes.indexOf('hdlr'); index >= 0; index = bytes.indexOf('hdlr', index + 4)) {
+    if (bytes.subarray(index + 12, index + 16).toString('ascii') === 'soun')
+      return [{ code: 'video-audio-track-not-allowed', path: filePath }]
+  }
+  return []
+}
+
 export function auditLicenseDigest(filePath, bytes, expectedDigests) {
   const expected = expectedDigests?.[filePath]
   if (!expected)
@@ -411,6 +424,7 @@ function auditSelectedFiles(sourceRoot, manifest, selectedPaths, transforms = ne
     if (binary) {
       if (!binaryIsAllowed(manifest, filePath))
         findings.push({ code: 'binary-file-not-allowed', path: filePath })
+      findings.push(...auditVideoAudioTrack(filePath, bytes))
       continue
     }
 

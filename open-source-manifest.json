@@ -211,9 +211,7 @@
     "src/rust/assets/resources/notification-ping-372479[notification-ping-372479].mp3",
     "src/rust/assets/resources/notification-sound-7062[notification-sound-7062].mp3",
     "src/rust/assets/resources/positive-notification-alert-351299[positive-notification-alert-351299].mp3",
-    "src/rust/assets/resources/short-digital-notification-alert-440353[short-digital-notification-alert-440353].mp3",
-    "src/frontend/public/onboarding/guide-first-call.mp4",
-    "src/frontend/public/onboarding/guide-first-call-poster.jpg"
+    "src/rust/assets/resources/short-digital-notification-alert-440353[short-digital-notification-alert-440353].mp3"
   ],
   "excludeSuffixes": [
     ".cer",
@@ -295,7 +293,8 @@
     ".jpeg",
     ".jpg",
     ".png",
-    ".webp"
+    ".webp",
+    ".mp4"
   ],
   "forbiddenScriptPathFragments": [
     ".cunzhi-knowledge/",
