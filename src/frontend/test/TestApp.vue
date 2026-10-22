@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import IterateSettings from '../components/settings/IterateSettings.vue'
 import { getTheme } from '../theme'
 import ComponentsTest from './components/ComponentsTest.vue'
+import FirstRunGuideTest from './components/FirstRunGuideTest.vue'
 import GlobalSpeechSettingsTest from './components/GlobalSpeechSettingsTest.vue'
 import MainLayoutTest from './components/MainLayoutTest.vue'
 import McpPopupTest from './components/McpPopupTest.vue'
@@ -12,6 +13,7 @@ import ThemesTest from './components/ThemesTest.vue'
 import TrialExpiredOverlayTest from './components/TrialExpiredOverlayTest.vue'
 
 const tabs = [
+  { key: 'first-run-guide', label: '首次引导（新）', component: FirstRunGuideTest },
   { key: 'onboarding-welcome', label: '欢迎页', component: OnboardingWelcomeTest },
   { key: 'trial-expired', label: '激活页', component: TrialExpiredOverlayTest },
   { key: 'main-ui', label: '主界面', component: MainLayoutTest },

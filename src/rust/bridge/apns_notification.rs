@@ -86,6 +86,12 @@ pub(super) struct ApnsNotifyRequest {
     pub(super) codex_thread_id: Option<String>,
     #[serde(default)]
     pub(super) codex_deeplink: Option<String>,
+    /// 调用方客户端（`codex` / `claude_code`），只用于早期 mcp_state 的时间线 route
+    #[serde(default)]
+    pub(super) caller_client: Option<String>,
+    /// 稳定时间线 route（Claude 调用方为 `claude-code:<sessionId>`）
+    #[serde(default)]
+    pub(super) timeline_route_id: Option<String>,
     #[serde(default)]
     pub(super) loop_active: bool,
     #[serde(default)]

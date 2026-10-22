@@ -1573,6 +1573,10 @@ pub async fn setup_application(app_handle: &AppHandle) -> Result<(), String> {
     if speech_role.is_owner_eligible() {
         crate::native_speech::start_phase1_runtime(app_handle.clone(), speech_role);
     }
+    // After an in-place update, hand over from processes still running the old image.
+    if speech_role == crate::native_speech::owner::SpeechProcessRole::CanonicalGui {
+        crate::app::stale_process_heal::spawn_after_startup();
+    }
 
     if !is_standalone {
         // 检查 daemon 是否已在 8080 运行（--bridge-only 模式）

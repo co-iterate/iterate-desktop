@@ -22,7 +22,7 @@
 </sub></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.4-blue?style=flat" alt="Source version 0.6.4">
+  <img src="https://img.shields.io/badge/version-0.6.9-blue?style=flat" alt="Source version 0.6.9">
   <a href="https://github.com/kexin94yyds/iterate-releases/releases/latest"><img src="https://img.shields.io/github/v/release/kexin94yyds/iterate-releases?style=flat&amp;label=release&amp;color=111111" alt="Latest release"></a>
   <a href="https://github.com/kexin94yyds/iterate-releases/releases"><img src="https://img.shields.io/github/downloads/kexin94yyds/iterate-releases/total?style=flat&amp;label=downloads&amp;color=111111" alt="Total downloads"></a>
   <a href="https://github.com/co-iterate/iterate-desktop"><img src="https://img.shields.io/github/stars/co-iterate/iterate-desktop?style=flat&amp;label=stars&amp;color=08A67A" alt="GitHub stars"></a>

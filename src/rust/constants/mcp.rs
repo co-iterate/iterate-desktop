@@ -50,6 +50,9 @@ pub const DEFAULT_ENABLED_TOOLS: &[&str] = &[
 /// 继续回复默认启用状态
 pub const DEFAULT_CONTINUE_REPLY_ENABLED: bool = true;
 
+/// 发送或继续时将当前输入备份到剪贴板，默认由用户主动开启
+pub const DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD: bool = false;
+
 /// 默认自动继续阈值
 pub const DEFAULT_AUTO_CONTINUE_THRESHOLD: u32 = 1000;
 

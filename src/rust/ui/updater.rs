@@ -489,6 +489,65 @@ fn verify_macos_update_app_bundle(app_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_apply_update_script(
+    app_path: &Path,
+    caller_pid: u32,
+    source_app: &Path,
+    marker_path: &Path,
+    script_path: &Path,
+    log_path: &Path,
+    cleanup_cmd: &str,
+) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+
+APP_PATH={app_path}
+CALLER_PID={caller_pid}
+SOURCE_APP={source_app}
+MARKER_PATH={marker_path}
+SELF_PATH={self_path}
+LOG_PATH={log_path}
+
+exec >>"$LOG_PATH" 2>&1
+trap 'rm -f "$MARKER_PATH" "$SELF_PATH"' EXIT
+
+# Serves, popups and the relay keep running from this bundle, so waiting for
+# every process never ends. Wait only for the GUI that started the update; the
+# swap happens when the user restarts or quits it, never while it is in use.
+while kill -0 "$CALLER_PID" 2>/dev/null; do
+  sleep 1
+done
+
+TMP_APP="${{APP_PATH}}.updating"
+rm -rf "$TMP_APP"
+ditto "$SOURCE_APP" "$TMP_APP"
+# Retire instead of deleting: processes still executing the old image keep a
+# valid code object, so their signature checks keep passing (P-2026-9354).
+RETIRED_DIR="$(dirname "$APP_PATH")/.iterate-retired"
+mkdir -p "$RETIRED_DIR"
+RETIRED_APP="$RETIRED_DIR/iterate-$(date +%Y%m%d%H%M%S)-$$.app"
+mv "$APP_PATH" "$RETIRED_APP"
+if ! mv "$TMP_APP" "$APP_PATH"; then
+  mv "$RETIRED_APP" "$APP_PATH"
+  exit 1
+fi
+{cleanup_cmd}
+# -n starts a new canonical GUI even when popups of the old version are open;
+# plain `open` would only activate one of them (P-2026-9365).
+open -n "$APP_PATH" >/dev/null 2>&1 || true
+"#,
+        app_path = shell_quote(&app_path.to_string_lossy()),
+        caller_pid = caller_pid,
+        source_app = shell_quote(&source_app.to_string_lossy()),
+        marker_path = shell_quote(&marker_path.to_string_lossy()),
+        self_path = shell_quote(&script_path.to_string_lossy()),
+        log_path = shell_quote(&log_path.to_string_lossy()),
+        cleanup_cmd = cleanup_cmd,
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn stage_macos_bundle_replace(
     new_app_path: &Path,
     cleanup: Option<MacOsUpdateCleanup>,
@@ -521,46 +580,14 @@ fn stage_macos_bundle_replace(
         None => "true".to_string(),
     };
 
-    let script = format!(
-        r#"#!/bin/sh
-set -eu
-
-APP_PATH={app_path}
-APP_BIN={app_bin}
-SOURCE_APP={source_app}
-MARKER_PATH={marker_path}
-SELF_PATH={self_path}
-LOG_PATH={log_path}
-
-exec >>"$LOG_PATH" 2>&1
-trap 'rm -f "$MARKER_PATH" "$SELF_PATH"' EXIT
-
-for _ in $(seq 1 120); do
-  if ! pgrep -f -- "$APP_BIN" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
-
-TMP_APP="${{APP_PATH}}.updating"
-rm -rf "$TMP_APP"
-ditto "$SOURCE_APP" "$TMP_APP"
-rm -rf "$APP_PATH"
-mv "$TMP_APP" "$APP_PATH"
-{cleanup_cmd}
-open "$APP_PATH" >/dev/null 2>&1 || true
-"#,
-        app_path = shell_quote(&current_app_path.to_string_lossy()),
-        app_bin = shell_quote(
-            &current_app_path
-                .join("Contents/MacOS/iterate")
-                .to_string_lossy()
-        ),
-        source_app = shell_quote(&new_app_path.to_string_lossy()),
-        marker_path = shell_quote(&marker_path.to_string_lossy()),
-        self_path = shell_quote(&script_path.to_string_lossy()),
-        log_path = shell_quote(&log_path.to_string_lossy()),
-        cleanup_cmd = cleanup_cmd,
+    let script = macos_apply_update_script(
+        &current_app_path,
+        std::process::id(),
+        new_app_path,
+        &marker_path,
+        &script_path,
+        &log_path,
+        &cleanup_cmd,
     );
 
     fs::write(&script_path, script).map_err(|e| format!("写入更新脚本失败: {}", e))?;
@@ -1256,6 +1283,51 @@ fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_apply_update_retires_the_old_bundle_and_opens_a_new_gui() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("iterate.app");
+        let source = temp.path().join("new.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(app.join("Contents/version"), "old").unwrap();
+        std::fs::create_dir_all(source.join("Contents")).unwrap();
+        std::fs::write(source.join("Contents/version"), "new").unwrap();
+        // `open` is stubbed through PATH and records its arguments.
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let open_log = temp.path().join("open.log");
+        std::fs::write(bin.join("open"), format!("#!/bin/sh\necho \"$@\" > {}\n", open_log.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("open"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // An already exited process stands in for the GUI that started the update.
+        let mut caller = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let caller_pid = caller.id();
+        caller.wait().unwrap();
+
+        let script_path = temp.path().join("apply_update.sh");
+        let script = super::macos_apply_update_script(
+            &app, caller_pid, &source, &temp.path().join("marker"), &script_path,
+            &temp.path().join("apply.log"), "true",
+        );
+        std::fs::write(&script_path, script).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg(&script_path)
+            .env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(std::fs::read_to_string(app.join("Contents/version")).unwrap(), "new");
+        let retired: Vec<_> = std::fs::read_dir(temp.path().join(".iterate-retired")).unwrap()
+            .map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(retired.len(), 1, "the old bundle is kept, not deleted");
+        assert_eq!(std::fs::read_to_string(retired[0].join("Contents/version")).unwrap(), "old");
+        let open_args = std::fs::read_to_string(&open_log).unwrap();
+        assert!(open_args.starts_with("-n "), "a new canonical GUI must be started: {open_args}");
+        assert!(!script_path.exists(), "the script removes itself");
+    }
+
     use super::{
         get_platform_download_asset, latest_tag_from_redirect_location,
         macos_update_signature_details_trusted, parse_sha256_checksum,

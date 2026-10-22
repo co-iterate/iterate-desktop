@@ -2,6 +2,7 @@
 import { computed, watch } from 'vue'
 import { useLocalQrCode } from '../../composables/useLocalQrCode'
 import { mobileConnectionFailureText } from './mobileConnectionMachine'
+import { buildAliyunIpRouteSetupPrompt } from './mobileConnectionPrompts'
 import { useMobileConnectionSetup } from './useMobileConnectionSetup'
 
 const show = defineModel<boolean>('show', { default: false })
@@ -15,6 +16,7 @@ const {
   remainingSeconds,
   error,
   notice,
+  managedAdmission,
   aiSetupPrompt,
   bootstrap,
   issueFreshPairing,
@@ -71,6 +73,11 @@ async function copyAiPrompt() {
     : '正式连接配置提示词已复制。'
 }
 
+async function copyAliyunIpPrompt() {
+  await navigator.clipboard.writeText(buildAliyunIpRouteSetupPrompt())
+  notice.value = '阿里云 IP 配置提示词已复制。'
+}
+
 watch(show, (visible) => {
   if (visible)
     void bootstrap()
@@ -123,8 +130,13 @@ watch(show, (visible) => {
       </div>
 
       <template v-else-if="state.stage === 'setup_required'">
+        <n-alert v-if="managedAdmission" type="warning" :bordered="false">
+          {{ managedAdmission === 'closed'
+            ? '自动连接目前没有对新设备开放，这次没能一键开通。可以先用下面的方式配置自己的公网路线；开放后点「重新检测」会自动连接。'
+            : '这台电脑不在自动连接的开放名单里，这次没能一键开通。可以先用下面的方式配置自己的公网路线；获准后点「重新检测」会自动连接。' }}
+        </n-alert>
         <n-alert type="info" :bordered="false">
-          这台 Mac 还没有登记正式公网路线。复制下面的安全提示词交给 AI；遇到 Cloudflare 登录、域名、DNS、管理员权限或凭据步骤时，AI 必须停下来由你确认。
+          当前电脑还没有登记正式公网路线。可以选择 Cloudflare Named Tunnel 或阿里云 IP + SSH，复制对应的安全提示词交给 AI；遇到登录、域名、DNS、管理员权限、凭据或费用相关步骤时，AI 必须停下来由你确认。
         </n-alert>
         <div class="prompt-preview">
           <div class="text-xs font-medium">
@@ -136,7 +148,10 @@ watch(show, (visible) => {
         </div>
         <div class="grid grid-cols-2 gap-2">
           <n-button size="large" class="tap-target" @click="copyAiPrompt">
-            复制 AI 配置提示词
+            复制 AI 配置提示词（Cloudflare）
+          </n-button>
+          <n-button size="large" class="tap-target" @click="copyAliyunIpPrompt">
+            复制阿里云 IP 配置提示词
           </n-button>
           <n-button type="primary" size="large" class="tap-target" @click="retry">
             重新检测
@@ -149,7 +164,7 @@ watch(show, (visible) => {
           正式配置仍然保留，只是当前自动恢复未通过。修复提示词只允许检查和恢复现有路线，不会退回首次配置或创建测试路线。
         </n-alert>
         <div v-if="formalRoute?.base_url" class="route-receipt text-xs">
-          已配置地址：{{ formalRoute.base_url }}
+          已配置{{ formalRoute.transport === 'aliyun_ssh_reverse_tunnel' ? '阿里云 IP + SSH' : 'Cloudflare' }}地址：{{ formalRoute.base_url }}
         </div>
         <div class="text-xs opacity-70">
           {{ terminalText }}

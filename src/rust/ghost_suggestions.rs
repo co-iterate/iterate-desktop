@@ -127,6 +127,7 @@ pub fn load_store_value() -> Value {
 }
 
 pub fn save_store_from_content(content: String) -> Result<Value, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let value: Value =
         serde_json::from_str(&content).map_err(|e| format!("解析幽灵补全词表失败: {e}"))?;
     let mut store = normalize_store_value(&value);
@@ -138,6 +139,7 @@ pub fn save_store_from_content(content: String) -> Result<Value, String> {
 }
 
 pub fn upsert_ghost_suggestion(request: UpsertGhostSuggestionRequest) -> Result<Value, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let key = normalize_key(&request.key);
     validate_key(&key)?;
 
@@ -188,6 +190,7 @@ pub fn update_ghost_suggestion(
     id: &str,
     request: UpdateGhostSuggestionRequest,
 ) -> Result<Value, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let mut store = load_store()?;
     ensure_expected_updated_at(&store, request.expected_updated_at.as_deref())?;
 
@@ -238,6 +241,7 @@ pub fn remove_ghost_suggestion(
     id: &str,
     request: RemoveGhostSuggestionRequest,
 ) -> Result<Value, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let mut store = load_store()?;
     ensure_expected_updated_at(&store, request.expected_updated_at.as_deref())?;
 
@@ -271,6 +275,7 @@ pub fn remove_ghost_suggestions_by_description(description: &str) -> Result<Valu
 }
 
 pub fn reorder_ghost_suggestions(request: ReorderGhostSuggestionsRequest) -> Result<Value, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let mut store = load_store()?;
     ensure_expected_updated_at(&store, request.expected_updated_at.as_deref())?;
 
@@ -314,6 +319,7 @@ pub fn reorder_ghost_suggestions(request: ReorderGhostSuggestionsRequest) -> Res
 }
 
 pub fn replace_ghost_suggestions(request: ReplaceGhostSuggestionsRequest) -> Result<Value, String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let mut store = load_store()?;
     ensure_expected_updated_at(&store, request.expected_updated_at.as_deref())?;
 
@@ -477,7 +483,7 @@ fn normalize_key(key: &str) -> String {
     key.trim().to_string()
 }
 
-fn validate_key(key: &str) -> Result<(), String> {
+pub(crate) fn validate_key(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("触发词不能为空".to_string());
     }
@@ -759,6 +765,8 @@ mod tests {
                         .to_string_lossy()
                         .to_string()
                 })
+                // The shared settings lock lives beside the stores by design.
+                .filter(|name| name != "settings-content.lock")
                 .collect::<Vec<_>>();
             files.sort();
             assert_eq!(files, vec!["ghost-suggestions.json".to_string()]);

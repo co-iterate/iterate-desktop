@@ -4,6 +4,8 @@ pub mod browser;
 pub mod config;
 pub mod constants;
 pub mod conversation;
+pub mod cross_device;
+pub mod delivery;
 pub mod ghost_suggestion_learning;
 pub mod ghost_suggestions;
 pub mod ipc;

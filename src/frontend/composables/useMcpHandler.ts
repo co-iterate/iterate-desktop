@@ -2,8 +2,11 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ref } from 'vue'
+import { publishCompletedMcpRequest } from '../services/bridgeRequestClosure'
 import { clearActiveMcpFatalContext, setActiveMcpFatalContext } from '../utils/mcpFatalError'
+import { crossDeviceSendError } from './useCrossDevice'
 import { isMuted, refreshGlobalMute, toggleMute } from './useGlobalMute'
+import { MCP_DELIVERY_FAILURE, mcpDeliveryError } from './useMcpDelivery'
 import { useNotification } from './useNotification'
 
 const LAST_VALID_PROJECT_PATH_KEY = 'iterate.last_valid_project_path'
@@ -155,6 +158,10 @@ async function resolveConversationRouteIdWithFallback(
   const explicitRouteId = resolveExplicitConversationRouteId(request)
   if (explicitRouteId)
     return explicitRouteId
+
+  // Claude Code 调用方不得借用 Codex live goal 的线程（P-2026-9373）
+  if (request?.caller_client === 'claude_code')
+    return resolveRequestId(request)
 
   const liveGoalRouteId = await resolveLiveGoalConversationRouteId(projectPath)
   return liveGoalRouteId ?? resolveRequestId(request)
@@ -391,6 +398,8 @@ export function useMcpHandler() {
   }
 
   function resolveProjectPath(request: any): string | null {
+    if (String(request?.id || '').startsWith('cross-'))
+      return null
     const candidate = request?.project_path ?? request?.projectPath
     if (isDisplayableProjectPath(candidate)) {
       const normalized = candidate.trim()
@@ -409,6 +418,8 @@ export function useMcpHandler() {
    * 统一的MCP响应处理
    */
   async function handleMcpResponse(response: any) {
+    crossDeviceSendError.value = ''
+    mcpDeliveryError.value = ''
     const request = mcpRequest.value as any
     const resolutionKey = beginRequestResolution(request, response)
     if (!resolutionKey)
@@ -416,6 +427,7 @@ export function useMcpHandler() {
     const projectPath = resolveProjectPath(request)
     const requestId = resolveRequestId(request)
     let dismissal: ImmediateMcpDismissal | null = null
+    let submitted = false
     try {
       dismissal = await dismissMcpUiImmediately(request)
       // 通过Tauri命令发送响应并退出应用
@@ -427,6 +439,8 @@ export function useMcpHandler() {
         hasResponse: response != null,
       })
       await invoke('send_mcp_response', { response, projectPath, requestId, timelineRouteId })
+      submitted = true
+      await publishCompletedMcpRequest(requestId, request?.project_path ?? request?.projectPath)
       clearActiveMcpFatalContext()
       if (isMcpProcess.value) {
         await invoke('exit_app')
@@ -434,6 +448,10 @@ export function useMcpHandler() {
     }
     catch (error) {
       console.error('MCP响应处理失败:', error)
+      if (!submitted)
+        mcpDeliveryError.value = MCP_DELIVERY_FAILURE
+      if (String(requestId || '').startsWith('cross-'))
+        crossDeviceSendError.value = String(error)
       if (dismissal)
         await restoreMcpUiAfterFailure(dismissal)
     }
@@ -486,6 +504,7 @@ export function useMcpHandler() {
         projectPath,
       })
       await invoke('send_mcp_response', { response: 'CANCELLED', projectPath, requestId, timelineRouteId })
+      await publishCompletedMcpRequest(requestId, request?.project_path ?? request?.projectPath)
       clearActiveMcpFatalContext()
       if (isMcpProcess.value) {
         await invoke('exit_app')
@@ -507,6 +526,7 @@ export function useMcpHandler() {
    */
   async function showMcpDialog(request: any) {
     await refreshGlobalMute()
+    mcpDeliveryError.value = ''
     const projectPath = resolveProjectPath(request)
     const routedRequest = await freezeConversationRouteId(request, projectPath)
     const requestId = resolveRequestId(routedRequest)

@@ -13,6 +13,17 @@ export interface McpRequest {
   codex_home?: string
   codex_thread_id?: string
   codex_deeplink?: string
+  /** 调用方客户端（P-2026-9373）；缺省视为 Codex */
+  caller_client?: 'codex' | 'claude_code' | string
+  /** Claude Code 调用方会话 ID（不复用 codex_thread_id） */
+  caller_session_id?: string
+  /** Claude Code 调用方会话启动目录 */
+  caller_cwd?: string
+  /** Claude Code 调用方进程号 */
+  caller_pid?: number
+  /** 稳定时间线 route；Claude 调用方为 `claude-code:<sessionId>` */
+  timeline_route_id?: string
+  conversation_title?: string
   checkpoint_id?: string
   checkpoint_commit?: string
   checkpoint_message?: string
@@ -105,6 +116,7 @@ export interface PopupFileAttachment {
 
 export interface PopupInputData {
   userInput?: string
+  rawUserInput?: string
   selectedOptions?: string[]
   draggedImages?: string[]
   attachedFiles?: PopupFileAttachment[]

@@ -840,6 +840,37 @@ if (!window.__TAURI__) {
     if (command === 'get_auto_checkpoint_enabled') {
       return true
     }
+    if (command === 'get_custom_prompt_config') {
+      const now = '2026-10-21T00:00:00Z'
+      const normal = (id: string, name: string, sort_order: number) => ({ id, name, content: `${name} 的内容`, sort_order, created_at: now, updated_at: now, type: 'normal' as const })
+      const conditional = (id: string, name: string, sort_order: number, current_state: boolean, is_active = true) => ({
+        id,
+        name,
+        content: '',
+        sort_order,
+        created_at: now,
+        updated_at: now,
+        type: 'conditional' as const,
+        condition_text: name,
+        template_true: `✔️${name}`,
+        template_false: '',
+        current_state,
+        is_active,
+      })
+      return {
+        enabled: true,
+        maxPrompts: 50,
+        prompts: [
+          normal('n1', '继续', 0),
+          normal('n2', '先别改', 1),
+          normal('n3', '跑一下测试', 2),
+          conditional('c1', '不明白先问我', 3, true),
+          conditional('c2', '发现问题先询问记录', 4, true),
+          conditional('c3', '交付用 Markdown 链接', 5, true),
+          conditional('c4', '简短回答', 6, false),
+        ],
+      }
+    }
     if (command === 'set_auto_checkpoint_enabled') {
       return null
     }
@@ -1003,6 +1034,15 @@ if (!window.__TAURI__) {
 }
 
 // 创建 Vue 应用
+// ?popupCompact=0|1 用于对比简洁弹窗开关的两种状态
+const popupCompactParam = new URLSearchParams(window.location.search).get('popupCompact')
+if (popupCompactParam === '0' || popupCompactParam === '1') {
+  try {
+    localStorage.setItem('iterate:popup:compact-mode', popupCompactParam === '1' ? 'true' : 'false')
+  }
+  catch {}
+}
+
 const app = createApp(TestApp)
 
 // 使用 Naive UI

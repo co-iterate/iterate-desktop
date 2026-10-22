@@ -15,6 +15,7 @@ const message = useMessage()
 const loading = ref(false)
 const saving = ref(false)
 const entries = ref<Entry[]>([])
+let savedEntries: unknown = []
 const showModal = ref(false)
 const editingId = ref<string | null>(null)
 const form = ref<Entry>({
@@ -43,6 +44,7 @@ async function loadEntries() {
   loading.value = true
   try {
     const result = await invoke('get_speech_muscle_memory_entries')
+    savedEntries = structuredClone(result)
     entries.value = normalizeEntries(result)
   }
   catch (error) {
@@ -59,14 +61,16 @@ async function persistEntries(nextEntries: Entry[], successMessage?: string) {
   try {
     const result = await invoke('save_speech_muscle_memory_entries', {
       entries: nextEntries,
+      expectedEntries: savedEntries,
     })
+    savedEntries = structuredClone(result)
     entries.value = normalizeEntries(result)
     if (successMessage)
       message.success(successMessage)
   }
   catch (error) {
     console.error('保存肌肉记忆库失败:', error)
-    message.error('保存肌肉记忆库失败')
+    message.error(String(error))
   }
   finally {
     saving.value = false

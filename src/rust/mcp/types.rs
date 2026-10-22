@@ -149,6 +149,17 @@ pub struct PopupRequest {
     pub codex_thread_id: Option<String>,
     #[serde(default)]
     pub codex_deeplink: Option<String>,
+    /// 调用方客户端：`codex` / `claude_code`（P-2026-9373）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_route_id: Option<String>,
     #[serde(default)]
     pub checkpoint_id: Option<String>,
     #[serde(default)]

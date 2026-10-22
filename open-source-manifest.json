@@ -80,6 +80,7 @@
     "release-package/scripts/merge-codex-mcp-config.py",
     "release-package/windows/Install iterate.bat",
     "release-package/windows/Start iterate.bat",
+    "resources/windows-test.manifest",
     "screenshots/feature1.png",
     "screenshots/feature3.png",
     "screenshots/interceptor.png",
@@ -126,6 +127,7 @@
     "scripts/release-authority-workflow.test.mjs",
     "scripts/release-sign-assets.mjs",
     "scripts/release-sign-assets.test.mjs",
+    "scripts/run-rust-tests.mjs",
     "scripts/select-windows-x64-webview2-loader.mjs",
     "scripts/sync-version.sh",
     "scripts/timeline-dotbar-layout.test.mjs",
@@ -209,7 +211,9 @@
     "src/rust/assets/resources/notification-ping-372479[notification-ping-372479].mp3",
     "src/rust/assets/resources/notification-sound-7062[notification-sound-7062].mp3",
     "src/rust/assets/resources/positive-notification-alert-351299[positive-notification-alert-351299].mp3",
-    "src/rust/assets/resources/short-digital-notification-alert-440353[short-digital-notification-alert-440353].mp3"
+    "src/rust/assets/resources/short-digital-notification-alert-440353[short-digital-notification-alert-440353].mp3",
+    "src/frontend/public/onboarding/guide-first-call.mp4",
+    "src/frontend/public/onboarding/guide-first-call-poster.jpg"
   ],
   "excludeSuffixes": [
     ".cer",
