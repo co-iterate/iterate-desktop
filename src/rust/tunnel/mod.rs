@@ -3,6 +3,7 @@ pub mod formal_transport;
 pub mod manager;
 pub mod managed;
 pub mod secret;
+pub mod tailscale_serve;
 
 pub use commands::{
     check_origin_health, get_quick_tunnel_status, get_remote_tunnel_status, recover_bridge_origin,

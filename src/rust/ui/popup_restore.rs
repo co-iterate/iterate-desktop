@@ -87,7 +87,7 @@ fn release_shortcut(app: &AppHandle, owner: &Owner) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn restore_window(window: &WebviewWindow) -> Result<(), String> {
+pub(crate) fn restore_window(window: &WebviewWindow) -> Result<(), String> {
     window.unminimize().map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
@@ -189,6 +189,19 @@ fn synchronize_main(app: &AppHandle) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// 全部窗口面板点中本进程时，由本进程自己取消最小化并抢回前台：
+/// macOS 不允许别的进程替我们 unminimize，跨进程激活也只是「请求」。
+pub async fn take_focus_request(app: &AppHandle) -> Result<(), String> {
+    if !super::window_registry::take_focus_request_for_current_process() {
+        return Ok(());
+    }
+    on_main(app.clone(), |app| match app.get_webview_window("main") {
+        Some(window) => restore_window(&window),
+        None => Err("没有 main 窗口可聚焦".into()),
+    })
+    .await
 }
 
 /// Reuses the existing native mute tick, which runs while WebViews are minimized.

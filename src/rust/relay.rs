@@ -3899,8 +3899,8 @@ mod tests {
     fn pairing_primary_detects_tailscale_funnel_base_url() {
         let pairing = json!({
             "transport_mode": "public_tunnel",
-            "base_url": "https://macbook-air.tail5b0fb3.ts.net",
-            "ws_url": "wss://macbook-air.tail5b0fb3.ts.net/ws"
+            "base_url": "https://macbook-air.tail1234ab.ts.net",
+            "ws_url": "wss://macbook-air.tail1234ab.ts.net/ws"
         });
         assert!(pairing_primary_is_tailscale_funnel(&pairing));
 

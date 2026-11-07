@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import IterateSettings from '../components/settings/IterateSettings.vue'
 import { getTheme } from '../theme'
 import ComponentsTest from './components/ComponentsTest.vue'
+import FirstRunGuideTest from './components/FirstRunGuideTest.vue'
 import GlobalSpeechSettingsTest from './components/GlobalSpeechSettingsTest.vue'
 import MainLayoutTest from './components/MainLayoutTest.vue'
 import McpPopupTest from './components/McpPopupTest.vue'
@@ -12,7 +13,8 @@ import ThemesTest from './components/ThemesTest.vue'
 import TrialExpiredOverlayTest from './components/TrialExpiredOverlayTest.vue'
 
 const tabs = [
-  { key: 'onboarding-welcome', label: '欢迎页', component: OnboardingWelcomeTest },
+  { key: 'first-run-guide', label: '① 首次引导（下载后第一眼）', component: FirstRunGuideTest },
+  { key: 'onboarding-welcome', label: '欢迎页（旧·正式版已不用）', component: OnboardingWelcomeTest },
   { key: 'trial-expired', label: '激活页', component: TrialExpiredOverlayTest },
   { key: 'main-ui', label: '主界面', component: MainLayoutTest },
   { key: 'mcp-popup', label: 'MCP 弹窗', component: McpPopupTest },
@@ -24,7 +26,7 @@ const tabs = [
 ]
 
 const initialTab = new URLSearchParams(window.location.search).get('tab')
-const activeTab = ref(tabs.some(tab => tab.key === initialTab) ? initialTab! : 'mcp-popup')
+const activeTab = ref(tabs.some(tab => tab.key === initialTab) ? initialTab! : 'first-run-guide')
 const useSimulatedWindow = ref(true)
 
 watch(activeTab, (tab) => {
@@ -81,14 +83,22 @@ onUnmounted(() => {
           <!-- 测试控制面板 -->
           <div class="test-controls">
             <n-card title="测试控制面板" size="small">
-              <n-tabs v-model:value="activeTab" type="segment" size="small">
-                <n-tab-pane
+              <a class="real-app-link" href="./app.html?fresh=1" target="_blank">
+                ▶ 真实 App 原型（推荐）
+                <small>跑正式 App.vue，按钮都是真的；从新用户第一眼开始</small>
+              </a>
+              <div class="tab-list">
+                <n-button
                   v-for="tab in tabs"
                   :key="tab.key"
-                  :name="tab.key"
-                  :tab="tab.label"
-                />
-              </n-tabs>
+                  block
+                  size="small"
+                  :type="activeTab === tab.key ? 'primary' : 'default'"
+                  @click="activeTab = tab.key"
+                >
+                  {{ tab.label }}
+                </n-button>
+              </div>
             </n-card>
           </div>
 
@@ -194,9 +204,40 @@ onUnmounted(() => {
 
 /* 测试控制面板 */
 .test-controls {
-  flex: 0 0 300px;
+  flex: 0 0 240px;
   position: sticky;
   top: 20px;
+  z-index: 2;
+}
+
+.real-app-link {
+  display: block;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #16a34a;
+  color: #fff;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.real-app-link small {
+  display: block;
+  margin-top: 2px;
+  font-weight: 400;
+  font-size: 11px;
+  opacity: 0.9;
+}
+
+.tab-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tab-list :deep(.n-button__content) {
+  justify-content: flex-start;
+  width: 100%;
 }
 
 .simulated-window {
@@ -207,14 +248,10 @@ onUnmounted(() => {
     0 20px 60px rgba(0, 0, 0, 0.3),
     0 8px 25px rgba(0, 0, 0, 0.2);
   overflow: hidden;
-  transition: all 0.3s ease;
-}
-
-.simulated-window:hover {
-  transform: translateY(-2px);
-  box-shadow:
-    0 25px 70px rgba(0, 0, 0, 0.35),
-    0 10px 30px rgba(0, 0, 0, 0.25);
+  /* 常驻 transform：让组件里 position: fixed 的全屏层（欢迎页、激活页、引导浮层）
+     始终以这个 600px 窗口为容器。原来只在 :hover 时加 transform，
+     全屏层会在“铺满浏览器 / 铺满窗口”之间来回跳。 */
+  transform: translateZ(0);
 }
 
 /* 窗口标题栏 */

@@ -48,7 +48,8 @@ test('ordinary typing does not append automatic context on every keystroke', () 
 })
 
 test('automatic learning is fed only by direct text input event types and committed IME text', () => {
-  assert.match(popupInputSource, /@input="handleDirectUserInputForLearning"/)
+  assert.match(popupInputSource, /@input="handleTextareaInput"/)
+  assert.match(popupInputSource, /if \(ghostSuggestionsEnabled\.value\) \{\n {4}handleDirectUserInputForLearning\(event as InputEvent\)/)
   assert.match(popupInputSource, /directUserLearningChunkFromInputEvent\(event\)/)
   assert.match(popupInputSource, /directUserLearningChunkFromCompositionEvent\(event\)/)
   assert.match(popupInputSource, /extractDirectUserAuthoredPromotionTerms\(/)
@@ -173,4 +174,43 @@ test('ghost completion uses solitary left Option to enable and right Option to d
   assert.doesNotMatch(mcpPopupSource, /SEND_TARGET_KEY|sendTarget\.value/)
   assert.match(popupHeaderSource, /invoke\('open_terminal', \{ cwd: props\.projectPath \}\)/)
   assert.match(popupHeaderSource, /title="在当前项目打开终端"/)
+})
+
+test('with ghost completion off, typing stays in the native textarea', () => {
+  const textarea = popupInputSource.slice(
+    popupInputSource.lastIndexOf('<textarea', popupInputSource.indexOf('class="popup-main-input"')),
+    popupInputSource.indexOf('/>', popupInputSource.indexOf('class="popup-main-input"')),
+  )
+  const inputHandler = popupInputSource.match(/function handleTextareaInput\(event: Event\) \{[\s\S]*?\n\}/)?.[0] ?? ''
+
+  // 不绑定 v-model/:value，否则每次重渲染都会把落后的 userInput 写回 textarea
+  assert.doesNotMatch(textarea, /v-model|:value=/)
+  // 关闭补全时只在有/无内容切换或 @ 触发时同步，停手也不同步
+  assert.match(inputHandler, /syncIfInputBoundaryChanged\(readTextareaText\(\)\)/)
+  assert.doesNotMatch(popupInputSource, /scheduleInputIdleSync|INPUT_IDLE_SYNC_MS/)
+  assert.doesNotMatch(inputHandler.split('return')[1] ?? '', /emitUpdate|handleDirectUserInputForLearning/)
+})
+
+test('ghost completion off stops input learning', () => {
+  assert.match(popupInputSource, /if \(!ghostSuggestionsEnabled\.value\) \{\n {4}directUserLearningBuffer = ''\n {4}return\n {2}\}/)
+  assert.match(popupInputSource, /if \(ghostSuggestionsEnabled\.value\)\n {4}directUserLearningBuffer \+= directUserLearningChunkFromCompositionEvent\(event\)/)
+  assert.match(popupInputSource, /watch\(ghostSuggestionsEnabled, \(enabled\) => \{[\s\S]*?directUserLearningBuffer = ''/)
+})
+
+test('submit, goal, draft and clipboard backup read the latest textarea text first', () => {
+  assert.match(popupInputSource, /function getFinalUserInput\(\) \{\n {2}syncUserInputFromTextarea\(\)/)
+  for (const fn of ['handleSubmit', 'handleGoalSubmit', 'getDraft', 'backupCurrentSubmissionToClipboard']) {
+    const body = mcpPopupSource.match(new RegExp(`function ${fn}\\([^)]*\\)[^{]*\\{[\\s\\S]*?\\n\\}`))?.[0] ?? ''
+    assert.match(body, /inputRef\.value\?\.flushInput\?\.\(\)/, fn)
+  }
+  // 发送日志只记长度，不落正文
+  assert.match(mcpPopupSource, /userInputLength: userInput\.value\.length/)
+})
+
+test('cross-device polling keeps state identity when nothing changed', () => {
+  const crossDeviceSource = readFileSync(
+    new URL('../src/frontend/composables/useCrossDevice.ts', import.meta.url),
+    'utf8',
+  )
+  assert.match(crossDeviceSource, /if \(JSON\.stringify\(next\) !== JSON\.stringify\(state\.value\)\)\n {6}state\.value = next/)
 })

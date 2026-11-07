@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import AppContent from './components/AppContent.vue'
 import TrialExpiredOverlay from './components/common/TrialExpiredOverlay.vue'
+import FirstRunGuideHost from './components/onboarding/FirstRunGuideHost.vue'
 import InfinitySpeechAnchor from './components/speech/InfinitySpeechAnchor.vue'
 import { useAppManager } from './composables/useAppManager'
 import { useEventHandlers } from './composables/useEventHandlers'
@@ -24,7 +25,7 @@ const {
 } = useAppManager()
 
 // 创建事件处理器
-const handlers = useEventHandlers(actions)
+const handlers = useEventHandlers(actions, () => mcpRequest.value)
 const speechRuntimeHost = useGlobalSpeechRuntimeHost()
 
 // 试用期状态
@@ -36,6 +37,7 @@ const onboardingChecked = ref(false)
 const appStarted = ref(false)
 const mcpLaunchContext = ref<McpLaunchContext | null>(null)
 const trialCheckMessage = ref('正在检查授权状态...')
+const startupFailed = ref(false)
 const TRIAL_STATUS_TIMEOUT_MS = 5000
 const speechOverlayMode = new URLSearchParams(window.location.search).get('view') === 'speech-overlay'
 const windowsPlatform = navigator.platform.toUpperCase().includes('WIN')
@@ -130,6 +132,10 @@ async function retryBackgroundServices() {
   finally {
     retryingBackgroundServices.value = false
   }
+}
+
+function reloadWindow() {
+  window.location.reload()
 }
 
 async function reportTrialDebug(message: string) {
@@ -284,6 +290,9 @@ onMounted(async () => {
   catch (error) {
     console.error('应用初始化失败:', error)
     await reportTrialDebug(`onMounted:initializeFailed ${String(error)}`)
+    // 兑现等待页上「自动回落到错误态」的承诺，而不是一直停在初始文案
+    startupFailed.value = true
+    trialCheckMessage.value = '启动没有完成'
   }
 })
 
@@ -351,6 +360,8 @@ onUnmounted(() => {
               @update-reply-config="handlers.onUpdateReplyConfig" @message-ready="handlers.onMessageReady"
               @config-reloaded="handlers.onConfigReloaded" @bridge-action="handlers.onBridgeAction"
             />
+            <!-- 首次使用引导：只在主窗口出现，不进入独立 MCP 弹窗窗口 -->
+            <FirstRunGuideHost v-if="!mcpShellMode" />
           </n-dialog-provider>
         </n-notification-provider>
       </n-message-provider>
@@ -361,7 +372,19 @@ onUnmounted(() => {
         <div class="text-lg font-semibold text-on-surface">
           {{ trialCheckMessage }}
         </div>
-        <div class="text-sm leading-6">
+        <template v-if="startupFailed">
+          <div class="text-sm leading-6">
+            可能有另一个 iterate 窗口正在运行。关闭多余的 iterate 窗口后重新加载；仍不行请完全退出 iterate 再打开。
+          </div>
+          <button
+            type="button"
+            class="rounded-md bg-primary-500 px-4 py-2 text-sm text-white hover:opacity-90"
+            @click="reloadWindow"
+          >
+            重新加载
+          </button>
+        </template>
+        <div v-else class="text-sm leading-6">
           如果等待超过几秒仍无变化，应用会自动回落到错误态，避免白屏无反馈。
         </div>
       </div>

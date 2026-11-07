@@ -88,6 +88,9 @@ pub fn start_global_mute_sync(app: AppHandle) {
             if let Err(error) = super::popup_restore::synchronize(&app).await {
                 log::debug!("同步弹窗恢复快捷键失败: {error}");
             }
+            if let Err(error) = super::popup_restore::take_focus_request(&app).await {
+                log::warn!("响应全部窗口的聚焦请求失败: {error}");
+            }
             if let Ok(Some(snapshot)) = store::read(&path) {
                 if observed != Some(snapshot) {
                     match synchronize(&app, snapshot).await {

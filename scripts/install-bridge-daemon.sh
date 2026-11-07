@@ -69,6 +69,7 @@ Commands:
   restart     unload + load
   uninstall   unload and remove the LaunchAgent plist
   health      Probe local HTTP and WebSocket on PORT
+  verify      Check APP_BIN satisfies the iterate Developer ID requirement
 
 Environment:
   LABEL=${LABEL}
@@ -409,6 +410,7 @@ case "${command}" in
   restart) restart_plist ;;
   uninstall) uninstall_plist ;;
   health) health ;;
+  verify) require_trusted_bridge_identity; log "trusted: ${APP_BIN}" ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 64 ;;
 esac

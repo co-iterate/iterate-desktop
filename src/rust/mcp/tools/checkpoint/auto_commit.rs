@@ -71,11 +71,79 @@ fn push_exclude_pathspec(paths: &mut Vec<String>, workspace: &str, rel_path: &st
     }
 }
 
-fn checkpoint_commit_paths(workspace: &str) -> Vec<String> {
+fn checkpoint_commit_paths(workspace: &str, skipped: &[String]) -> Vec<String> {
     let mut paths = vec![".".to_string()];
     push_exclude_pathspec(&mut paths, workspace, ".cunzhi-knowledge");
     push_exclude_pathspec(&mut paths, workspace, ".cunzhi-memory");
+    for path in skipped {
+        paths.push(format!(":(exclude,literal){}", path));
+    }
     paths
+}
+
+/// 自动检查点单文件上限。超过的文件不自动提交，避免把构建产物、数据导出写进历史
+/// （P-2026-1524 DerivedData 8 GiB、P-2026-9375 Relearn 笔记库导出 200MB+）。
+const MAX_CHECKPOINT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 未跟踪文件中常见的用户数据导出 / 恢复备份，即使很小也不自动提交。
+fn is_user_data_artifact(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    (name.contains("idb-export") && name.ends_with(".json"))
+        || lower.starts_with("recovery-backups/")
+        || lower.contains("/recovery-backups/")
+        || name.ends_with(".asar")
+        || name.contains(".asar.before-")
+        || name.ends_with(".sqlite")
+        || name.ends_with(".sqlite3")
+}
+
+fn git_paths_z(workspace: &str, args: &[&str]) -> Vec<String> {
+    match Command::new("git").args(args).current_dir(workspace).output() {
+        Ok(output) if output.status.success() => output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 找出本次检查点应跳过的文件：任何超过上限的改动文件，以及未跟踪的数据类文件。
+fn checkpoint_skipped_paths(workspace: &str) -> Vec<String> {
+    let untracked = git_paths_z(
+        workspace,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    );
+    let modified = git_paths_z(workspace, &["ls-files", "-z", "--modified"]);
+
+    let mut skipped = Vec::new();
+    for (path, is_untracked) in untracked
+        .iter()
+        .map(|p| (p, true))
+        .chain(modified.iter().map(|p| (p, false)))
+    {
+        if is_checkpoint_index_path(path) || skipped.contains(path) {
+            continue;
+        }
+        let too_large = std::fs::metadata(Path::new(workspace).join(path))
+            .map(|meta| meta.is_file() && meta.len() > MAX_CHECKPOINT_FILE_BYTES)
+            .unwrap_or(false);
+        if too_large || (is_untracked && is_user_data_artifact(path)) {
+            skipped.push(path.clone());
+        }
+    }
+    skipped
+}
+
+fn has_staged_changes(workspace: &str) -> bool {
+    Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(workspace)
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
 }
 
 fn output_stderr(output: &Output) -> String {
@@ -177,10 +245,23 @@ fn create_checkpoint_with_subject(
     if let Some(request_id) = request_id.map(str::trim).filter(|value| !value.is_empty()) {
         body_lines.push(format!("turn_id: {}", request_id));
     }
+
+    let skipped = checkpoint_skipped_paths(workspace);
+    if !skipped.is_empty() {
+        log::warn!(
+            "[Checkpoint] 跳过 {} 个大文件或数据类文件，未自动提交: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+        body_lines.push(format!(
+            "skipped_large_or_data_files: {}",
+            skipped.join(", ")
+        ));
+    }
     let body = body_lines.join("\n");
     let message = format!("{}\n\n{}", subject, body);
 
-    let checkpoint_paths = checkpoint_commit_paths(workspace);
+    let checkpoint_paths = checkpoint_commit_paths(workspace, &skipped);
     let add_result = run_git_with_index_lock_retry(
         workspace,
         &["add", "-A", "--"],
@@ -190,6 +271,10 @@ fn create_checkpoint_with_subject(
 
     if !add_result.status.success() {
         return Err(format!("git add 失败: {}", output_stderr(&add_result)));
+    }
+
+    if !has_staged_changes(workspace) {
+        return Ok(None);
     }
 
     let commit_result = run_git_with_index_lock_retry(
@@ -393,6 +478,8 @@ mod tests {
 
     #[test]
     fn debounced_monitor_creates_checkpoint_after_stable_dirty_state() {
+        // 监控会写对话日志；不隔离时每跑一次测试都会往真实知识库追加一条「@ repo」记录
+        let knowledge = crate::mcp::tools::interaction::logger::TempKnowledgeDirForTest::new();
         let root =
             std::env::temp_dir().join(format!("cunzhi-monitor-checkpoint-{}", std::process::id()));
         let repo = root.join("repo");
@@ -447,6 +534,15 @@ mod tests {
         let head_body = String::from_utf8_lossy(&head.stdout);
         assert!(head_body.contains("checkpoint_id:"));
         assert!(head_body.contains("turn_id: req_monitor"));
+
+        let conversations = knowledge.path().join("conversations");
+        let logged = fs::read_dir(&conversations)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|day| day.path().is_dir());
+        assert!(logged, "monitor checkpoint should log into the temp knowledge dir");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -545,7 +641,7 @@ mod tests {
             .status
             .success());
 
-        let paths = checkpoint_commit_paths(repo.to_str().expect("utf8 path"));
+        let paths = checkpoint_commit_paths(repo.to_str().expect("utf8 path"), &[]);
         assert!(paths
             .iter()
             .any(|path| path == ":(exclude).cunzhi-knowledge"));
@@ -669,6 +765,104 @@ mod tests {
         let followup = auto_create_checkpoint(repo.to_str().expect("utf8 path"), None)
             .expect("generated-only follow-up should succeed");
         assert!(followup.is_none());
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    fn init_seeded_repo(name: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!("{}-{}", name, std::process::id()));
+        if repo.exists() {
+            let _ = fs::remove_dir_all(&repo);
+        }
+        fs::create_dir_all(&repo).expect("temp repo dir should exist");
+        assert!(run_git(&repo, &["init"]).status.success());
+        assert!(run_git(&repo, &["config", "user.name", "Codex Test"])
+            .status
+            .success());
+        assert!(
+            run_git(&repo, &["config", "user.email", "codex@example.com"])
+                .status
+                .success()
+        );
+        fs::write(repo.join("demo.txt"), "v1\n").expect("seed file should be written");
+        assert!(run_git(&repo, &["add", "demo.txt"]).status.success());
+        assert!(run_git(&repo, &["commit", "-m", "seed"]).status.success());
+        repo
+    }
+
+    #[test]
+    fn checkpoint_skips_oversized_and_user_data_files() {
+        let repo = init_seeded_repo("cunzhi-skip-data-files");
+
+        fs::write(repo.join("demo.txt"), "v2\n").expect("dirty file should be written");
+        let big = fs::File::create(repo.join("huge build output.bin")).expect("big file");
+        big.set_len(super::MAX_CHECKPOINT_FILE_BYTES + 1)
+            .expect("big file size");
+        fs::write(repo.join("tmp-idb-export.json"), "{\"notes\":[]}")
+            .expect("export should be written");
+        fs::create_dir_all(repo.join("recovery-backups")).expect("backup dir");
+        fs::write(repo.join("recovery-backups").join("config.json"), "{}")
+            .expect("backup should be written");
+        fs::write(repo.join("notes.sqlite"), "db").expect("sqlite should be written");
+        fs::write(repo.join("small.json"), "{}").expect("normal file should be written");
+
+        auto_create_checkpoint(repo.to_str().expect("utf8 path"), Some("req_skip"))
+            .expect("helper should succeed")
+            .expect("real change should create commit");
+
+        let committed = run_git(&repo, &["show", "--name-only", "--pretty=format:", "HEAD"]);
+        let committed = String::from_utf8_lossy(&committed.stdout);
+        assert!(committed.contains("demo.txt"));
+        assert!(committed.contains("small.json"));
+        assert!(!committed.contains("huge build output.bin"));
+        assert!(!committed.contains("tmp-idb-export.json"));
+        assert!(!committed.contains("recovery-backups/config.json"));
+        assert!(!committed.contains("notes.sqlite"));
+
+        let body = run_git(&repo, &["log", "-1", "--format=%b"]);
+        let body = String::from_utf8_lossy(&body.stdout);
+        assert!(body.contains("skipped_large_or_data_files:"));
+        assert!(body.contains("tmp-idb-export.json"));
+
+        let status = run_git(&repo, &["status", "--porcelain"]);
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(status.contains("tmp-idb-export.json"), "skipped files stay untracked");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn checkpoint_returns_none_when_only_skipped_files_changed() {
+        let repo = init_seeded_repo("cunzhi-skip-only");
+
+        fs::write(repo.join("tmp-idb-export-replace.json"), "{}")
+            .expect("export should be written");
+
+        let result = auto_create_checkpoint(repo.to_str().expect("utf8 path"), None)
+            .expect("skipped-only change should not error");
+        assert!(result.is_none());
+
+        let count = run_git(&repo, &["rev-list", "--count", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn tracked_data_like_files_still_checkpoint_when_small() {
+        let repo = init_seeded_repo("cunzhi-tracked-data");
+
+        fs::write(repo.join("fixture.sqlite"), "v1").expect("fixture should be written");
+        assert!(run_git(&repo, &["add", "fixture.sqlite"]).status.success());
+        assert!(run_git(&repo, &["commit", "-m", "fixture"]).status.success());
+        fs::write(repo.join("fixture.sqlite"), "v2").expect("fixture should change");
+
+        auto_create_checkpoint(repo.to_str().expect("utf8 path"), None)
+            .expect("helper should succeed")
+            .expect("tracked small file change should create commit");
+
+        let committed = run_git(&repo, &["show", "--name-only", "--pretty=format:", "HEAD"]);
+        assert!(String::from_utf8_lossy(&committed.stdout).contains("fixture.sqlite"));
 
         let _ = fs::remove_dir_all(&repo);
     }

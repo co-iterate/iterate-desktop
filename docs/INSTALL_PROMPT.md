@@ -46,12 +46,14 @@
 对于 Codex 等支持工具超时配置的客户端，为 `call_zhi` 保留足够长的等待时间；Codex 可使用 `tool_timeout_sec = 315360000`。
 全新 Codex 配置把 `call_zhi` 的工具级默认值写为 `approval_mode = "prompt"`；如果用户已有显式 `approval_mode`，必须保留已有值，不得覆盖。
 
-## 第四步：配置通用系统提示词
+## 第四步：确认调用规则
 
-1. 打开 iterate App 的“使用说明书”。
-2. 复制“通用系统提示词”。
-3. 按当前客户端支持的方式，把它加入 system prompt、rules 或 always-on memory。
-4. 只使用通用模板，不加入用户未提供的个人知识库、私有目录或专属工作流。
+`call_zhi` 要能连续调用，AI 必须知道“每个任务都以 call_zhi 交回、拿到回复后继续”。
+
+1. 优先用 iterate「设置 → AI 客户端」一键接入：Claude Code、Cursor 会读取 iterate MCP 自带的调用说明；Codex 会被写入 `~/.codex/AGENTS.md` 的一段带标记规则。这两种情况都不需要再复制提示词。
+2. 手动配置 Codex 时，把 `SYSTEM_PROMPT.md` 的「必须遵守的交互协议」加入 `~/.codex/AGENTS.md`。Codex 不会把 MCP 自带说明放进系统提示词，缺了这一步只会调用一次就停。
+3. 其他客户端如果在验证时只调用一次就停，再把这段协议加入它的 system prompt、rules 或 always-on memory。
+4. 只使用通用模板，不加入用户未提供的个人知识库、私有目录或专属工作流；不要重复粘贴多份。
 
 ## 第五步：刷新客户端
 
@@ -65,7 +67,8 @@ MCP 配置和系统提示词写好后，指导用户完全退出并重新打开�
 2. 客户端重启后能看到 `iterate-zhi`、`zhi` 或 `call_zhi`；
 3. 发起一次真实 MCP 调用，并发送一个非空 `message`，例如“iterate 安装验证：请确认是否看到此弹窗”；
 4. 桌面出现 iterate 弹窗，用户提交后客户端收到返回；
-5. 用户关闭左上角红叉时，只结束当前调用并返回 `继续对话: false`，而不是 MCP 错误。
+5. 用户在弹窗里回复后，AI 继续工作并再次调用 `call_zhi`，而不是只调用一次就停下；
+6. 用户关闭左上角红叉时，只结束当前调用并返回 `继续对话: false`，而不是 MCP 错误。
 
 ## 输出格式
 

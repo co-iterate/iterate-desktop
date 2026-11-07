@@ -2,6 +2,18 @@
 import { invoke } from '@tauri-apps/api/core'
 import { useMessage } from 'naive-ui'
 import { computed, onMounted, ref } from 'vue'
+import { useCoreSystemPrompt } from '../../composables/useCoreSystemPrompt'
+import {
+  buildManualMcpConfig,
+  CLAUDE_ZHI_PERMISSION,
+  clientNeedsPermission,
+  clientNeedsReconnect,
+  clientNeedsRules,
+  manualMcpCommand,
+  permissionStateText,
+  RULES_FILE_HINT,
+  rulesStateText,
+} from './aiClientSetup'
 
 interface ClientStatus {
   id: string
@@ -13,12 +25,19 @@ interface ClientStatus {
   opted_out: boolean
   config_path: string
   configured_command: string | null
+  /** 调用规则文件：Claude Code 是 ~/.claude/CLAUDE.md，Codex 是 ~/.codex/AGENTS.md，其他客户端为 null。 */
+  rules_path: string | null
+  rules_state: 'installed' | 'manual' | 'missing' | null
+  /** Claude Code 的权限文件 ~/.claude/settings.json；其他客户端为 null。 */
+  permission_path: string | null
+  permission_state: 'installed' | 'manual' | 'missing' | 'invalid' | null
 }
 
 interface AppLocationStatus {
   ok: boolean
   bundled_server: string | null
   stable_server: string
+  stable_server_ready: boolean
   problem: string | null
 }
 
@@ -38,8 +57,11 @@ interface ClientActionResult {
 const props = withDefaults(defineProps<{
   /** 新手引导里使用：隐藏未检测到的客户端和逐项移除按钮。 */
   compact?: boolean
+  /** 显示「列表外的客户端」：复制核心系统提示词和 MCP 配置，手动接入。 */
+  showManual?: boolean
 }>(), {
   compact: false,
+  showManual: false,
 })
 
 const emit = defineEmits<{
@@ -59,9 +81,36 @@ const visibleClients = computed(() => {
   return props.compact ? clients.filter(client => client.detected) : clients
 })
 
+// 还没接入，或 MCP 已接入但缺调用规则 / 缺 call_zhi 免确认（重新接入会补上）
 const pendingClients = computed(() =>
-  visibleClients.value.filter(client => !client.points_to_current),
+  visibleClients.value.filter(client => !client.points_to_current || clientNeedsReconnect(client)),
 )
+
+const rulesClients = computed(() => visibleClients.value.filter(client => client.rules_path))
+
+const { promptContent, ensureMcpToolsLoaded } = useCoreSystemPrompt()
+const manualCommand = computed(() => manualMcpCommand(overview.value?.app_location))
+
+async function copyText(text: string, done: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(done)
+  }
+  catch (error) {
+    console.error('复制失败:', error)
+    message.error('复制失败')
+  }
+}
+
+function copyCorePrompt() {
+  void copyText(promptContent.value, '核心系统提示词已复制，贴进客户端的系统提示词文件')
+}
+
+function copyMcpConfig() {
+  if (!manualCommand.value)
+    return
+  void copyText(buildManualMcpConfig(manualCommand.value), 'MCP 配置已复制，贴进客户端的 MCP 配置文件')
+}
 
 const canConnect = computed(() =>
   !working.value
@@ -75,6 +124,10 @@ function isRemote(client: ClientStatus) {
 }
 
 function statusLabel(client: ClientStatus) {
+  if (clientNeedsRules(client))
+    return { text: '缺调用规则', type: 'warning' as const }
+  if (clientNeedsPermission(client))
+    return { text: '缺免确认', type: 'warning' as const }
   if (client.points_to_current)
     return { text: '已接入', type: 'success' as const }
   if (client.needs_repair)
@@ -96,7 +149,8 @@ async function loadOverview() {
     // 用户已有的自定义入口（wrapper、其他版本）不默认勾选，需用户看到当前命令后自己决定是否迁移。
     selected.value = pendingClients.value
       .filter(client => client.needs_repair
-        || (client.detected && !client.configured && !client.opted_out))
+        || (client.detected && !client.configured && !client.opted_out)
+        || (clientNeedsReconnect(client) && !client.opted_out))
       .map(client => client.id)
   }
   catch (error) {
@@ -154,6 +208,8 @@ async function disconnect(client: ClientStatus) {
 
 onMounted(() => {
   loadOverview()
+  if (props.showManual)
+    void ensureMcpToolsLoaded()
 })
 </script>
 
@@ -168,7 +224,7 @@ onMounted(() => {
     </div>
 
     <div v-else-if="visibleClients.length === 0" class="text-xs opacity-60">
-      没有检测到 Claude Code、Codex 或 Cursor。其他客户端可以使用“复制安装提示词”手动接入。
+      没有检测到 Claude Code、Codex、Cursor 或 Antigravity。{{ props.showManual ? '其他客户端用下面的按钮手动接入。' : '其他客户端可以使用“复制安装提示词”手动接入。' }}
     </div>
 
     <n-checkbox-group v-else v-model:value="selected">
@@ -180,7 +236,7 @@ onMounted(() => {
         <div class="flex items-center min-w-0">
           <n-checkbox
             :value="client.id"
-            :disabled="client.points_to_current || isRemote(client) || working"
+            :disabled="(client.points_to_current && !clientNeedsReconnect(client)) || isRemote(client) || working"
             class="mr-3"
           />
           <div class="min-w-0">
@@ -206,6 +262,22 @@ onMounted(() => {
             </div>
             <div v-else-if="client.needs_repair" class="text-xs text-error">
               iterate 的入口已失效（App 可能被移动过），勾选后重新接入即可修复
+            </div>
+            <div
+              v-if="client.rules_path"
+              class="text-xs truncate"
+              :class="client.rules_state === 'missing' ? 'text-warning' : 'opacity-60'"
+              :title="client.rules_path"
+            >
+              {{ client.rules_path }} · {{ rulesStateText(client.rules_state) }}
+            </div>
+            <div
+              v-if="client.permission_path"
+              class="text-xs truncate"
+              :class="client.permission_state === 'missing' || client.permission_state === 'invalid' ? 'text-warning' : 'opacity-60'"
+              :title="`${client.permission_path} → permissions.allow: ${CLAUDE_ZHI_PERMISSION}`"
+            >
+              {{ client.permission_path }} · {{ permissionStateText(client.permission_state) }}
             </div>
           </div>
         </div>
@@ -241,6 +313,11 @@ onMounted(() => {
       </n-button>
     </div>
 
+    <div v-if="rulesClients.length > 0" class="text-xs opacity-60 leading-5">
+      接入 Claude Code、Codex 时，还会把「iterate 交互协议」写进它们的系统提示词文件（上面每项第二行的 CLAUDE.md / AGENTS.md），AI 才会做完一步就回来问你。只写带 iterate 标记的那一段，移除时整段删掉；已有你手写的同名规则就不重复写。
+      接入 Claude Code 时还会在 ~/.claude/settings.json 的 permissions.allow 里加一条 {{ CLAUDE_ZHI_PERMISSION }}，第一次调用 call_zhi 不用再点确认；只放行这一个工具，移除时只删 iterate 加的这一条，你自己加的不动。
+    </div>
+
     <div v-if="results.length > 0" class="space-y-1">
       <div
         v-for="result in results"
@@ -251,5 +328,34 @@ onMounted(() => {
         {{ result.name }}：{{ result.message }}
       </div>
     </div>
+
+    <div v-if="props.showManual" class="manual-clients">
+      <div class="text-sm font-medium">
+        列表里没有你的客户端？
+      </div>
+      <div class="text-xs opacity-60 leading-5">
+        复制下面两样：MCP 配置贴进客户端的 MCP 设置，核心系统提示词{{ RULES_FILE_HINT }}。
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <n-button size="small" @click="copyCorePrompt">
+          复制核心系统提示词
+        </n-button>
+        <n-button size="small" :disabled="!manualCommand" @click="copyMcpConfig">
+          复制 MCP 配置
+        </n-button>
+      </div>
+      <div v-if="manualCommand" class="text-xs opacity-50 truncate" :title="manualCommand">
+        command：{{ manualCommand }}
+      </div>
+    </div>
   </n-space>
 </template>
+
+<style scoped>
+.manual-clients {
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(128, 128, 128, 0.15);
+}
+</style>

@@ -51,6 +51,8 @@ commit_parsers = [
 
 # 提交预处理器 - 清理提交信息
 commit_preprocessors = [
+  # 只保留标题行：正文和 Co-Authored-By 等 trailer 会被下面的空白折叠拼进标题
+  { pattern = '(?s)\n.*$', replace = "" },
   # 移除 issue 编号
   { pattern = ' #\d+$', replace = "" },
   # 移除多余空格

@@ -3,7 +3,7 @@ use crate::bridge::ws::{
 };
 use crate::config::{
     load_config, save_config, AppConfig, AppState, CustomPrompt, CustomPromptConfig, ReplyConfig,
-    ShortcutBinding, ShortcutConfig, WindowConfig,
+    PopupPlacement, ShortcutBinding, ShortcutConfig, WindowConfig,
 };
 use crate::constants::{ui, validation, window};
 use crate::conversation::{resolve_tree_route_key, ConversationManager, NodeMetadata, NodeType};
@@ -530,6 +530,12 @@ pub async fn set_window_settings(
             .lock()
             .map_err(|e| format!("获取配置失败: {}", e))?;
 
+        if let Some(placement) = window_settings.get("popup_placement") {
+            config.ui_config.window_config.popup_placement =
+                serde_json::from_value(placement.clone())
+                    .map_err(|e| format!("弹窗位置无效: {}", e))?;
+        }
+
         // 更新窗口配置
         if let Some(fixed) = window_settings.get("fixed").and_then(|v| v.as_bool()) {
             config.ui_config.window_config.fixed = fixed;
@@ -733,6 +739,17 @@ pub async fn send_mcp_response(
     state: State<'_, AppState>,
     conversation_manager: State<'_, Arc<ConversationManager>>,
 ) -> Result<(), String> {
+    // Cross-device requests arbitrate before conversation/checkpoint side effects.
+    let closing = response.as_str() == Some("CANCELLED")
+        || response.pointer("/metadata/source").and_then(serde_json::Value::as_str) == Some("popup_closed");
+    if crate::delivery::mcp_delivery_status()? == "returned" {
+        return Err("这条请求已经送达，不能再次提交".to_string());
+    }
+    if !closing { crate::delivery::ensure_connected()?; }
+    if crate::cross_device::submit(&response).await? {
+        return Ok(());
+    }
+    let cross_finalize_guard = crate::cross_device::source_finalize_guard()?;
     let normalized_project_path = normalize_non_empty(project_path.clone());
     let normalized_request_id = normalize_non_empty(request_id.clone());
     let normalized_timeline_route_id = normalize_non_empty(timeline_route_id.clone());
@@ -767,6 +784,24 @@ pub async fn send_mcp_response(
     // 检查是否为MCP模式
     let args: Vec<String> = std::env::args().collect();
     let is_mcp_mode = args.len() >= 3 && args[1] == "--mcp-request";
+    let mut response_file_claim = if (is_standalone_mode || is_mcp_mode)
+        && cross_finalize_guard.is_none()
+    {
+        std::env::var_os("ITERATE_RESPONSE_FILE")
+            .map(|path| {
+                crate::delivery::ResponseFileClaim::acquire(std::path::Path::new(&path))
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            "这条请求已从其他端提交".to_string()
+                        } else {
+                            format!("无法占用回复通道: {error}")
+                        }
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let route_key = resolve_tree_route_key(
         effective_request_id.as_deref(),
         normalized_project_path.as_deref(),
@@ -877,12 +912,19 @@ pub async fn send_mcp_response(
 
         // 如果设置了 ITERATE_RESPONSE_FILE，同时写入文件（--serve 模式需要）
         if let Ok(response_file) = std::env::var("ITERATE_RESPONSE_FILE") {
-            crate::utils::atomic_file::write_file_atomically(
-                std::path::Path::new(&response_file),
-                response_str.as_bytes(),
-            )
-            .map_err(|e| format!("写入响应文件失败: {}", e))?;
+            if cross_finalize_guard.is_some() {
+                crate::cross_device::publish_source_response(std::path::Path::new(&response_file), &response)?;
+            } else {
+                crate::delivery::publish_claimed_response_file(
+                    std::path::Path::new(&response_file), &response_str,
+                )
+                    .map_err(|e| format!("写入响应文件失败: {}", e))?;
+                if let Some(claim) = response_file_claim.as_mut() {
+                    claim.commit();
+                }
+            }
         }
+        if !closing { crate::delivery::wait_for_handoff().await?; }
         // 对话已结束，通知主进程清除 MCP_STATE_CACHE（子进程内存与主进程隔离）
         // 这里必须等待请求返回；standalone 子进程退出很快，fire-and-forget 会导致清理丢失。
         if let Some(ref rid) = effective_request_id {
@@ -1178,9 +1220,7 @@ fn find_hui_latest_anchor(query: &HuiSnapshotQuery<'_>) -> Option<HuiLatestAncho
     let conversations_root = query
         .conversations_root
         .map(Path::to_path_buf)
-        .or_else(|| {
-            dirs::home_dir().map(|home_dir| home_dir.join(".cunzhi-knowledge/conversations"))
-        })?;
+        .or_else(|| crate::config::paths::knowledge_root().map(|root| root.join("conversations")))?;
     let time_regex = Regex::new(r"(?m)^##\s+(\d{2}:\d{2}:\d{2})").ok()?;
     let mut candidates = Vec::new();
 
@@ -2157,18 +2197,36 @@ pub async fn open_confirmed_external_file(path: String) -> Result<(), String> {
     let resolved_path_string = target.to_string_lossy().to_string();
 
     let result = if cfg!(target_os = "windows") {
-        Command::new("explorer").arg(&resolved_path_string).spawn()
+        let shell_path = windows_explorer_path(&resolved_path_string);
+        let mut command = Command::new("explorer");
+        if target.is_file() {
+            command.arg(format!("/select,{}", shell_path));
+        } else {
+            command.arg(shell_path);
+        }
+        command.spawn()
     } else if cfg!(target_os = "macos") {
-        Command::new("open")
-            .args(["-R", &resolved_path_string])
-            .spawn()
+        let mut command = Command::new("open");
+        if target.is_file() {
+            command.arg("-R");
+        }
+        command.arg(&target).spawn()
     } else {
         Command::new("xdg-open").arg(&target).spawn()
     };
 
     result
         .map(|_| ())
-        .map_err(|e| format!("无法在 Finder 中定位跨项目文件: {}", e))
+        .map_err(|e| format!("无法在文件管理器中打开跨项目文件或文件夹: {}", e))
+}
+
+// canonicalize() returns extended-length Windows paths; Explorer expects shell paths.
+fn windows_explorer_path(path: &str) -> String {
+    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", unc_path)
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
 }
 
 #[tauri::command]
@@ -2363,6 +2421,20 @@ fn codex_desktop_cli_candidates() -> Vec<PathBuf> {
 
     candidates.dedup();
     candidates
+}
+
+/// 手机 + 没选模型时用：Mac 上找不到 Codex 桌面版就改用 Claude 启动。
+#[cfg(target_os = "macos")]
+pub fn codex_desktop_available() -> bool {
+    resolve_codex_desktop_cli().is_ok()
+        || std::path::Path::new("/Applications/Codex.app").exists()
+        || std::path::Path::new("/Applications/ChatGPT.app").exists()
+}
+
+/// 其他平台保持原来的行为（总是走 Codex）。
+#[cfg(not(target_os = "macos"))]
+pub fn codex_desktop_available() -> bool {
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -2849,6 +2921,48 @@ pub async fn probe_codex_automation_permission() -> Result<CodexAutomationProbeR
     })
 }
 
+/// 手机 + 选 Claude 时 iterate 要用 AppleScript 控制 Terminal。
+/// 在桌面端主动触发一次，让 macOS 的自动化授权框在用户就在 Mac 前时弹出，
+/// 而不是等手机按 + 时卡在没人点的授权框上。
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn probe_terminal_automation_permission() -> Result<CodexAutomationProbeResult, String> {
+    let output = tokio::task::spawn_blocking(|| {
+        run_applescript(r#"tell application "Terminal" to count windows"#)
+    })
+    .await
+    .map_err(|e| format!("Terminal 自动化探测失败: {e}"))??;
+    if output.status.success() {
+        return Ok(CodexAutomationProbeResult {
+            status: "granted".to_string(),
+            details: "已确认 iterate 可以控制 Terminal，手机 + 可以直接启动 Claude。".to_string(),
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    log::warn!("[Automation] Terminal probe failed: {stderr}");
+    let (status, details) = if is_automation_permission_error(&stderr) {
+        (
+            "permission_required",
+            "iterate 还不能控制 Terminal，手机 + 无法启动 Claude。请到“系统设置 > 隐私与安全性 > 自动化”里允许 iterate 控制“终端”。".to_string(),
+        )
+    } else {
+        ("error", format!("Terminal 自动化探测未通过：{stderr}"))
+    };
+    Ok(CodexAutomationProbeResult {
+        status: status.to_string(),
+        details,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn probe_terminal_automation_permission() -> Result<CodexAutomationProbeResult, String> {
+    Ok(CodexAutomationProbeResult {
+        status: "unsupported".to_string(),
+        details: "当前平台不需要 Terminal 自动化授权。".to_string(),
+    })
+}
+
 /// 按项目路径打开 Codex Desktop
 #[cfg(target_os = "macos")]
 #[tauri::command]
@@ -2862,6 +2976,161 @@ pub async fn open_codex_project(project_path: String) -> Result<(), String> {
     }
 
     launch_codex_desktop(Some(normalized_project_path))
+}
+
+/// ⌘+点击回到调用本次 MCP 的 Claude Code 会话（P-2026-9373）。
+///
+/// - 会话进程还活着：按进程 tty 在 Terminal.app 里选中对应标签页并前置，返回 `"focused"`；
+/// - 会话已退出：新开 Terminal，`cd <cwd>` 后执行 `claude --resume <sessionId>`，返回 `"resumed"`。
+///
+/// 第一版只支持 Terminal.app。sessionId 只接受 UUID；cwd 用单引号转义；
+/// tty 与命令都通过 osascript argv 传入，不拼进 AppleScript 文本。
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn open_claude_session(
+    session_id: String,
+    cwd: Option<String>,
+    pid: Option<u32>,
+) -> Result<String, String> {
+    use crate::mcp::caller_identity::{
+        claude_resume_shell_command, claude_sessions_dir, find_live_claude_session,
+        normalize_claude_session_id, process_tty, TERMINAL_FOCUS_TTY_SCRIPT,
+        TERMINAL_RUN_COMMAND_SCRIPT,
+    };
+
+    let session_id = normalize_claude_session_id(&session_id)
+        .ok_or_else(|| "Claude 会话 ID 无效".to_string())?;
+    let sessions_dir =
+        claude_sessions_dir().ok_or_else(|| "找不到 Claude Code 配置目录".to_string())?;
+
+    let run_osascript = |script: &str, arg: &str| -> Result<String, String> {
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(arg)
+            .output()
+            .map_err(|error| format!("执行 osascript 失败: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                "osascript 执行失败".to_string()
+            } else {
+                format!("osascript 执行失败: {stderr}")
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+
+    if let Some(live) = find_live_claude_session(&sessions_dir, &session_id, pid) {
+        let tty = process_tty(live.pid).ok_or_else(|| {
+            "Claude 会话仍在运行，但没有关联终端（可能在 IDE 或 Claude 桌面版中），第一版只支持 Terminal.app"
+                .to_string()
+        })?;
+        return match run_osascript(TERMINAL_FOCUS_TTY_SCRIPT, &tty)?.as_str() {
+            "focused" => Ok("focused".to_string()),
+            "terminal_not_running" | "tab_not_found" => Err(format!(
+                "Claude 会话仍在运行（{tty}），但不在 Terminal.app 中（可能在 iTerm、IDE 或 Claude 桌面版），第一版只支持 Terminal.app"
+            )),
+            other => Err(format!("切换 Terminal 标签页失败: {other}")),
+        };
+    }
+
+    let cwd = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Claude 会话已退出，且缺少会话目录，无法恢复".to_string())?;
+    if !std::path::Path::new(cwd).is_dir() {
+        return Err(format!("Claude 会话目录不存在: {cwd}"));
+    }
+    let command = claude_resume_shell_command(cwd, &session_id)?;
+    run_osascript(TERMINAL_RUN_COMMAND_SCRIPT, &command)?;
+    Ok("resumed".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn open_claude_session(
+    _session_id: String,
+    _cwd: Option<String>,
+    _pid: Option<u32>,
+) -> Result<String, String> {
+    Err("当前平台暂不支持回到 Claude 会话（第一版只支持 macOS Terminal.app）".to_string())
+}
+
+/// ⌘+点击回到调用本次 MCP 的 agy 会话，做法同 Claude：
+/// agy 进程还活着就切到它所在的 Terminal 标签页（`"focused"`），
+/// 已退出就新开 Terminal 执行 `agy --conversation <id>`（`"resumed"`）。
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn open_agy_session(
+    conversation_id: String,
+    cwd: Option<String>,
+    pid: Option<u32>,
+) -> Result<String, String> {
+    use crate::mcp::caller_identity::{
+        agy_resume_shell_command, is_antigravity_cli_executable, is_process_alive,
+        process_executable_name, process_tty, TERMINAL_FOCUS_TTY_SCRIPT,
+        TERMINAL_RUN_COMMAND_SCRIPT,
+    };
+
+    let run_osascript = |script: &str, arg: &str| -> Result<String, String> {
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(arg)
+            .output()
+            .map_err(|error| format!("执行 osascript 失败: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                "osascript 执行失败".to_string()
+            } else {
+                format!("osascript 执行失败: {stderr}")
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+
+    // pid 可能已被系统复用，必须仍是 agy 才去切标签页。
+    let live_pid = pid.filter(|pid| {
+        is_process_alive(*pid)
+            && process_executable_name(*pid).is_some_and(|name| is_antigravity_cli_executable(&name))
+    });
+    if let Some(live_pid) = live_pid {
+        let tty = process_tty(live_pid).ok_or_else(|| {
+            "agy 会话仍在运行，但没有关联终端，第一版只支持 Terminal.app".to_string()
+        })?;
+        return match run_osascript(TERMINAL_FOCUS_TTY_SCRIPT, &tty)?.as_str() {
+            "focused" => Ok("focused".to_string()),
+            "terminal_not_running" | "tab_not_found" => Err(format!(
+                "agy 会话仍在运行（{tty}），但不在 Terminal.app 中（可能在 iTerm 或其他终端），第一版只支持 Terminal.app"
+            )),
+            other => Err(format!("切换 Terminal 标签页失败: {other}")),
+        };
+    }
+
+    let cwd = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "agy 会话已退出，且缺少会话目录，无法恢复".to_string())?;
+    if !std::path::Path::new(cwd).is_dir() {
+        return Err(format!("agy 会话目录不存在: {cwd}"));
+    }
+    let command = agy_resume_shell_command(cwd, &conversation_id)?;
+    run_osascript(TERMINAL_RUN_COMMAND_SCRIPT, &command)?;
+    Ok("resumed".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn open_agy_session(
+    _conversation_id: String,
+    _cwd: Option<String>,
+    _pid: Option<u32>,
+) -> Result<String, String> {
+    Err("当前平台暂不支持回到 agy 会话（第一版只支持 macOS Terminal.app）".to_string())
 }
 
 /// 打开指定 Codex 会话
@@ -3319,7 +3588,7 @@ fn collect_hui_source_paths_from(
     }
 
     let project_names = collect_project_names(project_path);
-    let conversations_root = home_dir.join(".cunzhi-knowledge/conversations");
+    let conversations_root = crate::config::paths::knowledge_root_in(home_dir).join("conversations");
 
     for day_offset in 0..3 {
         let date = now - chrono::Duration::days(day_offset);
@@ -4037,9 +4306,23 @@ pub async fn get_all_window_instances(
     Ok(registry.get_all_instances())
 }
 
+/// 当前弹窗进程的 PID，总览面板用它标出「当前窗口」
+#[tauri::command]
+pub fn get_current_window_pid() -> u32 {
+    std::process::id()
+}
+
 /// 激活指定窗口
 #[tauri::command]
-pub async fn activate_window_instance(pid: u32) -> Result<(), String> {
+pub async fn activate_window_instance(app: AppHandle, pid: u32) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if let Err(error) =
+        app.run_on_main_thread(move || crate::ui::window_registry::yield_activation_to(pid))
+    {
+        log::warn!("让出前台激活权失败: {error}");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
     crate::ui::window_registry::activate_window(pid)
 }
 
@@ -4051,11 +4334,12 @@ pub fn debug_log(message: String) {
 
 /// 时间线调试日志 - 直接写独立日志文件
 #[tauri::command]
-pub fn timeline_debug_log(location: String, payload: Option<serde_json::Value>) {
+pub async fn timeline_debug_log(location: String, payload: Option<serde_json::Value>) {
     let key_params = payload
         .filter(|value| !value.is_null())
         .unwrap_or_else(|| serde_json::json!({}));
-    append_timeline_debug_log(&location, key_params);
+    // 写文件放后台线程，不占主线程
+    let _ = tauri::async_runtime::spawn_blocking(move || append_timeline_debug_log(&location, key_params)).await;
 }
 
 /// 打开系统终端
@@ -4173,10 +4457,35 @@ pub async fn open_in_ide(project_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 在当前活动工作区显示窗口（跟随当前页面）
-/// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
-#[tauri::command]
-pub async fn center_window(app: AppHandle) -> Result<(), String> {
+fn popup_window_coordinates(
+    placement: PopupPlacement,
+    work_x: i32,
+    work_y: i32,
+    work_width: i32,
+    work_height: i32,
+    window_width: i32,
+    window_height: i32,
+    left_margin: i32,
+) -> (i32, i32) {
+    let available_width = (work_width - window_width).max(0);
+    let x = work_x
+        + match placement {
+            PopupPlacement::Left => left_margin.min(available_width),
+            PopupPlacement::Center => available_width / 2,
+        };
+    let y = work_y + (work_height - window_height).max(0) / 2;
+    (x, y)
+}
+
+fn place_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    let placement = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map_err(|e| format!("获取配置失败: {}", e))?
+        .ui_config
+        .window_config
+        .popup_placement;
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "未找到主窗口".to_string())?;
@@ -4197,16 +4506,38 @@ pub async fn center_window(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("获取窗口尺寸失败: {}", e))?;
     let work_area = target_monitor.work_area();
 
-    let centered_x =
-        work_area.position.x + ((work_area.size.width as i32 - window_size.width as i32) / 2);
-    let centered_y =
-        work_area.position.y + ((work_area.size.height as i32 - window_size.height as i32) / 2);
+    let left_margin = (24.0 * target_monitor.scale_factor()).round() as i32;
+    let (x, y) = popup_window_coordinates(
+        placement,
+        work_area.position.x,
+        work_area.position.y,
+        work_area.size.width as i32,
+        work_area.size.height as i32,
+        window_size.width as i32,
+        window_size.height as i32,
+        left_margin,
+    );
 
     window
         .set_position(Position::Physical(PhysicalPosition::new(
-            centered_x, centered_y,
+            x, y,
         )))
         .map_err(|e| format!("设置窗口位置失败: {}", e))?;
+
+    Ok(window)
+}
+
+/// 按已保存的弹窗位置调整窗口，不改变窗口可见性、最小化状态或焦点。
+#[tauri::command]
+pub fn position_window_left(app: AppHandle) -> Result<(), String> {
+    place_main_window(&app).map(|_| ())
+}
+
+/// 按已保存的位置在鼠标所在屏幕的工作区显示窗口。
+/// 配合 tauri.conf.json 中的 visibleOnAllWorkspaces: true，窗口会在所有工作区可见
+#[tauri::command]
+pub async fn center_window(app: AppHandle) -> Result<(), String> {
+    let window = place_main_window(&app)?;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     window
         .unminimize()
@@ -4217,6 +4548,35 @@ pub async fn center_window(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("聚焦窗口失败: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod popup_placement_tests {
+    use super::{popup_window_coordinates, PopupPlacement};
+
+    #[test]
+    fn left_and_center_use_selected_monitor_work_area() {
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Left, 1920, 40, 1280, 900, 600, 700, 24),
+            (1944, 140)
+        );
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Center, 1920, 40, 1280, 900, 600, 700, 24),
+            (2260, 140)
+        );
+    }
+
+    #[test]
+    fn placement_keeps_oversized_window_at_work_area_origin() {
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Left, -1920, 0, 700, 500, 900, 700, 24),
+            (-1920, 0)
+        );
+        assert_eq!(
+            popup_window_coordinates(PopupPlacement::Center, -1920, 0, 700, 500, 900, 700, 24),
+            (-1920, 0)
+        );
+    }
 }
 
 #[tauri::command]
@@ -4915,6 +5275,19 @@ fn normalize_local_file_path(path: &str) -> String {
         decoded = next;
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let bytes = decoded.as_bytes();
+        // URL-style /C:/... is not a valid Win32 absolute filename.
+        if bytes.len() >= 4
+            && matches!(bytes[0], b'/' | b'\\')
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+            && matches!(bytes[3], b'/' | b'\\')
+        {
+            decoded.remove(0);
+        }
+    }
     decoded
 }
 
@@ -5095,8 +5468,8 @@ fn resolve_confirmed_external_file_target(path: &str) -> Result<PathBuf, String>
     let metadata =
         std::fs::metadata(&canonical_path).map_err(|e| format!("读取文件失败: {}", e))?;
 
-    if !metadata.is_file() {
-        return Err("跨项目仅支持在 Finder 中定位普通文件".to_string());
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("跨项目仅支持普通文件或文件夹".to_string());
     }
 
     if has_dangerous_local_open_extension(&canonical_path) || is_executable_file(&metadata) {
@@ -5163,6 +5536,22 @@ mod local_file_path_tests {
         expand_home_prefix, normalize_local_file_path, read_file_base64,
         resolve_confirmed_external_file_target, resolve_local_open_path, resolve_local_open_target,
     };
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolves_windows_url_style_drive_paths() {
+        let root = std::env::temp_dir().join(format!("iterate-drive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("中文 screenshot.png");
+        std::fs::write(&file, b"path normalization fixture").unwrap();
+        let drive_path = file.to_string_lossy().replace('\\', "/");
+        for input in [drive_path.clone(), format!("/{drive_path}"), format!("file:///{drive_path}")] {
+            let target = resolve_local_open_target(&input, &root.to_string_lossy()).unwrap();
+            assert_eq!(target.path, file.canonicalize().unwrap());
+        }
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn expand_home_prefix_only_expands_leading_tilde() {
@@ -5334,18 +5723,41 @@ mod local_file_path_tests {
     }
 
     #[test]
-    fn rejects_confirmed_external_directory() {
+    fn resolves_confirmed_external_directory() {
         let directory = std::env::temp_dir().join(format!(
-            "iterate-confirmed-external-dir-{}",
+            "iterate-confirmed-external-dir-中文 空格-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&directory).expect("create external directory");
 
-        let error = resolve_confirmed_external_file_target(&directory.to_string_lossy())
-            .expect_err("external directory should be rejected");
+        let resolved = resolve_confirmed_external_file_target(&directory.to_string_lossy())
+            .expect("external directory should resolve");
 
-        assert!(error.contains("普通文件"));
+        assert_eq!(resolved, directory.canonicalize().expect("canonical directory"));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn normalizes_windows_explorer_paths() {
+        assert_eq!(super::windows_explorer_path(r"\\?\C:\中文 空格\folder"), r"C:\中文 空格\folder");
+        assert_eq!(super::windows_explorer_path(r"\\?\UNC\server\share\folder"), r"\\server\share\folder");
+        assert_eq!(super::windows_explorer_path(r"C:\folder"), r"C:\folder");
+    }
+
+    #[test]
+    fn rejects_confirmed_external_executable() {
+        let file = std::env::temp_dir().join(format!("iterate-external-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"test").expect("write executable fixture");
+        let error = resolve_confirmed_external_file_target(&file.to_string_lossy())
+            .expect_err("executable should remain rejected");
+        assert!(error.contains("可执行文件"));
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn rejects_confirmed_external_relative_path() {
+        assert!(resolve_confirmed_external_file_target("relative-folder")
+            .unwrap_err().contains("绝对路径"));
     }
 
     #[cfg(unix)]
@@ -5374,12 +5786,22 @@ mod local_file_path_tests {
 
 /// 保存提示词库到文件（供 Bridge Server API 读取）
 #[tauri::command]
-pub fn save_prompt_library_file(content: String) -> Result<(), String> {
+pub fn save_prompt_library_file(content: String, expected_items: Option<serde_json::Value>) -> Result<(), String> {
+    let _sync_lock = crate::cross_device::settings_sync::content_lock()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = std::path::Path::new(&home).join(".cunzhi");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
     let path = dir.join("prompt-library.json");
-    std::fs::write(&path, &content).map_err(|e| format!("写入失败: {}", e))
+    let current: serde_json::Value = serde_json::from_str(&load_prompt_library_file()?).map_err(|e| e.to_string())?;
+    if expected_items.as_ref() != Some(&current["items"]) {
+        return Err("提示词库已改变，请重新加载后重试；本机内容未覆盖".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir).map_err(|e| e.to_string())?;
+    serde_json::to_writer_pretty(&mut temp, &value).map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 读取提示词库文件（跨进程共享源）
@@ -5406,8 +5828,11 @@ pub fn save_ghost_suggestions_file(content: String, app: AppHandle) -> Result<()
 
 /// 读取幽灵补全词表共享文件
 #[tauri::command]
-pub fn load_ghost_suggestions_file() -> Result<String, String> {
-    crate::ghost_suggestions::load_store_content()
+pub async fn load_ghost_suggestions_file() -> Result<String, String> {
+    // 弹窗每 2.5 秒轮询，文件读取放后台线程，不占主线程
+    tauri::async_runtime::spawn_blocking(crate::ghost_suggestions::load_store_content)
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// 按当前 schema 追加或更新一个幽灵补全词，避免外部脚本直接改 JSON。
@@ -5469,12 +5894,13 @@ pub fn get_speech_muscle_memory_entries() -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub fn save_speech_muscle_memory_entries(
     entries: serde_json::Value,
+    expected_entries: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let array = entries
         .as_array()
         .cloned()
         .ok_or_else(|| "entries 必须是数组".to_string())?;
-    let saved = speech_memory::save_entries(array)?;
+    let saved = speech_memory::save_entries_checked(array, expected_entries)?;
     Ok(serde_json::Value::Array(saved))
 }
 

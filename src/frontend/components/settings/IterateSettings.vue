@@ -6,6 +6,7 @@ import { useLocalQrCode } from '../../composables/useLocalQrCode'
 import { bridgeFetch } from '../../services/bridgeFetch'
 import ConnectionRouteStatusPanel from './ConnectionRouteStatusPanel.vue'
 import MobileConnectionWizard from './MobileConnectionWizard.vue'
+import { mobileRouteLabel } from './mobileRouteOptions'
 import { buildConnectionRouteView } from './useConnectionRouteStatus'
 
 interface TunnelStatus {
@@ -312,6 +313,23 @@ const isWebLoginSessionsLoading = ref(false)
 const webLoginSessions = ref<CloudflareWebLoginSession[]>([])
 const isLoading = ref(false)
 const showMobileConnectionWizard = ref(false)
+const mobileWizardInitialPanel = ref<'manage' | undefined>(undefined)
+const mobileRouteSummary = ref<{ label: string, healthy: boolean } | null>(null)
+
+async function refreshMobileRouteSummary() {
+  try {
+    const { current: status } = await invoke<{ current: { configured: boolean, transport?: string | null, health: string } }>('get_mobile_route_options')
+    mobileRouteSummary.value = { label: mobileRouteLabel(status.configured ? status.transport : null), healthy: status.health === 'healthy' }
+  }
+  catch {
+    mobileRouteSummary.value = null
+  }
+}
+
+function openMobileConnectionManager() {
+  mobileWizardInitialPanel.value = 'manage'
+  showMobileConnectionWizard.value = true
+}
 const showQuickTunnelDeveloperControls = import.meta.env.DEV
   && import.meta.env.VITE_ENABLE_QUICK_TUNNEL_TEST === '1'
 const showLogs = ref(false)
@@ -502,8 +520,6 @@ const mobileEntrySourceText = computed(() => {
     return '来自公网兜底域名'
   return ''
 })
-
-const pairingRouteDescription = computed(() => '使用安全连接向导时，iterate 会先复用或验证 HTTPS/WSS 公网通道，再生成一次性二维码。')
 
 function fallbackCacheStatus(kind: 'mcp_state' | 'mcp_action'): CacheStatus {
   const caches = bridgeDiagnostics.value?.caches
@@ -976,6 +992,7 @@ async function checkHealth() {
 }
 
 function startTunnel() {
+  mobileWizardInitialPanel.value = undefined
   showMobileConnectionWizard.value = true
 }
 
@@ -1527,7 +1544,13 @@ watch(mobileQrCodeError, (error) => {
   })
 })
 
+watch(showMobileConnectionWizard, (visible) => {
+  if (!visible)
+    void refreshMobileRouteSummary()
+})
+
 onMounted(async () => {
+  void refreshMobileRouteSummary()
   await refreshStatus()
   await refreshCloudflareConfig()
   await refreshRelayMacClientConfig()
@@ -1554,925 +1577,944 @@ onUnmounted(() => {
 
 <template>
   <n-space vertical size="large">
-    <!-- 说明 -->
-    <div class="flex items-start">
-      <div class="w-1.5 h-1.5 bg-info rounded-full mr-3 flex-shrink-0 mt-2" />
-      <div>
-        <div class="text-sm font-medium leading-relaxed mb-1">
-          使用方式
-        </div>
-        <div class="text-xs opacity-60 leading-relaxed">
-          {{ pairingRouteDescription }}<br>
-          Tailscale、Funnel、Cloudflare 或 LAN 会按当前候选列表排序展示。
-        </div>
-      </div>
-    </div>
-
-    <!-- 连接通道三分法 -->
-    <div class="flex items-center justify-between mb-1">
-      <div class="text-sm font-medium leading-relaxed">
-        手机连接通道
-      </div>
-      <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="async () => { await checkHealth(); await refreshBridgeDiagnostics() }">
-        刷新
-      </n-button>
-    </div>
-    <ConnectionRouteStatusPanel :route-view="connectionRouteView" />
-
-    <!-- Mac Relay Client -->
-    <div class="p-3 bg-black-100 rounded-lg">
-      <div class="flex items-start justify-between gap-3 mb-3">
+    <!-- 手机连接：普通用户只需要这一块 -->
+    <div class="phone-card">
+      <div class="phone-card__head">
         <div>
-          <div class="text-sm font-medium text-primary">
-            Mac Relay Client
+          <div class="phone-card__title">
+            手机连接
           </div>
-          <div class="text-xs opacity-60">
-            常驻 Mac 出站 WebSocket，用于 iPhone 通过 Relay 下发受限恢复命令。
-          </div>
-        </div>
-        <div class="flex flex-col items-end gap-1">
-          <span
-            class="text-[11px] leading-relaxed px-2 py-0.5 rounded"
-            :class="relayMacRuntimeStatusClass"
-          >
-            {{ relayMacRuntimeStatusText }}
-          </span>
-          <span
-            class="text-[11px] leading-relaxed px-2 py-0.5 rounded"
-            :class="relayMacClientConfig.token_present ? 'bg-success/15 text-success' : 'bg-black-200'"
-          >
-            {{ relayMacTokenStatusText }}
-          </span>
-        </div>
-      </div>
-
-      <n-space vertical size="small">
-        <n-input
-          v-model:value="relayMacClientConfig.relay_url"
-          size="small"
-          placeholder="wss://relay.example.com/mac/ws"
-          :disabled="isRelayMacClientSaving"
-        />
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
-          <n-input
-            v-model:value="relayMacClientConfig.device_id"
-            size="small"
-            placeholder="local-mac"
-            :disabled="isRelayMacClientSaving"
-          />
-          <n-input
-            v-model:value="relayMacClientConfig.local_base_url"
-            size="small"
-            placeholder="http://127.0.0.1:8080"
-            :disabled="isRelayMacClientSaving"
-          />
-          <n-input-number
-            v-model:value="relayMacClientConfig.heartbeat_secs"
-            size="small"
-            :min="5"
-            :max="300"
-            :disabled="isRelayMacClientSaving"
-          />
-        </div>
-        <n-input
-          v-model:value="relayMacClientTokenInput"
-          size="small"
-          type="password"
-          show-password-on="click"
-          placeholder="Relay token；留空则保留已保存 token"
-          :disabled="isRelayMacClientSaving"
-        />
-        <n-checkbox
-          v-model:checked="relayMacClientConfig.clear_relay_token"
-          size="small"
-          :disabled="isRelayMacClientSaving || Boolean(relayMacClientTokenInput.trim()) || !relayMacClientConfig.token_present"
-        >
-          清空已保存 token
-        </n-checkbox>
-        <div class="flex items-center justify-between gap-3">
-          <n-switch
-            v-model:value="relayMacClientConfig.allow_recover"
-            size="small"
-            :disabled="isRelayMacClientSaving"
-          >
-            <template #checked>
-              真实恢复
-            </template>
-            <template #unchecked>
-              模拟恢复
-            </template>
-          </n-switch>
-          <div class="flex flex-wrap gap-2">
-            <n-button
-              size="tiny"
-              text
-              :loading="isRelayMacClientSaving || isRelayMacClientControlling"
-              @click="refreshRelayMacClientPanel"
-            >
-              刷新
-            </n-button>
-            <n-button
-              size="tiny"
-              type="primary"
-              :loading="isRelayMacClientSaving"
-              :disabled="!relayMacClientConfig.relay_url.trim()"
-              @click="saveRelayMacClientConfig"
-            >
-              保存
-            </n-button>
-            <n-button
-              size="tiny"
-              type="primary"
-              ghost
-              :loading="isRelayMacClientSaving || isRelayMacClientControlling"
-              :disabled="!relayMacClientConfig.relay_url.trim()"
-              @click="saveAndRestartRelayMacClient"
-            >
-              安装/重启
-            </n-button>
-            <n-button
-              size="tiny"
-              text
-              :loading="isRelayMacClientControlling"
-              @click="controlRelayMacClient('health')"
-            >
-              体检
-            </n-button>
-            <n-button
-              size="tiny"
-              text
-              type="warning"
-              :loading="isRelayMacClientControlling"
-              @click="controlRelayMacClient('stop')"
-            >
-              停止
-            </n-button>
+          <div class="phone-card__sub">
+            在 iPhone 的 iterate Remote 里回复这台 Mac 上的任务。
           </div>
         </div>
-        <div class="grid grid-cols-1 gap-1 text-[11px] opacity-60 leading-relaxed">
-          <div>config: {{ relayMacClientConfig.config_path || '未初始化' }}</div>
-          <div>plist: {{ relayMacClientConfig.plist_path || '未初始化' }}</div>
-          <div>runner: {{ relayMacClientConfig.runner_path || '未初始化' }}</div>
-        </div>
-        <div v-if="relayMacClientRuntime?.message" class="text-xs leading-relaxed opacity-75">
-          {{ relayMacClientRuntime.message }}
-        </div>
-        <pre
-          v-if="relayMacClientRuntime?.stdout || relayMacClientRuntime?.stderr"
-          class="max-h-32 overflow-auto rounded bg-black-200/60 p-2 text-[11px] leading-relaxed whitespace-pre-wrap"
-        >{{ [relayMacClientRuntime.stdout, relayMacClientRuntime.stderr].filter(Boolean).join('\n') }}</pre>
-        <div v-if="relayMacClientError" class="text-xs text-error leading-relaxed">
-          {{ relayMacClientError }}
-        </div>
-      </n-space>
-    </div>
-
-    <!-- 客户 Cloudflare Web Login -->
-    <div class="p-3 bg-black-100 rounded-lg">
-      <div class="flex items-start justify-between gap-3 mb-3">
-        <div>
-          <div class="text-sm font-medium text-primary">
-            Cloudflare Web Login
-          </div>
-          <div class="text-xs opacity-60">
-            客户自有 hostname 的持久通道；填写 Access 邮箱可自动配置 allow-email 策略，留空则只配置 Tunnel。
-          </div>
-        </div>
-        <span
-          class="text-[11px] leading-relaxed px-2 py-0.5 rounded"
-          :class="cloudflareVerified ? 'bg-success/15 text-success' : 'bg-black-200'"
-        >
-          {{ cloudflareVerificationText }}
-        </span>
-      </div>
-
-      <n-space vertical size="small">
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
-          <n-input
-            v-model:value="cloudflareApiToken"
-            size="small"
-            type="password"
-            show-password-on="click"
-            placeholder="Cloudflare API Token"
-            :disabled="isCloudflareAutoSetupLoading"
-          />
-          <n-input
-            v-model:value="cloudflareZoneName"
-            size="small"
-            placeholder="域名：example.com"
-            :disabled="isCloudflareAutoSetupLoading"
-          />
-          <n-input
-            v-model:value="cloudflareSubdomain"
-            size="small"
-            placeholder="子域名：login"
-            :disabled="isCloudflareAutoSetupLoading"
-          />
-        </div>
-        <n-input
-          v-model:value="cloudflareAccessEmails"
-          size="small"
-          placeholder="可选 Access 允许邮箱，多个用逗号分隔；留空则只配置 Tunnel"
-          :disabled="isCloudflareAutoSetupLoading"
-        />
-        <div class="flex items-center justify-between gap-3">
-          <n-switch
-            v-model:value="cloudflareOverwriteDns"
-            size="small"
-            :disabled="isCloudflareAutoSetupLoading"
-          >
-            <template #checked>
-              覆盖 DNS
-            </template>
-            <template #unchecked>
-              保留 DNS
-            </template>
-          </n-switch>
-          <n-button
-            size="tiny"
-            type="primary"
-            :loading="isCloudflareAutoSetupLoading"
-            :disabled="!cloudflareApiToken.trim() || !cloudflareZoneName.trim() || !cloudflareSubdomain.trim()"
-            @click="autoSetupCloudflare"
-          >
-            {{ cloudflareAccessEmails.trim() ? '配置 Tunnel + Access' : '配置 Tunnel' }}
-          </n-button>
-        </div>
-        <div class="h-px bg-black-200" />
-        <n-input
-          v-model:value="cloudflareHostname"
-          size="small"
-          placeholder="https://iterate.example.com"
-          :disabled="isCloudflareSaving || isCloudflareVerifying"
-        />
-        <n-input
-          v-model:value="cloudflareWebLoginConsoleOrigin"
-          size="small"
-          placeholder="Web Console origin，例如 https://app.example.com"
-          :disabled="isCloudflareSaving || isCloudflareVerifying"
-        />
-        <n-input
-          v-model:value="cloudflareTunnelToken"
-          size="small"
-          type="password"
-          show-password-on="click"
-          placeholder="粘贴 Cloudflare tunnel token；保存后清空"
-          :disabled="isCloudflareSaving || isCloudflareVerifying"
-        />
-        <div class="flex items-center justify-between gap-3">
-          <div class="text-xs opacity-60">
-            {{ cloudflareTokenStatusText }}
-          </div>
-          <n-switch
-            v-model:value="cloudflareAccessExpected"
-            size="small"
-            :disabled="isCloudflareSaving || isCloudflareVerifying"
-          >
-            <template #checked>
-              Access
-            </template>
-            <template #unchecked>
-              No Access
-            </template>
-          </n-switch>
-        </div>
-
-        <div class="flex flex-wrap gap-2">
-          <n-button
-            size="tiny"
-            type="primary"
-            :loading="isCloudflareSaving"
-            @click="saveCloudflareConfig"
-          >
-            保存
-          </n-button>
-          <n-button
-            size="tiny"
-            :loading="isCloudflareVerifying"
-            :disabled="!cloudflareConfig.tunnel_token_saved"
-            @click="verifyCloudflareConfig"
-          >
-            验证
-          </n-button>
-          <n-button
-            size="tiny"
-            :loading="isWebLoginPairingLoading"
-            :disabled="!cloudflareVerified || !cloudflareWebLoginConsoleConfigured"
-            @click="createCloudflareWebLoginPairing"
-          >
-            生成登录链接
-          </n-button>
-          <n-button
-            v-if="!customerTunnelRunning"
-            size="tiny"
-            :loading="isCustomerTunnelLoading"
-            :disabled="!cloudflareConfig.tunnel_token_saved || !cloudflareConfig.public_hostname"
-            @click="startCustomerTunnel"
-          >
-            启动通道
-          </n-button>
-          <n-button
-            v-else
-            size="tiny"
-            type="error"
-            :loading="isCustomerTunnelLoading"
-            @click="stopCustomerTunnel"
-          >
-            停止通道
-          </n-button>
-          <n-button
-            size="tiny"
-            text
-            :loading="isCloudflareSaving"
-            @click="clearCloudflareConfig"
-          >
-            清空
-          </n-button>
-        </div>
-
-        <div v-if="cloudflareVerification" class="grid grid-cols-3 gap-2 text-[11px]">
-          <div>
-            <div class="opacity-50">
-              Health
-            </div>
-            <div class="font-medium" :class="cloudflareVerification.health_ok ? 'text-success' : 'text-error'">
-              {{ cloudflareVerification.health_ok ? 'ok' : 'fail' }}
-            </div>
-          </div>
-          <div>
-            <div class="opacity-50">
-              Pair
-            </div>
-            <div class="font-medium" :class="cloudflareVerification.pair_challenge_ok ? 'text-success' : 'text-error'">
-              {{ cloudflareVerification.pair_challenge_ok ? 'ok' : 'fail' }}
-            </div>
-          </div>
-          <div>
-            <div class="opacity-50">
-              WS
-            </div>
-            <div class="font-medium" :class="cloudflareVerification.websocket_ok ? 'text-success' : 'text-error'">
-              {{ cloudflareVerification.websocket_ok ? 'ok' : 'fail' }}
-            </div>
-          </div>
-        </div>
-
-        <div v-if="webLoginPairing" class="space-y-1 text-[11px] leading-relaxed">
-          <div class="opacity-50">
-            Web Login Pair Page
-          </div>
-          <n-input
-            :value="webLoginPairing.pair_url"
-            size="tiny"
-            readonly
-          />
-          <div class="opacity-60">
-            {{ webLoginPairing.device_id }} · {{ new Date(webLoginPairing.expires_at).toLocaleTimeString() }}
-          </div>
-        </div>
-
-        <div class="space-y-2 text-[11px] leading-relaxed">
-          <div class="flex items-center justify-between gap-2">
-            <div>
-              <div class="opacity-50">
-                Web Login Sessions
-              </div>
-              <div class="opacity-60">
-                {{ webLoginSessions.length }} active
-              </div>
-            </div>
-            <div class="flex gap-2">
-              <n-button
-                size="tiny"
-                text
-                :loading="isWebLoginSessionsLoading"
-                @click="refreshCloudflareWebLoginSessions"
-              >
-                刷新
-              </n-button>
-              <n-button
-                size="tiny"
-                text
-                type="error"
-                :loading="isWebLoginSessionsLoading"
-                :disabled="webLoginSessions.length === 0"
-                @click="revokeCloudflareWebLoginSessions"
-              >
-                撤销全部
-              </n-button>
-            </div>
-          </div>
-          <div v-if="webLoginSessions.length > 0" class="space-y-1">
-            <div
-              v-for="session in webLoginSessions"
-              :key="session.session_id"
-              class="rounded bg-black-200/60 px-2 py-1"
-            >
-              <div class="font-medium">
-                {{ session.device_id }}
-              </div>
-              <div class="opacity-60">
-                {{ session.cf_origin }} · expires {{ new Date(session.expires_at).toLocaleTimeString() }}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="cloudflareError" class="text-xs text-error leading-relaxed">
-          {{ cloudflareError }}
-        </div>
-      </n-space>
-    </div>
-
-    <!-- Bridge 缓存命中率 -->
-    <div class="p-3 bg-black-100 rounded-lg">
-      <div class="flex items-start justify-between gap-3 mb-3">
-        <div>
-          <div class="text-sm font-medium leading-relaxed">
-            Bridge 缓存命中率
-          </div>
-          <div class="text-xs opacity-60">
-            {{ bridgeDiagnostics?.generated_at ? `更新于 ${new Date(bridgeDiagnostics.generated_at).toLocaleTimeString()}` : '等待诊断数据' }}
-          </div>
-        </div>
-        <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="refreshBridgeDiagnostics">
-          刷新
-        </n-button>
-      </div>
-
-      <div v-if="diagnosticsError" class="text-xs text-error leading-relaxed">
-        {{ diagnosticsError }}
-      </div>
-
-      <div v-else class="divide-y divide-black-200/70">
-        <div
-          v-for="row in cacheMetricRows"
-          :key="row.key"
-          class="py-2 first:pt-0 last:pb-0"
-        >
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
-              <div class="text-xs font-medium leading-relaxed">
-                {{ row.label }}
-              </div>
-              <div class="text-[11px] opacity-55 leading-relaxed">
-                {{ row.description }} · {{ formatMetricNumber(row.status.count) }}/{{ formatMetricNumber(row.status.max_entries) }} · TTL {{ formatTtl(row.status.ttl_secs) }}
-              </div>
-            </div>
-            <div class="text-right">
-              <div class="text-base font-semibold tabular-nums leading-tight">
-                {{ formatHitRate(row.status.metrics?.hit_rate_percent) }}
-              </div>
-              <div class="text-[11px] opacity-55">
-                hit rate
-              </div>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-4 gap-2 mt-2 text-[11px]">
-            <div>
-              <div class="opacity-50">
-                查询
-              </div>
-              <div class="font-medium tabular-nums">
-                {{ formatMetricNumber(row.status.metrics?.lookups) }}
-              </div>
-            </div>
-            <div>
-              <div class="opacity-50">
-                命中
-              </div>
-              <div class="font-medium tabular-nums">
-                {{ formatMetricNumber(row.status.metrics?.hits) }}
-              </div>
-            </div>
-            <div>
-              <div class="opacity-50">
-                写入
-              </div>
-              <div class="font-medium tabular-nums">
-                {{ formatMetricNumber(row.status.metrics?.writes) }}
-              </div>
-            </div>
-            <div>
-              <div class="opacity-50">
-                清理
-              </div>
-              <div class="font-medium tabular-nums">
-                {{ formatMetricNumber(row.status.metrics?.pruned) }}
-              </div>
-            </div>
-          </div>
-
-          <div class="flex flex-wrap gap-1.5 mt-2">
-            <span class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded">
-              request_id {{ formatHitRate(row.status.metrics?.routes?.request_id?.hit_rate_percent) }}
-            </span>
-            <span class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded">
-              project_path {{ formatHitRate(row.status.metrics?.routes?.project_path?.hit_rate_percent) }}
-            </span>
-            <span class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded">
-              fallback {{ formatHitRate(row.status.metrics?.routes?.fallback_route?.hit_rate_percent) }}
-            </span>
-            <span
-              v-if="row.key === 'mcp_state'"
-              class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded"
-            >
-              registry fallback {{ formatMetricNumber(row.status.metrics?.active_registry_fallback_hits) }}
-            </span>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <template v-if="showQuickTunnelDeveloperControls">
-      <!-- 开发测试通道状态与控制 -->
-      <div class="flex items-center justify-between">
-        <div class="flex items-center">
-          <div class="w-1.5 h-1.5 rounded-full mr-3 flex-shrink-0" :class="statusColor" />
-          <div>
-            <div class="text-sm font-medium leading-relaxed">
-              公网兜底状态
-            </div>
-            <div class="text-xs opacity-60">
-              {{ statusText }}
-              <template v-if="status.pid">
-                (PID: {{ status.pid }})
-              </template>
-            </div>
-          </div>
-        </div>
-        <n-space>
-          <n-button
-            v-if="status.state === 'stopped' || status.state === 'error'"
-            size="small"
-            type="primary"
-            :loading="isLoading"
-            @click="startTunnel"
-          >
-            安全连接 iPhone
-          </n-button>
-          <n-button
-            v-else
-            size="small"
-            type="error"
-            :loading="isLoading"
-            @click="stopTunnel"
-          >
-            停止
-          </n-button>
-        </n-space>
-      </div>
-
-      <!-- 手机浏览器入口展示 -->
-      <div v-if="mobileUrl" class="p-3 bg-black-100 rounded-lg">
-        <div class="flex items-center justify-between mb-2">
-          <div>
-            <div class="text-sm font-medium text-primary">
-              手机浏览器入口
-            </div>
-            <div v-if="mobileEntrySourceText" class="text-xs opacity-60">
-              {{ mobileEntrySourceText }}
-            </div>
-          </div>
-          <n-space size="small">
-            <n-button size="tiny" text @click="showQrCode = !showQrCode">
-              {{ showQrCode ? '隐藏二维码' : '显示二维码' }}
-            </n-button>
-          </n-space>
-        </div>
-
-        <div class="flex items-center gap-2 mb-2">
-          <code class="text-xs bg-black-200 px-2 py-1 rounded flex-1 truncate">
-            {{ mobileUrl }}
-          </code>
-          <n-button size="tiny" :type="copySuccess ? 'success' : 'default'" @click="copyDomain">
-            {{ copySuccess ? '已复制' : '复制' }}
-          </n-button>
-          <n-button size="tiny" type="primary" @click="openDomain">
-            打开
-          </n-button>
-        </div>
-
-        <!-- 二维码 -->
-        <div v-if="showQrCode" class="flex justify-center pt-2">
-          <img
-            :src="qrCodeUrl"
-            alt="QR Code"
-            class="w-32 h-32 rounded bg-white p-1"
-            @load="onMobileQrImageLoad"
-            @error="onMobileQrImageError"
-          >
-        </div>
-      </div>
-    </template>
-
-    <div
-      v-if="status.origin_healthy"
-      class="p-3 bg-black-100 rounded-lg"
-    >
-      <div class="flex items-center justify-between mb-2">
-        <div>
-          <div class="text-sm font-medium text-primary">
-            iPhone 安全连接
-          </div>
-          <div class="text-xs opacity-60">
-            使用已登记并验证的正式公网路线；尚未配置时会提供安全的 AI 配置提示词。
-          </div>
-        </div>
-        <n-button size="small" type="primary" @click="showMobileConnectionWizard = true">
+        <n-button type="primary" @click="startTunnel">
           连接 iPhone
         </n-button>
       </div>
-      <div class="text-[11px] opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
-        正式配置与瞬时健康分开保存；暂时故障会先自动恢复，不会退回测试通道。
-      </div>
-      <div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-black-200/70">
-        <div class="min-w-0">
-          <div class="text-xs font-medium leading-relaxed">
-            iOS 回写幽灵补全词表
-          </div>
-          <div class="text-[11px] opacity-60 leading-relaxed">
-            仅影响之后配对的设备；已配对设备需重新配对。
-          </div>
-        </div>
-        <n-switch
-          :value="ghostSuggestionWritebackEnabled"
-          :loading="isMobileConfigLoading"
-          :disabled="!status.origin_healthy"
-          @update:value="updateGhostSuggestionWriteback"
-        />
-      </div>
-      <div class="grid gap-2 mt-3 pt-3 border-t border-black-200/70">
-        <div class="flex items-start justify-between gap-3">
-          <div class="min-w-0">
-            <div class="text-xs font-medium leading-relaxed">
-              iPhone 目录浏览授权
-            </div>
-            <div class="text-[11px] opacity-60 leading-relaxed">
-              只授权选中的设备；文件系统根 / 永不允许。
-            </div>
-          </div>
-          <n-button size="tiny" text :loading="isFileRootLoading" @click="refreshPairedDeviceFileRoots">
-            刷新
-          </n-button>
-        </div>
-
-        <n-select
-          v-if="fileRootDeviceOptions.length"
-          v-model:value="selectedFileRootDeviceId"
-          size="small"
-          :options="fileRootDeviceOptions"
-          placeholder="选择 iPhone"
-        />
-        <div v-else class="text-[11px] opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
-          暂无可授权的 iPhone 配对记录。
-        </div>
-
-        <div
-          v-if="selectedFileRootDevice"
-          class="text-[11px] leading-relaxed bg-black-200/70 px-2 py-1.5 rounded"
-        >
-          <template v-if="selectedFileRootDevice.file_browser_roots.length">
-            <div class="opacity-60 mb-0.5">
-              当前授权根
-            </div>
-            <code class="break-all">{{ selectedFileRootDevice.file_browser_roots.join(' · ') }}</code>
-          </template>
-          <template v-else>
-            <span class="opacity-60">当前只有活跃项目根可浏览。</span>
-          </template>
-        </div>
-
-        <div class="flex justify-end gap-2">
-          <n-button
-            size="tiny"
-            :disabled="!selectedFileRootDeviceId"
-            :loading="isFileRootLoading"
-            @click="chooseSelectedDeviceFileRoot"
-          >
-            选择授权目录
-          </n-button>
-          <n-button
-            size="tiny"
-            type="error"
-            ghost
-            :disabled="!selectedFileRootDevice?.file_browser_roots.length"
-            :loading="isFileRootLoading"
-            @click="clearSelectedDeviceFileRoots"
-          >
-            撤销目录授权
-          </n-button>
-        </div>
-      </div>
-      <div v-if="mobileConfigError" class="text-xs text-error leading-relaxed mt-2">
-        {{ mobileConfigError }}
-      </div>
-      <div v-if="fileRootError" class="text-xs text-error leading-relaxed mt-2">
-        {{ fileRootError }}
+      <div class="phone-card__route">
+        <span class="phone-card__label">连接方式</span>
+        <span class="font-medium">{{ mobileRouteSummary?.label ?? '读取中' }}</span>
+        <span v-if="mobileRouteSummary" class="phone-card__pill" :class="mobileRouteSummary.healthy ? 'phone-card__pill--ok' : 'phone-card__pill--warn'">
+          {{ mobileRouteSummary.healthy ? '正常' : '连不上' }}
+        </span>
+        <button type="button" class="phone-card__link" @click="openMobileConnectionManager">
+          管理连接
+        </button>
       </div>
     </div>
 
-    <div
-      v-if="status.origin_healthy"
-      class="p-3 bg-black-100 rounded-lg"
-    >
-      <div class="flex items-start justify-between gap-3 mb-3">
-        <div>
-          <div class="text-sm font-medium text-primary">
-            iPhone 快捷动作
+    <!-- 其余是排查用的高级信息，默认收起 -->
+    <n-collapse>
+      <n-collapse-item title="开发者诊断" name="developer-diagnostics">
+        <n-space vertical size="large">
+          <!-- 连接通道三分法 -->
+          <div class="flex items-center justify-between mb-1">
+            <div class="text-sm font-medium leading-relaxed">
+              手机连接通道
+            </div>
+            <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="async () => { await checkHealth(); await refreshBridgeDiagnostics() }">
+              刷新
+            </n-button>
           </div>
-          <div class="text-xs opacity-60">
-            {{ connectedPhoneClients.length ? `${connectedPhoneClients.length} 台在线` : '暂无在线 iPhone' }}
+          <ConnectionRouteStatusPanel :route-view="connectionRouteView" />
+
+          <!-- Mac Relay Client -->
+          <div class="p-3 bg-black-100 rounded-lg">
+            <div class="flex items-start justify-between gap-3 mb-3">
+              <div>
+                <div class="text-sm font-medium text-primary">
+                  Mac Relay Client
+                </div>
+                <div class="text-xs opacity-60">
+                  常驻 Mac 出站 WebSocket，用于 iPhone 通过 Relay 下发受限恢复命令。
+                </div>
+              </div>
+              <div class="flex flex-col items-end gap-1">
+                <span
+                  class="text-[11px] leading-relaxed px-2 py-0.5 rounded"
+                  :class="relayMacRuntimeStatusClass"
+                >
+                  {{ relayMacRuntimeStatusText }}
+                </span>
+                <span
+                  class="text-[11px] leading-relaxed px-2 py-0.5 rounded"
+                  :class="relayMacClientConfig.token_present ? 'bg-success/15 text-success' : 'bg-black-200'"
+                >
+                  {{ relayMacTokenStatusText }}
+                </span>
+              </div>
+            </div>
+
+            <n-space vertical size="small">
+              <n-input
+                v-model:value="relayMacClientConfig.relay_url"
+                size="small"
+                placeholder="wss://relay.example.com/mac/ws"
+                :disabled="isRelayMacClientSaving"
+              />
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <n-input
+                  v-model:value="relayMacClientConfig.device_id"
+                  size="small"
+                  placeholder="local-mac"
+                  :disabled="isRelayMacClientSaving"
+                />
+                <n-input
+                  v-model:value="relayMacClientConfig.local_base_url"
+                  size="small"
+                  placeholder="http://127.0.0.1:8080"
+                  :disabled="isRelayMacClientSaving"
+                />
+                <n-input-number
+                  v-model:value="relayMacClientConfig.heartbeat_secs"
+                  size="small"
+                  :min="5"
+                  :max="300"
+                  :disabled="isRelayMacClientSaving"
+                />
+              </div>
+              <n-input
+                v-model:value="relayMacClientTokenInput"
+                size="small"
+                type="password"
+                show-password-on="click"
+                placeholder="Relay token；留空则保留已保存 token"
+                :disabled="isRelayMacClientSaving"
+              />
+              <n-checkbox
+                v-model:checked="relayMacClientConfig.clear_relay_token"
+                size="small"
+                :disabled="isRelayMacClientSaving || Boolean(relayMacClientTokenInput.trim()) || !relayMacClientConfig.token_present"
+              >
+                清空已保存 token
+              </n-checkbox>
+              <div class="flex items-center justify-between gap-3">
+                <n-switch
+                  v-model:value="relayMacClientConfig.allow_recover"
+                  size="small"
+                  :disabled="isRelayMacClientSaving"
+                >
+                  <template #checked>
+                    真实恢复
+                  </template>
+                  <template #unchecked>
+                    模拟恢复
+                  </template>
+                </n-switch>
+                <div class="flex flex-wrap gap-2">
+                  <n-button
+                    size="tiny"
+                    text
+                    :loading="isRelayMacClientSaving || isRelayMacClientControlling"
+                    @click="refreshRelayMacClientPanel"
+                  >
+                    刷新
+                  </n-button>
+                  <n-button
+                    size="tiny"
+                    type="primary"
+                    :loading="isRelayMacClientSaving"
+                    :disabled="!relayMacClientConfig.relay_url.trim()"
+                    @click="saveRelayMacClientConfig"
+                  >
+                    保存
+                  </n-button>
+                  <n-button
+                    size="tiny"
+                    type="primary"
+                    ghost
+                    :loading="isRelayMacClientSaving || isRelayMacClientControlling"
+                    :disabled="!relayMacClientConfig.relay_url.trim()"
+                    @click="saveAndRestartRelayMacClient"
+                  >
+                    安装/重启
+                  </n-button>
+                  <n-button
+                    size="tiny"
+                    text
+                    :loading="isRelayMacClientControlling"
+                    @click="controlRelayMacClient('health')"
+                  >
+                    体检
+                  </n-button>
+                  <n-button
+                    size="tiny"
+                    text
+                    type="warning"
+                    :loading="isRelayMacClientControlling"
+                    @click="controlRelayMacClient('stop')"
+                  >
+                    停止
+                  </n-button>
+                </div>
+              </div>
+              <div class="grid grid-cols-1 gap-1 text-[11px] opacity-60 leading-relaxed">
+                <div>config: {{ relayMacClientConfig.config_path || '未初始化' }}</div>
+                <div>plist: {{ relayMacClientConfig.plist_path || '未初始化' }}</div>
+                <div>runner: {{ relayMacClientConfig.runner_path || '未初始化' }}</div>
+              </div>
+              <div v-if="relayMacClientRuntime?.message" class="text-xs leading-relaxed opacity-75">
+                {{ relayMacClientRuntime.message }}
+              </div>
+              <pre
+                v-if="relayMacClientRuntime?.stdout || relayMacClientRuntime?.stderr"
+                class="max-h-32 overflow-auto rounded bg-black-200/60 p-2 text-[11px] leading-relaxed whitespace-pre-wrap"
+              >{{ [relayMacClientRuntime.stdout, relayMacClientRuntime.stderr].filter(Boolean).join('\n') }}</pre>
+              <div v-if="relayMacClientError" class="text-xs text-error leading-relaxed">
+                {{ relayMacClientError }}
+              </div>
+            </n-space>
           </div>
-        </div>
-        <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="refreshBridgeDiagnostics">
-          刷新
-        </n-button>
-      </div>
 
-      <div class="grid gap-3">
-        <n-select
-          v-model:value="selectedPhoneDeviceId"
-          size="small"
-          :options="phoneDeviceOptions"
-        />
+          <!-- 客户 Cloudflare Web Login -->
+          <div class="p-3 bg-black-100 rounded-lg">
+            <div class="flex items-start justify-between gap-3 mb-3">
+              <div>
+                <div class="text-sm font-medium text-primary">
+                  Cloudflare Web Login
+                </div>
+                <div class="text-xs opacity-60">
+                  客户自有 hostname 的持久通道；填写 Access 邮箱可自动配置 allow-email 策略，留空则只配置 Tunnel。
+                </div>
+              </div>
+              <span
+                class="text-[11px] leading-relaxed px-2 py-0.5 rounded"
+                :class="cloudflareVerified ? 'bg-success/15 text-success' : 'bg-black-200'"
+              >
+                {{ cloudflareVerificationText }}
+              </span>
+            </div>
 
-        <div v-if="connectedPhoneClients.length" class="grid gap-2">
+            <n-space vertical size="small">
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <n-input
+                  v-model:value="cloudflareApiToken"
+                  size="small"
+                  type="password"
+                  show-password-on="click"
+                  placeholder="Cloudflare API Token"
+                  :disabled="isCloudflareAutoSetupLoading"
+                />
+                <n-input
+                  v-model:value="cloudflareZoneName"
+                  size="small"
+                  placeholder="域名：example.com"
+                  :disabled="isCloudflareAutoSetupLoading"
+                />
+                <n-input
+                  v-model:value="cloudflareSubdomain"
+                  size="small"
+                  placeholder="子域名：login"
+                  :disabled="isCloudflareAutoSetupLoading"
+                />
+              </div>
+              <n-input
+                v-model:value="cloudflareAccessEmails"
+                size="small"
+                placeholder="可选 Access 允许邮箱，多个用逗号分隔；留空则只配置 Tunnel"
+                :disabled="isCloudflareAutoSetupLoading"
+              />
+              <div class="flex items-center justify-between gap-3">
+                <n-switch
+                  v-model:value="cloudflareOverwriteDns"
+                  size="small"
+                  :disabled="isCloudflareAutoSetupLoading"
+                >
+                  <template #checked>
+                    覆盖 DNS
+                  </template>
+                  <template #unchecked>
+                    保留 DNS
+                  </template>
+                </n-switch>
+                <n-button
+                  size="tiny"
+                  type="primary"
+                  :loading="isCloudflareAutoSetupLoading"
+                  :disabled="!cloudflareApiToken.trim() || !cloudflareZoneName.trim() || !cloudflareSubdomain.trim()"
+                  @click="autoSetupCloudflare"
+                >
+                  {{ cloudflareAccessEmails.trim() ? '配置 Tunnel + Access' : '配置 Tunnel' }}
+                </n-button>
+              </div>
+              <div class="h-px bg-black-200" />
+              <n-input
+                v-model:value="cloudflareHostname"
+                size="small"
+                placeholder="https://iterate.example.com"
+                :disabled="isCloudflareSaving || isCloudflareVerifying"
+              />
+              <n-input
+                v-model:value="cloudflareWebLoginConsoleOrigin"
+                size="small"
+                placeholder="Web Console origin，例如 https://app.example.com"
+                :disabled="isCloudflareSaving || isCloudflareVerifying"
+              />
+              <n-input
+                v-model:value="cloudflareTunnelToken"
+                size="small"
+                type="password"
+                show-password-on="click"
+                placeholder="粘贴 Cloudflare tunnel token；保存后清空"
+                :disabled="isCloudflareSaving || isCloudflareVerifying"
+              />
+              <div class="flex items-center justify-between gap-3">
+                <div class="text-xs opacity-60">
+                  {{ cloudflareTokenStatusText }}
+                </div>
+                <n-switch
+                  v-model:value="cloudflareAccessExpected"
+                  size="small"
+                  :disabled="isCloudflareSaving || isCloudflareVerifying"
+                >
+                  <template #checked>
+                    Access
+                  </template>
+                  <template #unchecked>
+                    No Access
+                  </template>
+                </n-switch>
+              </div>
+
+              <div class="flex flex-wrap gap-2">
+                <n-button
+                  size="tiny"
+                  type="primary"
+                  :loading="isCloudflareSaving"
+                  @click="saveCloudflareConfig"
+                >
+                  保存
+                </n-button>
+                <n-button
+                  size="tiny"
+                  :loading="isCloudflareVerifying"
+                  :disabled="!cloudflareConfig.tunnel_token_saved"
+                  @click="verifyCloudflareConfig"
+                >
+                  验证
+                </n-button>
+                <n-button
+                  size="tiny"
+                  :loading="isWebLoginPairingLoading"
+                  :disabled="!cloudflareVerified || !cloudflareWebLoginConsoleConfigured"
+                  @click="createCloudflareWebLoginPairing"
+                >
+                  生成登录链接
+                </n-button>
+                <n-button
+                  v-if="!customerTunnelRunning"
+                  size="tiny"
+                  :loading="isCustomerTunnelLoading"
+                  :disabled="!cloudflareConfig.tunnel_token_saved || !cloudflareConfig.public_hostname"
+                  @click="startCustomerTunnel"
+                >
+                  启动通道
+                </n-button>
+                <n-button
+                  v-else
+                  size="tiny"
+                  type="error"
+                  :loading="isCustomerTunnelLoading"
+                  @click="stopCustomerTunnel"
+                >
+                  停止通道
+                </n-button>
+                <n-button
+                  size="tiny"
+                  text
+                  :loading="isCloudflareSaving"
+                  @click="clearCloudflareConfig"
+                >
+                  清空
+                </n-button>
+              </div>
+
+              <div v-if="cloudflareVerification" class="grid grid-cols-3 gap-2 text-[11px]">
+                <div>
+                  <div class="opacity-50">
+                    Health
+                  </div>
+                  <div class="font-medium" :class="cloudflareVerification.health_ok ? 'text-success' : 'text-error'">
+                    {{ cloudflareVerification.health_ok ? 'ok' : 'fail' }}
+                  </div>
+                </div>
+                <div>
+                  <div class="opacity-50">
+                    Pair
+                  </div>
+                  <div class="font-medium" :class="cloudflareVerification.pair_challenge_ok ? 'text-success' : 'text-error'">
+                    {{ cloudflareVerification.pair_challenge_ok ? 'ok' : 'fail' }}
+                  </div>
+                </div>
+                <div>
+                  <div class="opacity-50">
+                    WS
+                  </div>
+                  <div class="font-medium" :class="cloudflareVerification.websocket_ok ? 'text-success' : 'text-error'">
+                    {{ cloudflareVerification.websocket_ok ? 'ok' : 'fail' }}
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="webLoginPairing" class="space-y-1 text-[11px] leading-relaxed">
+                <div class="opacity-50">
+                  Web Login Pair Page
+                </div>
+                <n-input
+                  :value="webLoginPairing.pair_url"
+                  size="tiny"
+                  readonly
+                />
+                <div class="opacity-60">
+                  {{ webLoginPairing.device_id }} · {{ new Date(webLoginPairing.expires_at).toLocaleTimeString() }}
+                </div>
+              </div>
+
+              <div class="space-y-2 text-[11px] leading-relaxed">
+                <div class="flex items-center justify-between gap-2">
+                  <div>
+                    <div class="opacity-50">
+                      Web Login Sessions
+                    </div>
+                    <div class="opacity-60">
+                      {{ webLoginSessions.length }} active
+                    </div>
+                  </div>
+                  <div class="flex gap-2">
+                    <n-button
+                      size="tiny"
+                      text
+                      :loading="isWebLoginSessionsLoading"
+                      @click="refreshCloudflareWebLoginSessions"
+                    >
+                      刷新
+                    </n-button>
+                    <n-button
+                      size="tiny"
+                      text
+                      type="error"
+                      :loading="isWebLoginSessionsLoading"
+                      :disabled="webLoginSessions.length === 0"
+                      @click="revokeCloudflareWebLoginSessions"
+                    >
+                      撤销全部
+                    </n-button>
+                  </div>
+                </div>
+                <div v-if="webLoginSessions.length > 0" class="space-y-1">
+                  <div
+                    v-for="session in webLoginSessions"
+                    :key="session.session_id"
+                    class="rounded bg-black-200/60 px-2 py-1"
+                  >
+                    <div class="font-medium">
+                      {{ session.device_id }}
+                    </div>
+                    <div class="opacity-60">
+                      {{ session.cf_origin }} · expires {{ new Date(session.expires_at).toLocaleTimeString() }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="cloudflareError" class="text-xs text-error leading-relaxed">
+                {{ cloudflareError }}
+              </div>
+            </n-space>
+          </div>
+
+          <!-- Bridge 缓存命中率 -->
+          <div class="p-3 bg-black-100 rounded-lg">
+            <div class="flex items-start justify-between gap-3 mb-3">
+              <div>
+                <div class="text-sm font-medium leading-relaxed">
+                  Bridge 缓存命中率
+                </div>
+                <div class="text-xs opacity-60">
+                  {{ bridgeDiagnostics?.generated_at ? `更新于 ${new Date(bridgeDiagnostics.generated_at).toLocaleTimeString()}` : '等待诊断数据' }}
+                </div>
+              </div>
+              <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="refreshBridgeDiagnostics">
+                刷新
+              </n-button>
+            </div>
+
+            <div v-if="diagnosticsError" class="text-xs text-error leading-relaxed">
+              {{ diagnosticsError }}
+            </div>
+
+            <div v-else class="divide-y divide-black-200/70">
+              <div
+                v-for="row in cacheMetricRows"
+                :key="row.key"
+                class="py-2 first:pt-0 last:pb-0"
+              >
+                <div class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <div class="text-xs font-medium leading-relaxed">
+                      {{ row.label }}
+                    </div>
+                    <div class="text-[11px] opacity-55 leading-relaxed">
+                      {{ row.description }} · {{ formatMetricNumber(row.status.count) }}/{{ formatMetricNumber(row.status.max_entries) }} · TTL {{ formatTtl(row.status.ttl_secs) }}
+                    </div>
+                  </div>
+                  <div class="text-right">
+                    <div class="text-base font-semibold tabular-nums leading-tight">
+                      {{ formatHitRate(row.status.metrics?.hit_rate_percent) }}
+                    </div>
+                    <div class="text-[11px] opacity-55">
+                      hit rate
+                    </div>
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-4 gap-2 mt-2 text-[11px]">
+                  <div>
+                    <div class="opacity-50">
+                      查询
+                    </div>
+                    <div class="font-medium tabular-nums">
+                      {{ formatMetricNumber(row.status.metrics?.lookups) }}
+                    </div>
+                  </div>
+                  <div>
+                    <div class="opacity-50">
+                      命中
+                    </div>
+                    <div class="font-medium tabular-nums">
+                      {{ formatMetricNumber(row.status.metrics?.hits) }}
+                    </div>
+                  </div>
+                  <div>
+                    <div class="opacity-50">
+                      写入
+                    </div>
+                    <div class="font-medium tabular-nums">
+                      {{ formatMetricNumber(row.status.metrics?.writes) }}
+                    </div>
+                  </div>
+                  <div>
+                    <div class="opacity-50">
+                      清理
+                    </div>
+                    <div class="font-medium tabular-nums">
+                      {{ formatMetricNumber(row.status.metrics?.pruned) }}
+                    </div>
+                  </div>
+                </div>
+
+                <div class="flex flex-wrap gap-1.5 mt-2">
+                  <span class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded">
+                    request_id {{ formatHitRate(row.status.metrics?.routes?.request_id?.hit_rate_percent) }}
+                  </span>
+                  <span class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded">
+                    project_path {{ formatHitRate(row.status.metrics?.routes?.project_path?.hit_rate_percent) }}
+                  </span>
+                  <span class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded">
+                    fallback {{ formatHitRate(row.status.metrics?.routes?.fallback_route?.hit_rate_percent) }}
+                  </span>
+                  <span
+                    v-if="row.key === 'mcp_state'"
+                    class="text-[11px] leading-relaxed bg-black-200 px-2 py-0.5 rounded"
+                  >
+                    registry fallback {{ formatMetricNumber(row.status.metrics?.active_registry_fallback_hits) }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <template v-if="showQuickTunnelDeveloperControls">
+            <!-- 开发测试通道状态与控制 -->
+            <div class="flex items-center justify-between">
+              <div class="flex items-center">
+                <div class="w-1.5 h-1.5 rounded-full mr-3 flex-shrink-0" :class="statusColor" />
+                <div>
+                  <div class="text-sm font-medium leading-relaxed">
+                    公网兜底状态
+                  </div>
+                  <div class="text-xs opacity-60">
+                    {{ statusText }}
+                    <template v-if="status.pid">
+                      (PID: {{ status.pid }})
+                    </template>
+                  </div>
+                </div>
+              </div>
+              <n-space>
+                <n-button
+                  v-if="status.state === 'stopped' || status.state === 'error'"
+                  size="small"
+                  type="primary"
+                  :loading="isLoading"
+                  @click="startTunnel"
+                >
+                  安全连接 iPhone
+                </n-button>
+                <n-button
+                  v-else
+                  size="small"
+                  type="error"
+                  :loading="isLoading"
+                  @click="stopTunnel"
+                >
+                  停止
+                </n-button>
+              </n-space>
+            </div>
+
+            <!-- 手机浏览器入口展示 -->
+            <div v-if="mobileUrl" class="p-3 bg-black-100 rounded-lg">
+              <div class="flex items-center justify-between mb-2">
+                <div>
+                  <div class="text-sm font-medium text-primary">
+                    手机浏览器入口
+                  </div>
+                  <div v-if="mobileEntrySourceText" class="text-xs opacity-60">
+                    {{ mobileEntrySourceText }}
+                  </div>
+                </div>
+                <n-space size="small">
+                  <n-button size="tiny" text @click="showQrCode = !showQrCode">
+                    {{ showQrCode ? '隐藏二维码' : '显示二维码' }}
+                  </n-button>
+                </n-space>
+              </div>
+
+              <div class="flex items-center gap-2 mb-2">
+                <code class="text-xs bg-black-200 px-2 py-1 rounded flex-1 truncate">
+                  {{ mobileUrl }}
+                </code>
+                <n-button size="tiny" :type="copySuccess ? 'success' : 'default'" @click="copyDomain">
+                  {{ copySuccess ? '已复制' : '复制' }}
+                </n-button>
+                <n-button size="tiny" type="primary" @click="openDomain">
+                  打开
+                </n-button>
+              </div>
+
+              <!-- 二维码 -->
+              <div v-if="showQrCode" class="flex justify-center pt-2">
+                <img
+                  :src="qrCodeUrl"
+                  alt="QR Code"
+                  class="w-32 h-32 rounded bg-white p-1"
+                  @load="onMobileQrImageLoad"
+                  @error="onMobileQrImageError"
+                >
+              </div>
+            </div>
+          </template>
+
           <div
-            v-for="(client, index) in connectedPhoneClients"
-            :key="client.client_id"
-            class="flex items-start justify-between gap-3 text-xs bg-black-200/70 px-2 py-1.5 rounded"
+            v-if="status.origin_healthy"
+            class="p-3 bg-black-100 rounded-lg"
           >
-            <div class="min-w-0">
-              <div class="font-medium truncate">
-                {{ phoneClientLabel(client, index) }}
+            <div class="flex items-center justify-between mb-2">
+              <div>
+                <div class="text-sm font-medium text-primary">
+                  iPhone 安全连接
+                </div>
+                <div class="text-xs opacity-60">
+                  使用已登记并验证的正式公网路线；尚未配置时会提供安全的 AI 配置提示词。
+                </div>
               </div>
-              <div class="opacity-55 truncate">
-                {{ phoneClientMeta(client) }}
+              <n-button size="small" type="primary" @click="showMobileConnectionWizard = true">
+                连接 iPhone
+              </n-button>
+            </div>
+            <div class="text-[11px] opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
+              正式配置与瞬时健康分开保存；暂时故障会先自动恢复，不会退回测试通道。
+            </div>
+            <div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-black-200/70">
+              <div class="min-w-0">
+                <div class="text-xs font-medium leading-relaxed">
+                  iOS 回写幽灵补全词表
+                </div>
+                <div class="text-[11px] opacity-60 leading-relaxed">
+                  仅影响之后配对的设备；已配对设备需重新配对。
+                </div>
+              </div>
+              <n-switch
+                :value="ghostSuggestionWritebackEnabled"
+                :loading="isMobileConfigLoading"
+                :disabled="!status.origin_healthy"
+                @update:value="updateGhostSuggestionWriteback"
+              />
+            </div>
+            <div class="grid gap-2 mt-3 pt-3 border-t border-black-200/70">
+              <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <div class="text-xs font-medium leading-relaxed">
+                    iPhone 目录浏览授权
+                  </div>
+                  <div class="text-[11px] opacity-60 leading-relaxed">
+                    只授权选中的设备；文件系统根 / 永不允许。
+                  </div>
+                </div>
+                <n-button size="tiny" text :loading="isFileRootLoading" @click="refreshPairedDeviceFileRoots">
+                  刷新
+                </n-button>
+              </div>
+
+              <n-select
+                v-if="fileRootDeviceOptions.length"
+                v-model:value="selectedFileRootDeviceId"
+                size="small"
+                :options="fileRootDeviceOptions"
+                placeholder="选择 iPhone"
+              />
+              <div v-else class="text-[11px] opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
+                暂无可授权的 iPhone 配对记录。
+              </div>
+
+              <div
+                v-if="selectedFileRootDevice"
+                class="text-[11px] leading-relaxed bg-black-200/70 px-2 py-1.5 rounded"
+              >
+                <template v-if="selectedFileRootDevice.file_browser_roots.length">
+                  <div class="opacity-60 mb-0.5">
+                    当前授权根
+                  </div>
+                  <code class="break-all">{{ selectedFileRootDevice.file_browser_roots.join(' · ') }}</code>
+                </template>
+                <template v-else>
+                  <span class="opacity-60">当前只有活跃项目根可浏览。</span>
+                </template>
+              </div>
+
+              <div class="flex justify-end gap-2">
+                <n-button
+                  size="tiny"
+                  :disabled="!selectedFileRootDeviceId"
+                  :loading="isFileRootLoading"
+                  @click="chooseSelectedDeviceFileRoot"
+                >
+                  选择授权目录
+                </n-button>
+                <n-button
+                  size="tiny"
+                  type="error"
+                  ghost
+                  :disabled="!selectedFileRootDevice?.file_browser_roots.length"
+                  :loading="isFileRootLoading"
+                  @click="clearSelectedDeviceFileRoots"
+                >
+                  撤销目录授权
+                </n-button>
               </div>
             </div>
-            <div
-              v-if="client.device_id === selectedPhoneDeviceId"
-              class="i-carbon-checkmark-filled text-success flex-shrink-0 mt-0.5"
-            />
-          </div>
-        </div>
-
-        <div v-else class="text-xs opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
-          iPhone 连接后会出现在这里；也可以先使用“全部已连接 iPhone”广播动作。
-        </div>
-
-        <n-input
-          v-model:value="phoneActionText"
-          size="small"
-          type="textarea"
-          :autosize="{ minRows: 2, maxRows: 4 }"
-          placeholder="文本：写入剪贴板或显示消息"
-        />
-
-        <n-input
-          v-model:value="phoneActionUrl"
-          size="small"
-          placeholder="URL：http(s)://；打开 URL 可用 iterate://"
-        />
-
-        <div class="grid grid-cols-2 gap-2">
-          <n-select
-            v-model:value="phoneActionBrowser"
-            size="small"
-            :options="phoneActionBrowserOptions"
-          />
-          <n-input
-            v-model:value="phoneActionShortcutName"
-            size="small"
-            placeholder="快捷指令：iterate..."
-          />
-        </div>
-
-        <div class="grid grid-cols-2 gap-2">
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'set_clipboard'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('set_clipboard')"
-          >
-            <template #icon>
-              <div class="i-carbon-copy" />
-            </template>
-            写剪贴板
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'show_message'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('show_message')"
-          >
-            <template #icon>
-              <div class="i-carbon-chat" />
-            </template>
-            显示消息
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'start_voice'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('start_voice')"
-          >
-            <template #icon>
-              <div class="i-carbon-voice-activate" />
-            </template>
-            启动语音
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'open_url'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('open_url')"
-          >
-            <template #icon>
-              <div class="i-carbon-launch" />
-            </template>
-            打开 URL
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'open_browser'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('open_browser')"
-          >
-            <template #icon>
-              <div class="i-carbon-browser" />
-            </template>
-            打开浏览器
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'share_text'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('share_text')"
-          >
-            <template #icon>
-              <div class="i-carbon-share" />
-            </template>
-            分享文本
-          </n-button>
-          <n-button
-            size="small"
-            :loading="phoneActionLoading === 'run_shortcut'"
-            :disabled="Boolean(phoneActionLoading)"
-            @click="sendPhoneAction('run_shortcut')"
-          >
-            <template #icon>
-              <div class="i-carbon-play" />
-            </template>
-            快捷指令
-          </n-button>
-        </div>
-
-        <div
-          v-if="phoneActionLastResult"
-          class="text-xs opacity-60 leading-relaxed"
-        >
-          最近发送：{{ phoneActionLastResult.ok ? '已投递' : '未投递' }} · sent {{ phoneActionLastResult.sent }}/{{ phoneActionLastResult.subscribers }}
-        </div>
-        <div
-          v-if="phoneActionResultLoading || phoneActionResult || phoneActionResultTimedOut"
-          class="text-xs leading-relaxed bg-black-200/70 px-2 py-1.5 rounded"
-        >
-          <div v-if="phoneActionResult" class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
-              <div :class="phoneActionResultStatusClass(phoneActionResult.status)" class="font-medium">
-                回执：{{ phoneActionResultStatusText(phoneActionResult.status) }}
-              </div>
-              <div class="opacity-60 truncate">
-                {{ phoneActionResult.message || 'iPhone 已返回执行结果' }}
-              </div>
+            <div v-if="mobileConfigError" class="text-xs text-error leading-relaxed mt-2">
+              {{ mobileConfigError }}
             </div>
-            <div class="opacity-50 tabular-nums flex-shrink-0">
-              {{ formatPhoneActionResultTime(phoneActionResult.received_at) }}
+            <div v-if="fileRootError" class="text-xs text-error leading-relaxed mt-2">
+              {{ fileRootError }}
             </div>
           </div>
-          <div v-else-if="phoneActionResultLoading" class="opacity-70">
-            等待 iPhone 回执 · {{ phoneActionPendingId }}
-          </div>
-          <div v-else class="text-warning">
-            回执超时 · 动作可能已送达，但暂未收到 iPhone 执行结果
-          </div>
-        </div>
-        <div v-if="phoneActionError" class="text-xs text-error leading-relaxed">
-          {{ phoneActionError }}
-        </div>
-      </div>
-    </div>
 
-    <!-- 等待公网兜底域名 -->
-    <div v-else-if="status.state === 'starting'" class="p-3 bg-black-100 rounded-lg">
-      <div class="flex items-center gap-2">
-        <div class="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span class="text-sm opacity-60">正在启动公网兜底，请稍候...</span>
-      </div>
-    </div>
+          <div
+            v-if="status.origin_healthy"
+            class="p-3 bg-black-100 rounded-lg"
+          >
+            <div class="flex items-start justify-between gap-3 mb-3">
+              <div>
+                <div class="text-sm font-medium text-primary">
+                  iPhone 快捷动作
+                </div>
+                <div class="text-xs opacity-60">
+                  {{ connectedPhoneClients.length ? `${connectedPhoneClients.length} 台在线` : '暂无在线 iPhone' }}
+                </div>
+              </div>
+              <n-button size="tiny" text :loading="isDiagnosticsLoading" @click="refreshBridgeDiagnostics">
+                刷新
+              </n-button>
+            </div>
+
+            <div class="grid gap-3">
+              <n-select
+                v-model:value="selectedPhoneDeviceId"
+                size="small"
+                :options="phoneDeviceOptions"
+              />
+
+              <div v-if="connectedPhoneClients.length" class="grid gap-2">
+                <div
+                  v-for="(client, index) in connectedPhoneClients"
+                  :key="client.client_id"
+                  class="flex items-start justify-between gap-3 text-xs bg-black-200/70 px-2 py-1.5 rounded"
+                >
+                  <div class="min-w-0">
+                    <div class="font-medium truncate">
+                      {{ phoneClientLabel(client, index) }}
+                    </div>
+                    <div class="opacity-55 truncate">
+                      {{ phoneClientMeta(client) }}
+                    </div>
+                  </div>
+                  <div
+                    v-if="client.device_id === selectedPhoneDeviceId"
+                    class="i-carbon-checkmark-filled text-success flex-shrink-0 mt-0.5"
+                  />
+                </div>
+              </div>
+
+              <div v-else class="text-xs opacity-60 leading-relaxed bg-black-200/70 px-2 py-1.5 rounded">
+                iPhone 连接后会出现在这里；也可以先使用“全部已连接 iPhone”广播动作。
+              </div>
+
+              <n-input
+                v-model:value="phoneActionText"
+                size="small"
+                type="textarea"
+                :autosize="{ minRows: 2, maxRows: 4 }"
+                placeholder="文本：写入剪贴板或显示消息"
+              />
+
+              <n-input
+                v-model:value="phoneActionUrl"
+                size="small"
+                placeholder="URL：http(s)://；打开 URL 可用 iterate://"
+              />
+
+              <div class="grid grid-cols-2 gap-2">
+                <n-select
+                  v-model:value="phoneActionBrowser"
+                  size="small"
+                  :options="phoneActionBrowserOptions"
+                />
+                <n-input
+                  v-model:value="phoneActionShortcutName"
+                  size="small"
+                  placeholder="快捷指令：iterate..."
+                />
+              </div>
+
+              <div class="grid grid-cols-2 gap-2">
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'set_clipboard'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('set_clipboard')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-copy" />
+                  </template>
+                  写剪贴板
+                </n-button>
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'show_message'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('show_message')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-chat" />
+                  </template>
+                  显示消息
+                </n-button>
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'start_voice'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('start_voice')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-voice-activate" />
+                  </template>
+                  启动语音
+                </n-button>
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'open_url'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('open_url')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-launch" />
+                  </template>
+                  打开 URL
+                </n-button>
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'open_browser'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('open_browser')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-browser" />
+                  </template>
+                  打开浏览器
+                </n-button>
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'share_text'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('share_text')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-share" />
+                  </template>
+                  分享文本
+                </n-button>
+                <n-button
+                  size="small"
+                  :loading="phoneActionLoading === 'run_shortcut'"
+                  :disabled="Boolean(phoneActionLoading)"
+                  @click="sendPhoneAction('run_shortcut')"
+                >
+                  <template #icon>
+                    <div class="i-carbon-play" />
+                  </template>
+                  快捷指令
+                </n-button>
+              </div>
+
+              <div
+                v-if="phoneActionLastResult"
+                class="text-xs opacity-60 leading-relaxed"
+              >
+                最近发送：{{ phoneActionLastResult.ok ? '已投递' : '未投递' }} · sent {{ phoneActionLastResult.sent }}/{{ phoneActionLastResult.subscribers }}
+              </div>
+              <div
+                v-if="phoneActionResultLoading || phoneActionResult || phoneActionResultTimedOut"
+                class="text-xs leading-relaxed bg-black-200/70 px-2 py-1.5 rounded"
+              >
+                <div v-if="phoneActionResult" class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <div :class="phoneActionResultStatusClass(phoneActionResult.status)" class="font-medium">
+                      回执：{{ phoneActionResultStatusText(phoneActionResult.status) }}
+                    </div>
+                    <div class="opacity-60 truncate">
+                      {{ phoneActionResult.message || 'iPhone 已返回执行结果' }}
+                    </div>
+                  </div>
+                  <div class="opacity-50 tabular-nums flex-shrink-0">
+                    {{ formatPhoneActionResultTime(phoneActionResult.received_at) }}
+                  </div>
+                </div>
+                <div v-else-if="phoneActionResultLoading" class="opacity-70">
+                  等待 iPhone 回执 · {{ phoneActionPendingId }}
+                </div>
+                <div v-else class="text-warning">
+                  回执超时 · 动作可能已送达，但暂未收到 iPhone 执行结果
+                </div>
+              </div>
+              <div v-if="phoneActionError" class="text-xs text-error leading-relaxed">
+                {{ phoneActionError }}
+              </div>
+            </div>
+          </div>
+          <!-- 等待公网兜底域名 -->
+          <div v-else-if="status.state === 'starting'" class="p-3 bg-black-100 rounded-lg">
+            <div class="flex items-center gap-2">
+              <div class="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+              <span class="text-sm opacity-60">正在启动公网兜底，请稍候...</span>
+            </div>
+          </div>
+        </n-space>
+      </n-collapse-item>
+    </n-collapse>
 
     <!-- 错误信息 -->
     <div v-if="status.last_error && status.state === 'error'" class="p-3 bg-error-100 rounded-lg">
@@ -2496,6 +2538,73 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <MobileConnectionWizard v-model:show="showMobileConnectionWizard" />
+    <MobileConnectionWizard v-model:show="showMobileConnectionWizard" :initial-panel="mobileWizardInitialPanel" />
   </n-space>
 </template>
+
+<style scoped>
+.phone-card {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px;
+  border-radius: 12px;
+  border: 1px solid rgba(127, 127, 127, 0.2);
+}
+.phone-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.phone-card__title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.phone-card__sub {
+  margin-top: 2px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+.phone-card__route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(127, 127, 127, 0.16);
+  font-size: 13px;
+}
+.phone-card__label {
+  opacity: 0.6;
+}
+.phone-card__pill {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.phone-card__pill--ok {
+  color: #18a058;
+  background: rgba(24, 160, 88, 0.12);
+}
+.phone-card__pill--warn {
+  color: #d48806;
+  background: rgba(212, 136, 6, 0.12);
+}
+.phone-card__link {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  padding: 2px 0;
+  color: #18a058;
+  font: inherit;
+  cursor: pointer;
+}
+.phone-card__link:hover {
+  text-decoration: underline;
+}
+.phone-card__link:focus-visible {
+  outline: 2px solid #18a058;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+</style>

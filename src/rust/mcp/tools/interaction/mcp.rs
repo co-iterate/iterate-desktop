@@ -80,6 +80,13 @@ impl InteractionTool {
             codex_home: request.codex_home.or_else(codex_home_from_env),
             codex_thread_id,
             codex_deeplink,
+            caller_client: None,
+            caller_session_id: None,
+            caller_cwd: None,
+            caller_pid: None,
+            caller_model: None,
+            caller_model_label: None,
+            timeline_route_id: None,
             checkpoint_id: workspace_checkpoint
                 .as_ref()
                 .map(|checkpoint| checkpoint.checkpoint_id.clone()),

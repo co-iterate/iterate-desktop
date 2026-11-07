@@ -1573,6 +1573,10 @@ pub async fn setup_application(app_handle: &AppHandle) -> Result<(), String> {
     if speech_role.is_owner_eligible() {
         crate::native_speech::start_phase1_runtime(app_handle.clone(), speech_role);
     }
+    // After an in-place update, hand over from processes still running the old image.
+    if speech_role == crate::native_speech::owner::SpeechProcessRole::CanonicalGui {
+        crate::app::stale_process_heal::spawn_after_startup();
+    }
 
     if !is_standalone {
         // 检查 daemon 是否已在 8080 运行（--bridge-only 模式）
@@ -1604,6 +1608,8 @@ pub async fn setup_application(app_handle: &AppHandle) -> Result<(), String> {
         tauri::async_runtime::spawn_blocking(
             crate::mcp::client_install::refresh_stable_server_link_if_present,
         );
+        // 手动接入 Codex 时常漏掉长等待，Codex 默认 60 秒就放弃 call_zhi；启动时替用户补上。
+        tauri::async_runtime::spawn_blocking(crate::mcp::client_install::heal_codex_if_configured);
 
         // 启动 Browser AI Monitor (WebSocket 9333)
         let app_handle_browser = app_handle.clone();

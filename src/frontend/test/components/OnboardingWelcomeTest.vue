@@ -2,6 +2,8 @@
 import { ref } from 'vue'
 import OnboardingWelcome from '../../components/common/OnboardingWelcome.vue'
 
+const props = withDefaults(defineProps<{ showControls?: boolean }>(), { showControls: true })
+
 const completedCount = ref(0)
 const skippedCount = ref(0)
 
@@ -16,7 +18,7 @@ function handleSkip() {
 
 <template>
   <div class="welcome-preview-page">
-    <div class="preview-toolbar">
+    <div v-if="props.showControls" class="preview-toolbar">
       <p class="preview-eyebrow">
         首次打开欢迎页
       </p>

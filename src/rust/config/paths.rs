@@ -1,9 +1,28 @@
 use anyhow::Result;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const ITERATE_CONFIG_DIR_ENV: &str = "ITERATE_CONFIG_DIR";
+pub const KNOWLEDGE_DIR_ENV: &str = "CUNZHI_KNOWLEDGE_DIR";
+pub const KNOWLEDGE_DIR_NAME: &str = ".cunzhi-knowledge";
+
+/// 用户知识库根目录（对话日志、三件套、ji/hui/xi Skill）。
+///
+/// 优先 `CUNZHI_KNOWLEDGE_DIR`，否则 `~/.cunzhi-knowledge`。不保证目录存在。
+/// 所有读写 Home 知识库的地方都走这里，以后改名只改这一处。
+pub fn knowledge_root() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os(KNOWLEDGE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(configured));
+    }
+    dirs::home_dir().map(|home| knowledge_root_in(&home))
+}
+
+/// 在指定 Home 下解析知识库目录（不读环境变量，供测试和已拿到 Home 的调用方使用）。
+pub fn knowledge_root_in(home: &Path) -> PathBuf {
+    home.join(KNOWLEDGE_DIR_NAME)
+}
+
 const ANDROID_PACKAGE_CONFIG_DIR: &str = "/data/data/com.kexin94yyds.iterate/files/cunzhi";
 
 /// Resolve Bridge-owned state (paired devices and the local auth broker).

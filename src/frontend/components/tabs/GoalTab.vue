@@ -560,7 +560,7 @@ onUnmounted(() => {
   margin-top: 12px;
 }
 
-:global(.dark) .goal-panel {
+:root.dark .goal-panel {
   background:
     linear-gradient(180deg, rgba(31, 41, 55, 0.78), rgba(17, 24, 39, 0.62)),
     var(--card-color, #111827);

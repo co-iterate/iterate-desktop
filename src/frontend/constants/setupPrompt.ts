@@ -31,10 +31,18 @@ export const SETUP_PROMPT_CONTENT = `你是 iterate 安装助手。用户已经�
 - 如果是 Cursor，检查并配置 ~/.cursor/mcp.json
 - 如果是 Codex，检查并配置 ~/.codex/config.toml
 - 如果是 Claude Code，运行 \`claude mcp add -s user iterate-zhi -- /Applications/iterate.app/Contents/MacOS/mcp-server\`
-- 优先在 iterate 的「设置 → AI 客户端」里一键接入 Claude Code、Codex、Cursor；只有不在列表里的客户端才需要手动配置
-- 如果配置的是 \`iterate-zhi\`、\`call_zhi\` 这类需要长期等待用户输入的交互型 MCP，建议显式保留 \`tool_timeout_sec = 315360000\`，作为近似无限等待配置
+- 优先在 iterate 的「设置 → AI 客户端」里一键接入 Claude Code、Codex、Cursor、Antigravity；只有不在列表里的客户端才需要手动配置
+- 一键接入会同时配好长等待和调用规则：Claude Code 写入 \`timeout\` 并在 \`~/.claude/CLAUDE.md\` 加一段 iterate 调用规则，Codex 写入 \`tool_timeout_sec = 315360000\` 并在 \`~/.codex/AGENTS.md\` 加同一段规则
+- 手动配置 Codex 时，给 \`iterate-zhi\` 加 \`tool_timeout_sec = 315360000\`，否则 \`call_zhi\` 等用户回复时会被提前超时
 - 如果是其他客户端，先确认该客户端的 MCP 配置位置和格式，再做最小改动
-- 如果需要 MCP command，使用：\`/Applications/iterate.app/Contents/MacOS/mcp-server\`
+- 如果需要 MCP command：macOS 用 \`/Applications/iterate.app/Contents/MacOS/mcp-server\`；Windows 用 \`%LOCALAPPDATA%\\iterate\\bin\\mcp-server.exe\`（写进配置时展开成真实路径）
+
+### 第三步半：确认调用规则
+\`call_zhi\` 要能连续调用，AI 必须知道"每个任务都以 call_zhi 交回、拿到回复后继续"：
+- 一键接入 Claude Code 已写好 \`~/.claude/CLAUDE.md\`；Cursor 等会读取 iterate MCP 自带的说明，一般无需再复制提示词
+- 不在一键接入列表里的客户端（如 VS Code 里的其他插件），在「设置 → AI 客户端」点「复制核心系统提示词」，贴进该客户端的系统提示词文件（如 CLAUDE.md / AGENTS.md / .cursorrules）
+- Codex 不会把 MCP 自带说明放进系统提示词：一键接入已写好 \`~/.codex/AGENTS.md\`；手动配置时，把 iterate「使用说明书」里的「核心系统提示词」加入 \`~/.codex/AGENTS.md\`
+- 不要在同一份规则里重复粘贴多遍
 
 ### 第四步：刷新当前 IDE 或 CLI
 MCP 配置写完后，不要停在“理论上已经好了”。
@@ -48,6 +56,7 @@ MCP 配置写完后，不要停在“理论上已经好了”。
 - 客户端 MCP 配置是否生效
 - 当前 IDE 或 CLI 是否已经重新加载
 - 是否能完成一次最小调用测试
+- 回复弹窗后，AI 是否继续工作并再次调用 \`call_zhi\`，而不是只调用一次就停下
 
 ## 你的输出要求
 每次回复都按这个顺序输出：

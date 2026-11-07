@@ -7,6 +7,12 @@ use std::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
+    /// The exact fields read by this writer; never persisted or synchronized.
+    #[serde(skip)]
+    pub save_baseline: Option<serde_json::Value>,
+    /// Keys that actually existed in the file when the baseline was read.
+    #[serde(skip)]
+    pub save_baseline_present: Option<serde_json::Value>,
     #[serde(default = "default_ui_config")]
     pub ui_config: UiConfig, // UI相关配置（主题、窗口、置顶等）
     #[serde(default = "default_audio_config")]
@@ -76,6 +82,8 @@ pub struct FontConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WindowConfig {
+    #[serde(default)]
+    pub popup_placement: PopupPlacement,
     // 窗口约束设置
     #[serde(default = "default_auto_resize")]
     pub auto_resize: bool,
@@ -105,6 +113,14 @@ pub struct WindowConfig {
     pub free_height: f64,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupPlacement {
+    #[default]
+    Left,
+    Center,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AudioConfig {
     #[serde(default = "default_audio_notification_enabled")]
@@ -117,6 +133,8 @@ pub struct AudioConfig {
 pub struct ReplyConfig {
     #[serde(default = "default_enable_continue_reply")]
     pub enable_continue_reply: bool,
+    #[serde(default = "default_copy_submission_to_clipboard")]
+    pub copy_submission_to_clipboard: bool,
     #[serde(default = "default_auto_continue_threshold")]
     pub auto_continue_threshold: u32, // 字符数阈值
     #[serde(default = "default_continue_prompt")]
@@ -133,6 +151,20 @@ pub struct MobileConfig {
     pub allow_ghost_suggestions_write: bool,
     #[serde(default)]
     pub formal_route: Option<FormalMobileRouteConfig>,
+    /// 用过并通过验证的正式路线，供「更换连接方式」切回；只存类型和地址，不存凭据
+    #[serde(default)]
+    pub known_formal_routes: Vec<KnownFormalMobileRoute>,
+    /// 手机端 `+` 选 Claude 模型时在 Terminal 里执行的启动命令，未配置时用 `claude`
+    #[serde(default)]
+    pub claude_launch_command: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct KnownFormalMobileRoute {
+    pub transport: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub last_verified_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -360,6 +392,8 @@ impl Default for AppState {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            save_baseline: None,
+            save_baseline_present: None,
             ui_config: default_ui_config(),
             audio_config: default_audio_config(),
             reply_config: default_reply_config(),
@@ -419,6 +453,8 @@ pub fn default_mobile_config() -> MobileConfig {
     MobileConfig {
         allow_ghost_suggestions_write: default_allow_mobile_ghost_suggestions_write(),
         formal_route: None,
+        known_formal_routes: Vec::new(),
+        claude_launch_command: None,
     }
 }
 
@@ -516,6 +552,16 @@ pub fn default_usage_providers() -> HashMap<String, UsageProviderConfig> {
             auto_discover_accounts: false,
         },
     );
+    providers.insert(
+        "claude".to_string(),
+        UsageProviderConfig {
+            enabled: true,
+            source: "local".to_string(),
+            manual_cookie: None,
+            accounts: Vec::new(),
+            auto_discover_accounts: false,
+        },
+    );
     providers
 }
 
@@ -537,6 +583,7 @@ pub fn default_audio_url() -> String {
 
 pub fn default_window_config() -> WindowConfig {
     WindowConfig {
+        popup_placement: PopupPlacement::Left,
         auto_resize: window::DEFAULT_AUTO_RESIZE,
         max_width: window::MAX_WIDTH,
         max_height: window::MAX_HEIGHT,
@@ -553,6 +600,7 @@ pub fn default_window_config() -> WindowConfig {
 pub fn default_reply_config() -> ReplyConfig {
     ReplyConfig {
         enable_continue_reply: mcp::DEFAULT_CONTINUE_REPLY_ENABLED,
+        copy_submission_to_clipboard: mcp::DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD,
         auto_continue_threshold: mcp::DEFAULT_AUTO_CONTINUE_THRESHOLD,
         continue_prompt: mcp::DEFAULT_CONTINUE_PROMPT.to_string(),
         loop_prompt: mcp::DEFAULT_LOOP_PROMPT.to_string(),
@@ -584,6 +632,10 @@ pub fn default_enable_continue_reply() -> bool {
     mcp::DEFAULT_CONTINUE_REPLY_ENABLED
 }
 
+pub fn default_copy_submission_to_clipboard() -> bool {
+    mcp::DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD
+}
+
 pub fn default_auto_continue_threshold() -> u32 {
     mcp::DEFAULT_AUTO_CONTINUE_THRESHOLD
 }
@@ -603,7 +655,6 @@ pub fn default_goal_prompt_template() -> String {
 pub fn default_mcp_tools() -> HashMap<String, bool> {
     let mut tools = HashMap::new();
     tools.insert(mcp::TOOL_ZHI.to_string(), true); // iterate 工具默认启用
-    tools.insert(mcp::TOOL_JI.to_string(), false); // 记忆管理工具默认关闭
     tools.insert(mcp::TOOL_SOU.to_string(), false); // 代码搜索工具默认关闭
     tools.insert(mcp::TOOL_PAI.to_string(), false); // room 编排工具默认关闭
     tools.insert(mcp::TOOL_XI.to_string(), false); // 经验查找工具默认关闭
@@ -989,6 +1040,29 @@ pub fn default_shortcuts() -> HashMap<String, ShortcutBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_placement_defaults_left_for_legacy_config_and_round_trips() {
+        let legacy = serde_json::to_value(default_window_config()).unwrap();
+        let mut legacy = legacy.as_object().unwrap().clone();
+        legacy.remove("popup_placement");
+        let decoded: WindowConfig = serde_json::from_value(legacy.into()).unwrap();
+        assert_eq!(decoded.popup_placement, PopupPlacement::Left);
+
+        let mut centered = decoded;
+        centered.popup_placement = PopupPlacement::Center;
+        let encoded = serde_json::to_value(&centered).unwrap();
+        assert_eq!(encoded["popup_placement"], "center");
+        let reloaded: WindowConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(reloaded.popup_placement, PopupPlacement::Center);
+    }
+
+    #[test]
+    fn reply_config_defaults_clipboard_backup_to_disabled() {
+        let config: ReplyConfig = serde_json::from_str("{}").expect("reply config");
+
+        assert!(!config.copy_submission_to_clipboard);
+    }
 
     #[test]
     fn usage_provider_config_defaults_to_no_accounts() {

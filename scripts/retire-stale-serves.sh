@@ -11,10 +11,21 @@ installed_bin="${installed_app}/Contents/MacOS/iterate"
 dry_run="${CUNZHI_RETIRE_SERVES_DRY_RUN:-0}"
 [[ -x "${installed_bin}" ]] || { echo "retire-serves: 找不到 ${installed_bin}，跳过" >&2; exit 0; }
 installed_inode="$(stat -f %i "${installed_bin}")"
+# 只处理属于这个安装包的 serve：可执行文件在 <installed-app>/Contents/ 下，或在同目录
+# .iterate-retired/ 里（被替换下来的旧包）。其他包（例如装 ~/Applications/iterate-dev.app
+# 时的 /Applications/iterate.app）的 serve 一律不动。
+real_path() { realpath "$1" 2>/dev/null || printf '%s\n' "$1"; }
+installed_real="$(real_path "${installed_app}")"
+retired_real="$(real_path "$(dirname "${installed_app}")")/.iterate-retired"
 
 for pid in $(pgrep -f "MacOS/iterate --serve" || true); do
   exe="$(lsof -a -p "${pid}" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | grep '/Contents/MacOS/iterate$' | head -n 1)"
   [[ -n "${exe}" ]] || continue
+  exe="$(real_path "${exe}")"
+  case "${exe}" in
+    "${installed_real}/Contents/"* | "${retired_real}/"*) ;;
+    *) continue ;;
+  esac
   exe_inode="$(stat -f %i "${exe}" 2>/dev/null || echo missing)"
   [[ "${exe_inode}" == "${installed_inode}" ]] && continue
   port="$(ps -o command= -p "${pid}" | sed -nE 's/.*--port ([0-9]+).*/\1/p')"

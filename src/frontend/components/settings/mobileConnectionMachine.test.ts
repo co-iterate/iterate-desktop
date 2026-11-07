@@ -12,7 +12,7 @@ import {
   resolveMobileConnectionBootstrap,
   singleFlight,
 } from './mobileConnectionMachine.ts'
-import { buildFormalRouteRepairPrompt, buildFormalRouteSetupPrompt } from './mobileConnectionPrompts.ts'
+import { buildAliyunIpRouteSetupPrompt, buildFormalRouteRepairPrompt, buildFormalRouteSetupPrompt } from './mobileConnectionPrompts.ts'
 
 const healthyPublic = {
   transport_mode: 'public_tunnel',
@@ -255,7 +255,13 @@ test('formal AI prompts are redacted, route-scoped, and contain no developer hos
   const prompt = await readFile(new URL('./mobileConnectionPrompts.ts', import.meta.url), 'utf8')
   const setupPrompt = buildFormalRouteSetupPrompt()
   const repairPrompt = buildFormalRouteRepairPrompt('https://user-owned.example.com', 'probe timeout / raw detail')
+  const aliyunSetup = buildAliyunIpRouteSetupPrompt()
 
+  assert.match(aliyunSetup, /公网 Host（含端口）/)
+  assert.match(aliyunSetup, /X-Forwarded-For/)
+  assert.match(aliyunSetup, /X-Forwarded-Proto/)
+  assert.match(aliyunSetup, /\/api\/config、\/api\/active-sessions 及 \/ws WebSocket Upgrade 都必须返回 401/)
+  assert.match(aliyunSetup, /不得关闭 Bridge 鉴权/)
   assert.match(prompt, /buildFormalRouteSetupPrompt/)
   assert.match(prompt, /buildFormalRouteRepairPrompt/)
   assert.match(prompt, /\$\{safeBaseUrl\}/)
@@ -307,6 +313,46 @@ test('the handbook keeps the approved tab name, card order, and shared QR prompt
   assert.doesNotMatch(source, /重新检测/)
 })
 
+test('AI client setup lives on the AI connection path, not in the iPhone wizard', async () => {
+  const wizard = await readFile(new URL('./MobileConnectionWizard.vue', import.meta.url), 'utf8')
+  const clients = await readFile(new URL('./McpClientSettings.vue', import.meta.url), 'utf8')
+  const settingsTab = await readFile(new URL('../tabs/SettingsTab.vue', import.meta.url), 'utf8')
+  const onboarding = await readFile(new URL('../common/OnboardingWelcome.vue', import.meta.url), 'utf8')
+  const firstRunGuide = await readFile(new URL('../onboarding/FirstRunGuide.vue', import.meta.url), 'utf8')
+  const handbook = await readFile(new URL('../tabs/PromptsTab.vue', import.meta.url), 'utf8')
+  const corePrompt = await readFile(new URL('../../composables/useCoreSystemPrompt.ts', import.meta.url), 'utf8')
+
+  // 用户 2026-11-07：「AI 连接和连接手机是分开的」——手机向导回到 3 步，不再出现 AI 客户端配置
+  assert.match(wizard, /const GUIDE_STEPS = \['装 App', '扫码配对', '测试送达'\]/)
+  assert.match(wizard, /grid-template-columns: repeat\(3, 1fr\)/)
+  assert.doesNotMatch(wizard, /配 AI 客户端|McpClientSettings|aiClientSetup|showClientStep|backToClientStep/)
+  assert.match(wizard, /iterate 只会通过这台 Mac 已配置并验证的正式公网路线生成二维码。/)
+
+  // AI 连接这条线：首启卡片、设置页用同一个组件，都能看到 CLAUDE.md / AGENTS.md 规则状态
+  assert.match(onboarding, /<McpClientSettings compact \/>/)
+  assert.match(settingsTab, /<McpClientSettings show-manual \/>/)
+  assert.match(clients, /rules_path/)
+  assert.match(clients, /rulesStateText\(client\.rules_state\)/)
+  assert.match(clients, /<div v-if="rulesClients\.length > 0"/)
+  assert.match(clients, /'connect_mcp_clients'/)
+  assert.match(clients, /'get_mcp_client_overview'/)
+  // 首次使用引导第 1 步用自己的 driver，至少说明会写调用规则
+  assert.match(firstRunGuide, /~\/\.claude\/CLAUDE\.md、~\/\.codex\/AGENTS\.md/)
+
+  // 列表外的客户端：两个复制按钮，不再单独提 VS Code
+  assert.match(clients, /复制核心系统提示词/)
+  assert.match(clients, />\s*复制 MCP 配置\s*</)
+  assert.match(clients, /RULES_FILE_HINT/)
+  assert.doesNotMatch(clients, /VS Code|buildVsCodeMcpConfig|copilot-instructions/)
+
+  // 核心系统提示词只有一份来源
+  assert.match(corePrompt, /generateFullPrompt\(promptTools\.value\)/)
+  assert.match(clients, /useCoreSystemPrompt\(\)/)
+  assert.match(handbook, /useCoreSystemPrompt\(\)/)
+  assert.doesNotMatch(clients, /CORE_RULES|generateFullPrompt/)
+  assert.equal((handbook.match(/>\s*核心系统提示词\s*</g) || []).length, 1)
+})
+
 test('bootstrap branches only on persisted formal route status', async () => {
   const setup = await readFile(new URL('./useMobileConnectionSetup.ts', import.meta.url), 'utf8')
   const bootstrapStart = setup.indexOf('async function bootstrap()')
@@ -317,6 +363,21 @@ test('bootstrap branches only on persisted formal route status', async () => {
   assert.ok(pairingRead > bootstrapStart)
   assert.ok(formalDecision > pairingRead)
   assert.doesNotMatch(setup.slice(bootstrapStart), /readQuickTunnelStatus/)
+})
+
+test('verified Aliyun IP route permits a matching secure pairing candidate', () => {
+  assert.equal(resolveMobileConnectionBootstrap({
+    formal_route: {
+      ...healthyFormalRoute,
+      transport: 'aliyun_ssh_reverse_tunnel',
+      base_url: 'https://203.0.113.50:8443',
+    },
+    candidates: [{
+      ...healthyPublic,
+      base_url: 'https://203.0.113.50:8443',
+      ws_url: 'wss://203.0.113.50:8443/ws',
+    }],
+  }), 'issue_pairing')
 })
 
 test('wizard reopens only an unclaimed fresh QR without preparing the bridge again', async () => {

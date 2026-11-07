@@ -36,9 +36,9 @@ const PROXY_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 const TASK_EVENT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const HUI_SKILL_NAME: &str = "hui";
-const HUI_SKILL_RELATIVE_PATH: &str = ".cunzhi-knowledge/prompts/skills/hui/SKILL.md";
+const HUI_SKILL_RELATIVE_PATH: &str = "prompts/skills/hui/SKILL.md";
 const XI_SKILL_NAME: &str = "xi";
-const XI_SKILL_RELATIVE_PATH: &str = ".cunzhi-knowledge/prompts/skills/xi/SKILL.md";
+const XI_SKILL_RELATIVE_PATH: &str = "prompts/skills/xi/SKILL.md";
 static CODEX_LIVE_SESSION_SLOTS: Semaphore = Semaphore::const_new(1);
 
 const CODEX_VOICE_DEVELOPER_INSTRUCTIONS: &str = r#"
@@ -2292,7 +2292,7 @@ pub(super) fn validate_new_codex_task(body: &Value) -> Result<(String, String), 
     Ok((validated_project_path(project)?, prompt.to_string()))
 }
 
-fn validated_project_path(raw: &str) -> Result<String, String> {
+pub(super) fn validated_project_path(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_PROJECT_PATH_BYTES {
         return Err("目标项目路径为空或过长".to_string());
@@ -2881,7 +2881,7 @@ fn requested_voice_skill_input(transcript: &[TranscriptSegment]) -> Option<(&'st
         XI_SKILL_NAME => XI_SKILL_RELATIVE_PATH,
         _ => return None,
     };
-    let skill_path = dirs::home_dir()?.join(relative_path);
+    let skill_path = crate::config::paths::knowledge_root()?.join(relative_path);
     if !skill_path.is_file() {
         return None;
     }

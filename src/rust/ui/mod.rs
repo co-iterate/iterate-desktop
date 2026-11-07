@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod audio_assets;
 pub mod codex_goal_observer;
+pub mod claude_quota;
 pub mod codex_quota;
 pub mod commands;
 pub mod exit;
@@ -20,6 +21,8 @@ pub mod updater;
 pub mod window;
 pub mod window_events;
 pub mod window_registry;
+#[cfg(target_os = "windows")]
+pub mod webview_recovery;
 
 pub use audio::*;
 pub use audio_assets::*;

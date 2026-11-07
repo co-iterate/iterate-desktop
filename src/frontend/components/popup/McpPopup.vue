@@ -8,6 +8,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useShortcuts } from '../../composables/useShortcuts'
 
 import { isExplicitConversationEndInput } from '../../utils/conversationEndCommand'
+import { copySubmissionToClipboard } from '../../utils/submissionClipboard'
 import { stripAutoPrompt } from '../../utils/textUtils'
 import TimelineDotBar from '../conversation/TimelineDotBar.vue'
 import PopupActions from './PopupActions.vue'
@@ -85,6 +86,7 @@ interface PopupInputRef {
   statusText?: string
   updateData: (data: PopupInputData) => void
   getFinalUserInput: () => string
+  flushInput?: () => void
   recordSubmittedInputForAutoPromotion: () => void
   handleQuoteMessage: (messageContent: string) => void
   insertSelectedTextQuote: (selection: PopupTextSelection) => Promise<boolean>
@@ -112,6 +114,7 @@ const loading = ref(false)
 const submitting = ref(false)
 const selectedOptions = ref<string[]>([])
 const userInput = ref('')
+const rawUserInput = ref('')
 const draggedImages = ref<string[]>([])
 const attachedFiles = ref<PopupFileAttachment[]>([])
 const contentRef = ref<PopupContentRef | null>(null)
@@ -134,6 +137,7 @@ function handleAtTrigger() {
 
 // 继续回复配置
 const continueReplyEnabled = ref(true)
+const copySubmissionToClipboardEnabled = ref(false)
 const continuePrompt = ref('请按照最佳实践继续')
 const DEFAULT_LOOP_PROMPT = `进入 GoalRun 目标模式。
 
@@ -415,11 +419,6 @@ const canSubmit = computed(() => {
     || attachedFiles.value.length > 0
 })
 
-// 获取输入组件的状态文本
-const inputStatusText = computed(() => {
-  return inputRef.value?.statusText || '等待输入...'
-})
-
 function handleOpenArtifact(artifact: PopupArtifact) {
   emit('openArtifact', artifact)
 }
@@ -633,6 +632,7 @@ async function scheduleInputFocus(
 function syncInputData(data: PopupInputData) {
   if (data.userInput !== undefined) {
     userInput.value = data.userInput
+    rawUserInput.value = data.rawUserInput ?? data.userInput
   }
   if (data.selectedOptions !== undefined) {
     selectedOptions.value = [...data.selectedOptions]
@@ -693,6 +693,16 @@ function applyTimelinePrefill(payload: TimelinePrefillPayload) {
   flushTimelinePrefill()
 }
 
+function getDraft(): TimelinePrefillPayload {
+  inputRef.value?.flushInput?.()
+  return {
+    userInput: rawUserInput.value,
+    selectedOptions: [...selectedOptions.value],
+    draggedImages: [...draggedImages.value],
+    attachedFiles: attachedFiles.value.map(file => ({ ...file })),
+  }
+}
+
 // 加载继续回复配置
 async function loadReplyConfig() {
   try {
@@ -700,6 +710,7 @@ async function loadReplyConfig() {
     if (config) {
       const replyConfig = config as any
       continueReplyEnabled.value = replyConfig.enable_continue_reply ?? true
+      copySubmissionToClipboardEnabled.value = replyConfig.copy_submission_to_clipboard ?? false
       continuePrompt.value = replyConfig.continue_prompt ?? '请按照最佳实践继续'
       loopPrompt.value = replyConfig.loop_prompt ?? DEFAULT_LOOP_PROMPT
       goalPromptTemplate.value = replyConfig.goal_prompt_template ?? DEFAULT_GOAL_PROMPT_TEMPLATE
@@ -917,20 +928,39 @@ onUnmounted(() => {
 function resetForm() {
   selectedOptions.value = []
   userInput.value = ''
+  rawUserInput.value = ''
   draggedImages.value = []
   attachedFiles.value = []
   submitting.value = false
 }
 
+async function backupCurrentSubmissionToClipboard() {
+  inputRef.value?.flushInput?.()
+  try {
+    await copySubmissionToClipboard({
+      enabled: copySubmissionToClipboardEnabled.value,
+      userInput: rawUserInput.value,
+      selectedOptions: selectedOptions.value,
+      writeText: text => invoke('plugin:clipboard-manager|write_text', { text }),
+    })
+  }
+  catch (error) {
+    console.error('发送内容备份到剪贴板失败:', error)
+    message.warning('未能备份到剪贴板，仍将继续发送')
+  }
+}
+
 // 桌面弹窗统一回复给当前 IDE/MCP 调用方。
 async function handleSubmit() {
+  // 补全关闭时输入框停手后才同步，发送前先取最新正文
+  inputRef.value?.flushInput?.()
   if (!canSubmit.value || submitting.value)
     return
 
   void invoke('timeline_debug_log', {
     location: 'frontend/mcp_popup/handle_submit:start',
     payload: {
-      userInput: userInput.value,
+      userInputLength: userInput.value.length,
       selectedOptions: selectedOptions.value,
       hasInputRef: Boolean(inputRef.value),
       hasRecordAutoPromotion: typeof inputRef.value?.recordSubmittedInputForAutoPromotion === 'function',
@@ -940,6 +970,7 @@ async function handleSubmit() {
   submitting.value = true
 
   try {
+    await backupCurrentSubmissionToClipboard()
     const finalUserInput = buildFinalUserInput(
       inputRef.value?.getFinalUserInput() ?? userInput.value,
       attachedFiles.value,
@@ -984,6 +1015,7 @@ async function handleSubmit() {
 // 处理输入更新
 function handleInputUpdate(data: PopupInputData) {
   userInput.value = data.userInput ?? ''
+  rawUserInput.value = data.rawUserInput ?? data.userInput ?? ''
   selectedOptions.value = data.selectedOptions ?? []
   draggedImages.value = data.draggedImages ?? []
   attachedFiles.value = data.attachedFiles ?? []
@@ -1002,6 +1034,7 @@ async function handleContinue() {
   submitting.value = true
 
   try {
+    await backupCurrentSubmissionToClipboard()
     // 使用新的结构化数据格式
     const response = {
       user_input: continuePrompt.value,
@@ -1180,6 +1213,7 @@ function shouldPrefetchGoalRunHuiSnapshot(goal: string): boolean {
 
 // 处理目标按钮点击：启动 Live Goal，并提交一次非 loop 的目标模式请求。
 async function handleGoalSubmit() {
+  inputRef.value?.flushInput?.()
   if (submitting.value)
     return
 
@@ -1210,6 +1244,7 @@ async function handleGoalSubmit() {
       return
     }
 
+    await backupCurrentSubmissionToClipboard()
     const liveGoalSnapshot = await applyLiveGoalIntent(`/goal ${goalTitle}`)
     const huiSnapshot = shouldPrefetchGoalRunHuiSnapshot(goalText)
       ? await getGoalRunHuiSnapshot(liveGoalSnapshot)
@@ -1257,6 +1292,7 @@ async function handleGoalSubmit() {
 
 defineExpose({
   applyTimelinePrefill,
+  getDraft,
 })
 </script>
 
@@ -1269,9 +1305,9 @@ defineExpose({
       @mousemove="handleTimelineEdgeMouseMove"
       @mouseleave="handleTimelineEdgeMouseLeave"
     >
-      <div class="flex-1 min-h-0 overflow-y-auto scrollbar-thin" @click="handleMiddleZoneClick">
+      <div class="flex-1 min-h-0 overflow-y-auto scrollbar-thin flex flex-col" @click="handleMiddleZoneClick">
         <!-- 消息内容 - 允许选中 -->
-        <div class="mx-2 mt-2 mb-1 px-4 py-3 bg-black-100 rounded-lg select-text" data-guide="popup-content">
+        <div class="mx-2 mt-2 mb-1 px-4 py-3 bg-black-100 rounded-lg select-text flex-shrink-0" data-guide="popup-content">
           <PopupContent
             ref="contentRef"
             :request="request"
@@ -1284,8 +1320,8 @@ defineExpose({
           />
         </div>
 
-        <!-- 输入和选项 - 允许选中 -->
-        <div class="px-4 pb-3 bg-black select-text">
+        <!-- 输入和选项 - 允许选中；撑满剩余高度，让输入框吃掉空白 -->
+        <div class="px-4 pb-3 bg-black select-text flex flex-col flex-grow flex-shrink-0">
           <PopupInput
             ref="inputRef"
             :request="request"
@@ -1320,7 +1356,7 @@ defineExpose({
     <div class="mt-auto flex-shrink-0 bg-black-100 border-t-2 border-black-200" data-guide="popup-actions">
       <PopupActions
         :request="request" :loading="loading" :submitting="submitting" :can-submit="canSubmit"
-        :continue-reply-enabled="continueReplyEnabled" :input-status-text="inputStatusText"
+        :continue-reply-enabled="continueReplyEnabled"
         @submit="handleSubmit" @continue="handleContinue" @goal-submit="handleGoalSubmit"
       />
     </div>
