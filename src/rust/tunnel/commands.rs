@@ -3,7 +3,7 @@ use super::manager::{self, TunnelStatus};
 use crate::config::{
     load_standalone_config, save_config, save_standalone_config, AppConfig, AppState,
     CloudflareConfig, CloudflareVerificationResult, FormalMobileRouteConfig,
-    FormalMobileRouteVerification,
+    FormalMobileRouteVerification, KnownFormalMobileRoute,
 };
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
@@ -1106,8 +1106,13 @@ pub fn selected_formal_transport() -> Option<String> {
     load_standalone_config().ok()?.mobile_config.formal_route.map(|route| route.transport)
 }
 
+/// 用户自己维护的路线（托管 frp、Tailscale Serve）：iterate 不启动 Quick Tunnel、
+/// 不重放 Funnel，只用通过身份校验的这一条地址生成二维码。
 pub fn self_hosted_formal_route_selected() -> bool {
-    selected_formal_transport().as_deref() == Some("self_hosted_frp")
+    matches!(
+        selected_formal_transport().as_deref(),
+        Some("self_hosted_frp" | super::tailscale_serve::TRANSPORT)
+    )
 }
 
 pub fn cloudflare_formal_recovery_allowed() -> bool {
@@ -1120,6 +1125,43 @@ pub fn cloudflare_formal_recovery_allowed() -> bool {
     }
 }
 
+fn publicly_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !matches!(a, 0 | 10 | 127 | 224..=255)
+        && !(a == 100 && (64..=127).contains(&b))
+        && !(a == 169 && b == 254)
+        && !(a == 172 && (16..=31).contains(&b))
+        && !(a == 192 && ((b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99) || b == 168))
+        && !(a == 198 && ((b == 18 || b == 19) || (b == 51 && c == 100)))
+        && !(a == 203 && b == 0 && c == 113)
+}
+
+pub(crate) fn aliyun_ip_origin_is_public(value: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(value.trim().trim_end_matches('/')) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed
+            .host_str()
+            .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+            .is_some_and(publicly_routable_ipv4)
+}
+
+fn normalize_formal_mobile_route_base_url(transport: &str, value: &str) -> Result<String, String> {
+    if transport == "aliyun_ssh_reverse_tunnel" && !aliyun_ip_origin_is_public(value) {
+        return Err("formal_route_ip_origin_invalid".to_string());
+    }
+    if transport == super::tailscale_serve::TRANSPORT && !super::tailscale_serve::origin_is_valid(value) {
+        return Err("formal_route_tailscale_origin_invalid".to_string());
+    }
+    manager::normalize_public_hostname(value)
+}
+
 pub fn configured_formal_mobile_route() -> Option<FormalMobileRouteConfig> {
     effective_formal_mobile_route(load_standalone_config().ok()?)
 }
@@ -1128,7 +1170,7 @@ fn effective_formal_mobile_route(config: AppConfig) -> Option<FormalMobileRouteC
     if let Some(route) = config.mobile_config.formal_route {
         if route.schema_version == 1
             && super::formal_transport::is_supported_formal_transport(&route.transport)
-            && manager::normalize_public_hostname(&route.base_url).is_ok()
+            && normalize_formal_mobile_route_base_url(&route.transport, &route.base_url).is_ok()
         {
             return Some(route);
         }
@@ -1252,7 +1294,7 @@ async fn register_formal_mobile_route_guarded(
         "legacy_migration" => "legacy_migration",
         _ => return Err("formal_route_source_invalid".to_string()),
     };
-    let base_url = manager::normalize_public_hostname(base_url)?;
+    let base_url = normalize_formal_mobile_route_base_url(transport, base_url)?;
     let initial_config = load_standalone_config().map_err(|error| error.to_string())?;
     let previous_effective = effective_formal_mobile_route(initial_config.clone());
     let previous_route = initial_config.mobile_config.formal_route;
@@ -1313,6 +1355,10 @@ async fn register_formal_mobile_route_guarded(
             error_code: None,
         }),
     };
+    if let Some(previous) = config.mobile_config.formal_route.clone() {
+        remember_known_formal_route(&mut config, &previous);
+    }
+    remember_known_formal_route(&mut config, &route);
     config.mobile_config.formal_route = Some(route.clone());
     save_standalone_config(&config).map_err(|error| error.to_string())?;
     Ok(FormalMobileRouteStatus {
@@ -1357,6 +1403,106 @@ pub async fn verify_formal_mobile_route() -> Result<FormalMobileRouteStatus, Str
         save_standalone_config(&config).map_err(|error| error.to_string())?;
     }
     Ok(status)
+}
+
+const MAX_KNOWN_FORMAL_ROUTES: usize = 8;
+
+/// 记住用过的正式路线（最新的在前），只存类型和地址
+fn remember_known_formal_route(config: &mut AppConfig, route: &FormalMobileRouteConfig) {
+    if !super::formal_transport::is_supported_formal_transport(&route.transport) {
+        return;
+    }
+    let known = &mut config.mobile_config.known_formal_routes;
+    known.retain(|item| !(item.transport == route.transport && item.base_url == route.base_url));
+    known.insert(
+        0,
+        KnownFormalMobileRoute {
+            transport: route.transport.clone(),
+            base_url: route.base_url.clone(),
+            last_verified_at: route.last_verified_at.clone(),
+        },
+    );
+    known.truncate(MAX_KNOWN_FORMAL_ROUTES);
+}
+
+#[derive(Debug, Serialize)]
+pub struct MobileRouteOptions {
+    pub current: FormalMobileRouteStatus,
+    /// 除当前路线外、之前验证过的路线
+    pub known: Vec<KnownFormalMobileRoute>,
+    pub tailscale: super::tailscale_serve::TailscaleServeStatus,
+}
+
+/// 「管理连接 → 更换连接方式」需要的全部信息
+#[tauri::command]
+pub async fn get_mobile_route_options() -> MobileRouteOptions {
+    let (current, tailscale) = tokio::join!(
+        get_formal_mobile_route_status(),
+        super::tailscale_serve::inspect(),
+    );
+    let known = load_standalone_config()
+        .map(|config| config.mobile_config.known_formal_routes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| {
+            super::formal_transport::is_supported_formal_transport(&item.transport)
+                && !(current.transport.as_deref() == Some(item.transport.as_str())
+                    && current.base_url.as_deref() == Some(item.base_url.as_str()))
+        })
+        .collect();
+    MobileRouteOptions { current, known, tailscale }
+}
+
+/// 切换正式路线。只接受 Tailscale（地址从本机读取）或之前验证过的路线；
+/// 新路线必须先通过身份验证，失败时保留当前路线。
+#[tauri::command]
+pub async fn switch_formal_mobile_route(
+    transport: String,
+    base_url: String,
+) -> Result<FormalMobileRouteStatus, String> {
+    if transport == super::tailscale_serve::TRANSPORT {
+        return register_tailscale_serve_route().await;
+    }
+    let known = load_standalone_config()
+        .map_err(|error| error.to_string())?
+        .mobile_config
+        .known_formal_routes
+        .into_iter()
+        .any(|item| item.transport == transport && item.base_url == base_url);
+    if !known {
+        return Err("formal_route_not_known".to_string());
+    }
+    register_formal_mobile_route(&transport, &base_url, "manual_adopt").await
+}
+
+#[tauri::command]
+pub async fn get_tailscale_serve_status() -> super::tailscale_serve::TailscaleServeStatus {
+    super::tailscale_serve::inspect().await
+}
+
+/// Tailscale 引导第 3 步的「帮我执行」：用户明确点击后才运行 tailscale serve --bg 8080
+#[tauri::command]
+pub async fn start_tailscale_serve() -> Result<super::tailscale_serve::TailscaleServeStatus, String> {
+    super::tailscale_serve::start_serve().await
+}
+
+/// Tailscale 引导的「帮我关掉 Funnel」：用户明确点击后才运行 tailscale funnel reset
+#[tauri::command]
+pub async fn reset_tailscale_funnel() -> Result<super::tailscale_serve::TailscaleServeStatus, String> {
+    super::tailscale_serve::reset_funnel().await
+}
+
+/// 只登记用户已经在 tailnet 内配好的 serve；地址从本机 Tailscale 读取，不接受前端传入
+#[tauri::command]
+pub async fn register_tailscale_serve_route() -> Result<FormalMobileRouteStatus, String> {
+    let status = super::tailscale_serve::inspect().await;
+    if let Some(blocker) = status.blocker {
+        return Err(blocker);
+    }
+    let base_url = status
+        .base_url
+        .ok_or_else(|| "tailscale_serve_not_configured".to_string())?;
+    register_formal_mobile_route(super::tailscale_serve::TRANSPORT, &base_url, "manual_adopt").await
 }
 
 #[tauri::command]
@@ -1866,6 +2012,41 @@ pub async fn verify_cloudflare_guided_config(
 
 #[cfg(test)]
 mod tests {
+    fn route(transport: &str, base_url: &str) -> FormalMobileRouteConfig {
+        FormalMobileRouteConfig {
+            schema_version: 1,
+            transport: transport.to_string(),
+            base_url: base_url.to_string(),
+            configured_at: String::new(),
+            source: "manual_adopt".to_string(),
+            formal_route_generation: 1,
+            last_verified_at: Some("2026-10-23T00:00:00Z".to_string()),
+            last_verification: None,
+        }
+    }
+
+    #[test]
+    fn known_routes_keep_newest_first_without_duplicates() {
+        let mut config = AppConfig::default();
+        remember_known_formal_route(&mut config, &route("cloudflare_named_tunnel", "https://a.example"));
+        remember_known_formal_route(&mut config, &route("tailscale_serve", "https://mac.tail1.ts.net"));
+        remember_known_formal_route(&mut config, &route("cloudflare_named_tunnel", "https://a.example"));
+        let known: Vec<_> = config.mobile_config.known_formal_routes.iter().map(|item| item.transport.as_str()).collect();
+        assert_eq!(known, ["cloudflare_named_tunnel", "tailscale_serve"]);
+    }
+
+    #[test]
+    fn known_routes_ignore_unsupported_transports_and_cap_length() {
+        let mut config = AppConfig::default();
+        remember_known_formal_route(&mut config, &route("quick_tunnel", "https://x.trycloudflare.com"));
+        assert!(config.mobile_config.known_formal_routes.is_empty());
+        for index in 0..12 {
+            remember_known_formal_route(&mut config, &route("cloudflare_named_tunnel", &format!("https://{index}.example")));
+        }
+        assert_eq!(config.mobile_config.known_formal_routes.len(), MAX_KNOWN_FORMAL_ROUTES);
+        assert_eq!(config.mobile_config.known_formal_routes[0].base_url, "https://11.example");
+    }
+
     use super::*;
     use axum::{
         response::{IntoResponse, Redirect},
@@ -2137,5 +2318,43 @@ mod tests {
         .expect_err("unknown route provenance must be rejected");
 
         assert_eq!(error, "formal_route_source_invalid");
+    }
+
+    #[test]
+    fn aliyun_formal_route_accepts_https_ip_origin_on_configured_port() {
+        for port in [8443, 9443] {
+            let origin = format!("https://8.8.8.8:{port}");
+            assert_eq!(
+                normalize_formal_mobile_route_base_url("aliyun_ssh_reverse_tunnel", &origin),
+                Ok(origin)
+            );
+        }
+        for origin in [
+            "https://example.com:8443",
+            "https://user:secret@8.8.8.8:8443",
+            "https://8.8.8.8:8443/path",
+            "http://8.8.8.8:8443",
+            "https://127.0.0.1:8443",
+            "https://0.1.2.3:8443",
+            "https://10.1.2.3:8443",
+            "https://100.64.1.2:8443",
+            "https://169.254.1.2:8443",
+            "https://172.16.1.2:8443",
+            "https://192.168.1.2:8443",
+            "https://192.0.0.1:8443",
+            "https://192.0.2.1:8443",
+            "https://192.88.99.1:8443",
+            "https://198.18.1.2:8443",
+            "https://198.51.100.2:8443",
+            "https://203.0.113.10:8443",
+            "https://224.0.0.1:8443",
+            "https://240.0.0.1:8443",
+            "https://255.255.255.255:8443",
+        ] {
+            assert!(
+                normalize_formal_mobile_route_base_url("aliyun_ssh_reverse_tunnel", origin)
+                    .is_err()
+            );
+        }
     }
 }

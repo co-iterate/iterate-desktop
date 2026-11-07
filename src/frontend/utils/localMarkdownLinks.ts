@@ -15,6 +15,16 @@ function hasScheme(value: string): boolean {
   return /^[a-z][a-z0-9+.-]*:/i.test(value)
 }
 
+function normalizeWindowsDrivePath(value: string): string {
+  // Markdown/file URLs may spell an absolute drive path as /E:/folder/file.
+  const path = value.replace(/^[/\\]([a-z]:[/\\])/i, '$1')
+  return /^[a-z]:[/\\]/i.test(path) ? path.replace(/\\/g, '/') : path
+}
+
+function isWindowsDrivePath(value: string): boolean {
+  return /^[a-z]:\//i.test(normalizeWindowsDrivePath(value))
+}
+
 function decodeRepeatedly(value: string): string {
   let decoded = value
 
@@ -49,6 +59,9 @@ export function isPotentialLocalMarkdownHref(href: string): boolean {
   if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//'))
     return false
 
+  if (isWindowsDrivePath(trimmed))
+    return true
+
   if (hasScheme(trimmed))
     return trimmed.toLowerCase().startsWith('file://')
 
@@ -70,30 +83,33 @@ export function resolveLocalMarkdownHref(
 
   if (path.toLowerCase().startsWith('file://')) {
     try {
-      path = new URL(path).pathname
+      const url = new URL(path)
+      path = url.hostname && url.hostname !== 'localhost' ? `//${url.hostname}${url.pathname}` : url.pathname
     }
     catch {
       path = path.replace(/^file:\/\//i, '')
     }
   }
 
-  path = decodeRepeatedly(path)
+  path = normalizeWindowsDrivePath(decodeRepeatedly(path))
   if (!path)
     return null
 
-  if (path.startsWith('/'))
+  if (path.startsWith('/') || isWindowsDrivePath(path))
     return { path }
 
-  const normalizedProjectPath = projectPath.trim().replace(/\/+$/, '')
-  const normalizedRelativePath = path.replace(/^\.\/+/, '')
+  const normalizedProjectPath = normalizeWindowsDrivePath(projectPath.trim()).replace(/\/+$/, '')
+  const normalizedRelativePath = (isWindowsDrivePath(normalizedProjectPath) ? path.replace(/\\/g, '/') : path).replace(/^\.\/+/, '')
   return { path: `${normalizedProjectPath}/${normalizedRelativePath}` }
 }
 
 function normalizePathForProjectComparison(path: string): string {
-  const withoutEditorLocation = path.replace(/:(\d+)(?::\d+)?$/, '')
+  const withoutEditorLocation = normalizeWindowsDrivePath(path.replace(/:(\d+)(?::\d+)?$/, ''))
+  const windows = isWindowsDrivePath(withoutEditorLocation)
 
   try {
-    return decodeRepeatedly(new URL(`file://${withoutEditorLocation}`).pathname).replace(/\/+$/, '') || '/'
+    const normalized = decodeRepeatedly(new URL(`file://${windows ? '/' : ''}${withoutEditorLocation}`).pathname).replace(/\/+$/, '') || '/'
+    return windows ? normalized.toLowerCase() : normalized
   }
   catch {
     return withoutEditorLocation.replace(/\/+$/, '') || '/'

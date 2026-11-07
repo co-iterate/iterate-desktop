@@ -33,14 +33,14 @@ fn should_show_main_window_on_launch(args: &[String]) -> bool {
         return true;
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         // Windows 直接双击 iterate.exe 时，默认展示主界面，
         // 避免应用已启动但只剩控制台/隐藏窗口，造成“没打开”的体验。
         args.len() == 1
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         cfg!(debug_assertions)
             && std::env::var("ITERATE_DEV_SHOW_MAIN")
@@ -535,6 +535,13 @@ mod tests {
             "--show-main-window".to_string(),
         ]));
     }
+
+    #[test]
+    fn standalone_popup_waits_for_notification_preference_before_showing() {
+        assert!(!super::should_show_main_window_on_launch(&[
+            "iterate".to_string(), "--mcp-request".to_string(), "{}".to_string(),
+        ]));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -572,7 +579,9 @@ fn forward_macos_native_text_drop(window: &tauri::Window<tauri::Wry>, event: &ta
 
 /// 构建Tauri应用
 pub fn build_tauri_app() -> Builder<tauri::Wry> {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init());
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
@@ -600,6 +609,17 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::ui::global_mute::can_focus_popup_input,
             crate::ui::popup_restore::set_popup_restore_enabled,
             crate::ui::popup_restore::minimize_popup_window,
+            crate::delivery::get_mcp_delivery_status,
+            crate::cross_device::get_cross_device_status,
+            crate::cross_device::sync_cross_device_windows,
+            crate::cross_device::settings_sync::settings_sync_export,
+            crate::cross_device::settings_sync::settings_sync_preview,
+            crate::cross_device::settings_sync::settings_sync_apply,
+            crate::cross_device::set_cross_device_enabled,
+            crate::cross_device::transport::get_cross_device_config,
+            crate::cross_device::transport::generate_cross_device_pairing,
+            crate::cross_device::transport::save_cross_device_config,
+            crate::cross_device::transport::test_cross_device_connection,
             // 基础应用命令
             crate::bridge::auth::get_bridge_desktop_token,
             get_app_info,
@@ -654,6 +674,10 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::mcp::client_install::get_mcp_client_overview,
             crate::mcp::client_install::connect_mcp_clients,
             crate::mcp::client_install::disconnect_mcp_client,
+            crate::mcp::knowledge_starter::get_knowledge_overview,
+            crate::mcp::knowledge_starter::install_knowledge_starter,
+            crate::mcp::knowledge_starter::open_knowledge_dir,
+            crate::mcp::knowledge_starter::set_conversation_logging,
             send_mcp_response,
             crate::conversation::commands::migrate_timeline_image_storage,
             get_cli_args,
@@ -721,6 +745,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::native_speech::hide_speech_overlay_window,
             crate::native_speech::start_native_speech,
             crate::native_speech::stop_native_speech,
+            crate::native_speech::repair_speech_runtime,
             crate::native_speech::set_codex_live_audio_reserved,
             crate::native_speech::commit_speech_text,
             crate::native_speech::paste_text,
@@ -739,6 +764,8 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_new_windsurf_chat_with_content,
             open_codex_project,
             open_codex_thread,
+            crate::ui::commands::open_claude_session,
+            crate::ui::commands::open_agy_session,
             open_new_codex_chat,
             open_new_codex_chat_with_text,
             ack_mcp_request_ready,
@@ -762,7 +789,6 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::relay::control_relay_mac_client,
             // MCP 工具命令
             crate::mcp::tools::ci::commands::execute_ci_tool,
-            crate::mcp::tools::memory::commands::execute_ji_tool,
             // 自定义prompt命令
             get_hui_suggestion_terms,
             get_custom_prompt_config,
@@ -785,6 +811,7 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             unregister_window_instance,
             get_all_window_instances,
             activate_window_instance,
+            get_current_window_pid,
             debug_log,
             timeline_debug_log,
             // 配置管理命令
@@ -803,9 +830,11 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             open_terminal,
             open_in_ide,
             center_window,
+            position_window_left,
             dismiss_standalone_mcp_window,
             activate_app_window,
             probe_codex_automation_permission,
+            probe_terminal_automation_permission,
             exit_app,
             handle_app_exit_request,
             force_exit_app,
@@ -848,6 +877,12 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             crate::tunnel::commands::check_origin_health,
             crate::tunnel::commands::recover_bridge_origin,
             crate::tunnel::managed::ensure_managed_mobile_route,
+            crate::tunnel::commands::get_tailscale_serve_status,
+            crate::tunnel::commands::start_tailscale_serve,
+            crate::tunnel::commands::reset_tailscale_funnel,
+            crate::tunnel::commands::register_tailscale_serve_route,
+            crate::tunnel::commands::get_mobile_route_options,
+            crate::tunnel::commands::switch_formal_mobile_route,
             crate::tunnel::commands::get_cloudflare_guided_config,
             crate::tunnel::commands::save_cloudflare_guided_config,
             crate::tunnel::commands::clear_cloudflare_guided_config,
@@ -964,6 +999,11 @@ fn apply_saved_window_size(app: &tauri::App) {
 
 /// 运行Tauri应用
 pub fn run_tauri_app() {
+    crate::cross_device::transport::start_if_configured();
+    let _cross_mirror_guard = match crate::cross_device::mirror_process_guard() {
+        Ok(guard) => guard,
+        Err(error) => { eprintln!("{error}"); return; }
+    };
     install_android_rustls_crypto_provider();
 
     let args: Vec<String> = std::env::args().collect();

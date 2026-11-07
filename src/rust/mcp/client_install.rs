@@ -35,16 +35,23 @@ pub enum ClientKind {
     ClaudeCode,
     Codex,
     Cursor,
+    Antigravity,
 }
 
 impl ClientKind {
-    pub const ALL: [ClientKind; 3] = [ClientKind::ClaudeCode, ClientKind::Codex, ClientKind::Cursor];
+    pub const ALL: [ClientKind; 4] = [
+        ClientKind::ClaudeCode,
+        ClientKind::Codex,
+        ClientKind::Cursor,
+        ClientKind::Antigravity,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
             ClientKind::ClaudeCode => "claude-code",
             ClientKind::Codex => "codex",
             ClientKind::Cursor => "cursor",
+            ClientKind::Antigravity => "antigravity",
         }
     }
 
@@ -53,6 +60,7 @@ impl ClientKind {
             ClientKind::ClaudeCode => "Claude Code",
             ClientKind::Codex => "Codex",
             ClientKind::Cursor => "Cursor",
+            ClientKind::Antigravity => "Antigravity",
         }
     }
 
@@ -65,6 +73,7 @@ impl ClientKind {
             ClientKind::ClaudeCode => "重新打开 Claude Code 会话后生效",
             ClientKind::Codex => "重启 Codex 后生效",
             ClientKind::Cursor => "重启 Cursor 后生效",
+            ClientKind::Antigravity => "重新打开 agy 或 Antigravity 后生效",
         }
     }
 }
@@ -82,6 +91,14 @@ pub struct ClientStatus {
     pub opted_out: bool,
     pub config_path: String,
     pub configured_command: Option<String>,
+    /// 调用规则文件（Codex：AGENTS.md；Claude Code：CLAUDE.md）；其他客户端没有。
+    pub rules_path: Option<String>,
+    /// installed / manual / missing；没有规则文件的客户端为 None。
+    pub rules_state: Option<String>,
+    /// Claude Code 的权限文件 ~/.claude/settings.json；其他客户端为 None。
+    pub permission_path: Option<String>,
+    /// installed / manual / missing / invalid：call_zhi 是否已在 permissions.allow 免确认。
+    pub permission_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +106,8 @@ pub struct AppLocationStatus {
     pub ok: bool,
     pub bundled_server: Option<String>,
     pub stable_server: String,
+    /// 稳定入口已存在且指向当前 App；手动配置其他客户端时优先用它，否则用 App 包内路径。
+    pub stable_server_ready: bool,
     pub problem: Option<String>,
 }
 
@@ -130,6 +149,8 @@ fn client_config_path(kind: ClientKind) -> Result<PathBuf, String> {
         ClientKind::ClaudeCode => home_dir()?.join(".claude.json"),
         ClientKind::Codex => codex_home()?.join("config.toml"),
         ClientKind::Cursor => home_dir()?.join(".cursor").join("mcp.json"),
+        // agy CLI 与新版 Antigravity 共用的用户级配置（`agy mcp add` 写的就是这里）。
+        ClientKind::Antigravity => home_dir()?.join(".gemini").join("config").join("mcp_config.json"),
     })
 }
 
@@ -140,7 +161,12 @@ pub fn stable_server_path() -> PathBuf {
 fn bundled_server_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe = exe.canonicalize().unwrap_or(exe);
-    Some(exe.with_file_name("mcp-server"))
+    Some(exe.with_file_name(bundled_server_file_name()))
+}
+
+/// Windows 上可执行文件带 `.exe`；少了它，一键接入会一直报“App 包内缺少 mcp-server”。
+fn bundled_server_file_name() -> String {
+    format!("mcp-server{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// App 从 DMG 直接运行或被系统随机化路径（App Translocation）时，路径随时会失效，不能写进客户端配置。
@@ -157,11 +183,13 @@ fn unstable_location_reason(path: &Path) -> Option<&'static str> {
 
 pub fn app_location_status() -> AppLocationStatus {
     let stable_server = stable_server_path().to_string_lossy().to_string();
+    let stable_server_ready = is_current_server_command(&stable_server);
     let Some(bundled) = bundled_server_path() else {
         return AppLocationStatus {
             ok: false,
             bundled_server: None,
             stable_server,
+            stable_server_ready,
             problem: Some("无法定位 iterate 自身的安装位置".to_string()),
         };
     };
@@ -176,6 +204,7 @@ pub fn app_location_status() -> AppLocationStatus {
         ok: problem.is_none(),
         bundled_server: Some(bundled.to_string_lossy().to_string()),
         stable_server,
+        stable_server_ready,
         problem,
     }
 }
@@ -263,6 +292,9 @@ fn is_current_server_command(command: &str) -> bool {
 struct ClientPreferences {
     #[serde(default)]
     opted_out: BTreeMap<String, bool>,
+    /// ~/.claude/settings.json 里的 call_zhi 白名单是 iterate 加的；用户自己加的不记，移除时不删。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    claude_permission_owned: bool,
 }
 
 fn preferences_path() -> PathBuf {
@@ -348,12 +380,19 @@ fn write_config(path: &Path, content: &[u8], expected: Option<&str>) -> Result<(
     Ok(())
 }
 
+fn backup_dir() -> PathBuf {
+    iterate_bridge_state_dir().join("mcp-client-backups")
+}
+
 fn backup_config(kind: ClientKind, path: &Path) -> Result<Option<PathBuf>, String> {
+    backup_config_into(&backup_dir(), kind, path)
+}
+
+fn backup_config_into(dir: &Path, kind: ClientKind, path: &Path) -> Result<Option<PathBuf>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let dir = iterate_bridge_state_dir().join("mcp-client-backups");
-    fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    fs::create_dir_all(dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().trim_start_matches('.').to_string())
@@ -361,7 +400,7 @@ fn backup_config(kind: ClientKind, path: &Path) -> Result<Option<PathBuf>, Strin
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
     let backup = dir.join(format!("{}-{}-{}", kind.id(), stamp, file_name));
     fs::copy(path, &backup).map_err(|e| format!("备份 {} 失败: {e}", path.display()))?;
-    prune_backups(&dir, kind);
+    prune_backups(dir, kind);
     Ok(Some(backup))
 }
 
@@ -598,6 +637,45 @@ pub fn remove_codex_server(text: &str) -> Result<Option<String>, String> {
     Ok(Some(output))
 }
 
+/// 手动配置的 Codex 常漏掉 `tool_timeout_sec`，Codex 默认只等 60 秒，弹窗没回复就被它放弃，
+/// 之后在弹窗里点发送也送不回去。低于这个值的一律补成长等待（覆盖 60/120/600 这类默认或抄来的值）。
+const CODEX_MIN_HEALTHY_TIMEOUT_SECONDS: f64 = 86_400.0;
+
+/// 只修已存在的本地 iterate-zhi 条目的等待时间；没有条目、远程条目、或已足够长时返回 None。
+pub fn heal_codex_timeout(text: &str) -> Result<Option<String>, String> {
+    let mut doc = parse_codex_document(text)?;
+    let Some(servers) = doc.get_mut("mcp_servers") else {
+        return Ok(None);
+    };
+    let Some(key) = CODEX_SERVER_KEYS
+        .into_iter()
+        .find(|key| servers.as_table_like().is_some_and(|t| t.contains_key(key)))
+    else {
+        return Ok(None);
+    };
+    let Some(server) = servers.as_table_like_mut().and_then(|t| t.get_mut(key)) else {
+        return Ok(None);
+    };
+    let Some(table) = server.as_table_like() else {
+        return Ok(None);
+    };
+    if table.contains_key("url") {
+        return Ok(None);
+    }
+    let current = table.get("tool_timeout_sec").and_then(|item| {
+        item.as_integer()
+            .map(|value| value as f64)
+            .or_else(|| item.as_float())
+    });
+    if current.is_some_and(|value| value >= CODEX_MIN_HEALTHY_TIMEOUT_SECONDS) {
+        return Ok(None);
+    }
+    codex_set(server, "tool_timeout_sec", toml_value(CODEX_TIMEOUT_SECONDS as i64));
+    let output = doc.to_string();
+    parse_codex_document(&output)?;
+    Ok(Some(output))
+}
+
 fn codex_configured_command(text: &str) -> Option<String> {
     let doc = text.parse::<DocumentMut>().ok()?;
     let servers = doc.get("mcp_servers")?.as_table_like()?;
@@ -625,6 +703,18 @@ fn find_claude_cli() -> Option<PathBuf> {
         PathBuf::from("/usr/local/bin/claude"),
         home.join(".npm-global/bin/claude"),
         home.join(".bun/bin/claude"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+/// Antigravity CLI（agy）同样按常见安装位置找；额度读取也复用这里。
+pub fn find_agy_cli() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    [
+        home.join(".local/bin/agy"),
+        PathBuf::from("/opt/homebrew/bin/agy"),
+        PathBuf::from("/usr/local/bin/agy"),
     ]
     .into_iter()
     .find(|path| path.is_file())
@@ -685,6 +775,366 @@ fn claude_cli_upsert(cli: &Path, entry: &Value) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// 调用规则（Codex 的 AGENTS.md、Claude Code 的 CLAUDE.md）
+// ---------------------------------------------------------------------------
+
+// Codex 只在模型搜到工具时才把 MCP instructions 拼进工具描述，模型不知道要循环调用 call_zhi；
+// Claude Code 虽然会把 instructions 放进系统提示词，但 VS Code 插件等入口不一定带上。
+// 所以两家都在全局提示词文件里写同一段带标记的规则，断开时整段删掉；标记段外的内容一字不动。
+const CODEX_RULES_BEGIN: &str = "<!-- iterate-zhi:begin（由 iterate 维护；在 iterate 里断开 Codex 会自动删除本段） -->";
+const CLAUDE_RULES_BEGIN: &str =
+    "<!-- iterate-zhi:begin（由 iterate 维护；在 iterate 里断开 Claude Code 会自动删除本段） -->";
+const RULES_END: &str = "<!-- iterate-zhi:end -->";
+/// 用户照说明书手写进 CLAUDE.md 的规则也以这个标题开头；已有时不再追加第二份。
+const RULES_HEADING: &str = "## iterate 交互协议";
+/// Codex 与 Claude Code 共用的一份「iterate 交互协议」。
+const IZHI_RULES_BODY: &str = "## iterate 交互协议
+
+本规则只约束用户直接交互的前台主会话；子代理、后台任务、定时任务不调用 call_zhi。
+
+1. 每次回复都以调用 iterate-zhi 的 `call_zhi` 作为最后一步：完成、等待用户决定或交还控制权时都一样，不要只用文字收尾。
+2. 用户最新消息去除首尾空白后正好是 `zhi` 时，立即调用 `call_zhi`，不先执行其他任务。
+3. `message` 写当前完整结果、状态或待决事项；`project_path` 填当前工作区绝对路径，未知时不要猜；需要选择时把简短、互斥的选项放进 `predefined_options`。
+4. 拿到返回后：有附加图片先看图片；`继续对话: true` 时把用户输入当作新指令继续工作，做完再次调用 `call_zhi`，如此循环；`继续对话: false` 时结束本轮。
+5. `call_zhi` 会一直等用户回复，这是正常的：保持原调用，不要另开第二个调用，也不要用轮询代替。
+6. 删除、覆盖、提交、推送、发布等不可逆操作前，先通过 `call_zhi` 说明影响并取得同意。";
+
+/// 一份由 iterate 维护的全局提示词文件。
+#[derive(Debug, Clone, Copy)]
+struct RulesFile {
+    kind: ClientKind,
+    begin: &'static str,
+    /// 文件里已有用户手写的同名章节（没有 iterate 标记）时不追加，避免同一份规则出现两遍。
+    respect_manual: bool,
+}
+
+const CODEX_RULES: RulesFile = RulesFile {
+    kind: ClientKind::Codex,
+    begin: CODEX_RULES_BEGIN,
+    respect_manual: false,
+};
+
+const CLAUDE_RULES: RulesFile = RulesFile {
+    kind: ClientKind::ClaudeCode,
+    begin: CLAUDE_RULES_BEGIN,
+    respect_manual: true,
+};
+
+fn rules_file(kind: ClientKind) -> Option<RulesFile> {
+    match kind {
+        ClientKind::Codex => Some(CODEX_RULES),
+        ClientKind::ClaudeCode => Some(CLAUDE_RULES),
+        ClientKind::Cursor | ClientKind::Antigravity => None,
+    }
+}
+
+fn rules_path(rules: RulesFile) -> Result<PathBuf, String> {
+    match rules.kind {
+        ClientKind::Codex => Ok(codex_home()?.join("AGENTS.md")),
+        _ => Ok(home_dir()?.join(".claude").join("CLAUDE.md")),
+    }
+}
+
+fn rules_block(begin: &str) -> String {
+    format!("{begin}\n{IZHI_RULES_BODY}\n{RULES_END}")
+}
+
+/// 标记段的字节范围（含两端标记）；只认第一对完整的标记。
+fn rules_span(text: &str, begin: &str) -> Option<(usize, usize)> {
+    let start = text.find(begin)?;
+    let end = text[start..].find(RULES_END)? + start + RULES_END.len();
+    Some((start, end))
+}
+
+/// 已有标记段就原位替换，否则追加到末尾；标记段外的用户内容一字不动。
+fn upsert_rules(text: &str, begin: &str) -> String {
+    let block = rules_block(begin);
+    if let Some((start, end)) = rules_span(text, begin) {
+        return format!("{}{}{}", &text[..start], block, &text[end..]);
+    }
+    let trimmed = text.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{trimmed}\n\n{block}\n")
+    }
+}
+
+/// 删掉标记段及它前面为分隔而补的空行；没有标记段时返回 None。
+fn remove_rules(text: &str, begin: &str) -> Option<String> {
+    let (start, end) = rules_span(text, begin)?;
+    let before = text[..start].trim_end_matches('\n');
+    let after = text[end..].trim_start_matches('\n');
+    Some(match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => format!("{before}\n"),
+        (false, false) => format!("{before}\n\n{after}"),
+    })
+}
+
+/// 没有 iterate 标记、但已有用户手写的「iterate 交互协议」章节。
+fn has_manual_rules(text: &str, begin: &str) -> bool {
+    rules_span(text, begin).is_none()
+        && text.lines().any(|line| line.trim_start().starts_with(RULES_HEADING))
+}
+
+pub fn upsert_codex_rules(text: &str) -> String {
+    upsert_rules(text, CODEX_RULES_BEGIN)
+}
+
+pub fn remove_codex_rules(text: &str) -> Option<String> {
+    remove_rules(text, CODEX_RULES_BEGIN)
+}
+
+pub fn upsert_claude_rules(text: &str) -> String {
+    upsert_rules(text, CLAUDE_RULES_BEGIN)
+}
+
+pub fn remove_claude_rules(text: &str) -> Option<String> {
+    remove_rules(text, CLAUDE_RULES_BEGIN)
+}
+
+/// 规则文件当前状态，给界面显示：installed（有 iterate 标记段）/ manual（用户手写）/ missing。
+fn rules_state(rules: RulesFile, text: &str) -> &'static str {
+    if rules_span(text, rules.begin).is_some() {
+        "installed"
+    } else if rules.respect_manual && has_manual_rules(text, rules.begin) {
+        "manual"
+    } else {
+        "missing"
+    }
+}
+
+enum RulesWritten {
+    /// 已写入或本来就是最新内容。
+    Installed(PathBuf),
+    /// 用户已手写同名章节，没有追加。
+    KeptManual(PathBuf),
+}
+
+fn write_rules(rules: RulesFile) -> Result<RulesWritten, String> {
+    let path = rules_path(rules)?;
+    resolve_write_target(&path)?;
+    let original = read_optional(&path)?;
+    if rules.respect_manual && has_manual_rules(&original, rules.begin) {
+        return Ok(RulesWritten::KeptManual(path));
+    }
+    let updated = upsert_rules(&original, rules.begin);
+    if updated != original {
+        backup_config(rules.kind, &path)?;
+        write_config(&path, updated.as_bytes(), Some(&original))?;
+    }
+    Ok(RulesWritten::Installed(path))
+}
+
+fn delete_rules(rules: RulesFile) -> Result<(), String> {
+    let path = rules_path(rules)?;
+    resolve_write_target(&path)?;
+    let original = read_optional(&path)?;
+    let Some(updated) = remove_rules(&original, rules.begin) else {
+        return Ok(());
+    };
+    backup_config(rules.kind, &path)?;
+    write_config(&path, updated.as_bytes(), Some(&original))
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code 权限白名单（~/.claude/settings.json → permissions.allow）
+// ---------------------------------------------------------------------------
+
+// 新用户第一次 call_zhi 会被 Claude Code 的权限确认拦住（无头模式下直接报
+// “you haven't granted it yet”），zhi 循环第一步就断。一键接入时顺手把 call_zhi 加进用户级白名单。
+// 只放行 call_zhi 这一个工具（与 Codex 只给 tools.call_zhi 设 approval_mode 对齐），
+// 不放行整个 iterate-zhi 服务器：其余工具（checkpoint / sync / task 等）仍按用户自己的权限设置走。
+pub const CLAUDE_ZHI_PERMISSION: &str = "mcp__iterate-zhi__call_zhi";
+/// 用户自己写的、同样覆盖 call_zhi 的规则：整服务器放行或通配。
+const CLAUDE_ZHI_PERMISSION_ALIASES: [&str; 3] = [CLAUDE_ZHI_PERMISSION, "mcp__iterate-zhi", "mcp__iterate-zhi__*"];
+
+/// 与 CLAUDE.md 同目录（同样不读 CLAUDE_CONFIG_DIR，和现有 ~/.claude.json、~/.claude/CLAUDE.md 的写法一致）。
+fn claude_settings_path() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".claude").join("settings.json"))
+}
+
+fn permission_rules<'a>(root: &'a Map<String, Value>, list: &str) -> impl Iterator<Item = &'a str> {
+    root.get("permissions")
+        .and_then(|permissions| permissions.get(list))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+fn covers_call_zhi(rule: &str) -> bool {
+    CLAUDE_ZHI_PERMISSION_ALIASES.contains(&rule.trim())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PermissionEdit {
+    /// 已把 call_zhi 加进 allow，附带写回的完整内容。
+    Added(String),
+    /// allow 里已有覆盖 call_zhi 的规则（我们上次加的，或用户自己加的），不重复写。
+    AlreadyAllowed,
+    /// 用户在 deny / ask 里明确限制过 call_zhi：尊重用户选择，不放宽。
+    UserRestricted,
+}
+
+/// 计算加入白名单后的 settings.json。坏文件（非 JSON、顶层或 permissions / allow 类型不对）一律报错不写。
+pub fn add_claude_permission(text: &str) -> Result<PermissionEdit, String> {
+    let mut root = parse_json_object(text)?;
+    if ["deny", "ask"]
+        .into_iter()
+        .any(|list| permission_rules(&root, list).any(covers_call_zhi))
+    {
+        return Ok(PermissionEdit::UserRestricted);
+    }
+    if permission_rules(&root, "allow").any(covers_call_zhi) {
+        return Ok(PermissionEdit::AlreadyAllowed);
+    }
+    let permissions = match root
+        .entry("permissions")
+        .or_insert_with(|| Value::Object(Map::new()))
+    {
+        Value::Object(permissions) => permissions,
+        _ => return Err("settings.json 中的 permissions 不是对象，为避免破坏原配置已停止写入".to_string()),
+    };
+    match permissions.entry("allow").or_insert_with(|| json!([])) {
+        Value::Array(allow) => allow.push(Value::String(CLAUDE_ZHI_PERMISSION.to_string())),
+        _ => return Err("settings.json 中的 permissions.allow 不是数组，为避免破坏原配置已停止写入".to_string()),
+    }
+    Ok(PermissionEdit::Added(render_json(root)?))
+}
+
+/// 只删 allow 里与 CLAUDE_ZHI_PERMISSION 完全相同的条目；其他条目（含整服务器放行）原样保留。
+/// 没有可删的条目时返回 None。
+pub fn remove_claude_permission(text: &str) -> Result<Option<String>, String> {
+    let mut root = parse_json_object(text)?;
+    let Some(Value::Array(allow)) = root
+        .get_mut("permissions")
+        .and_then(|permissions| permissions.get_mut("allow"))
+    else {
+        return Ok(None);
+    };
+    let before = allow.len();
+    allow.retain(|rule| rule.as_str() != Some(CLAUDE_ZHI_PERMISSION));
+    if allow.len() == before {
+        return Ok(None);
+    }
+    Ok(Some(render_json(root)?))
+}
+
+/// 给界面显示：installed（iterate 加的）/ manual（用户自己设过）/ missing / invalid（文件坏了，不会写）。
+pub fn claude_permission_state(text: &str, owned: bool) -> &'static str {
+    let Ok(root) = parse_json_object(text) else {
+        return "invalid";
+    };
+    let user_restricted = ["deny", "ask"]
+        .into_iter()
+        .any(|list| permission_rules(&root, list).any(covers_call_zhi));
+    let has_ours = permission_rules(&root, "allow").any(|rule| rule == CLAUDE_ZHI_PERMISSION);
+    if user_restricted {
+        "manual"
+    } else if owned && has_ours {
+        "installed"
+    } else if permission_rules(&root, "allow").any(covers_call_zhi) {
+        "manual"
+    } else {
+        "missing"
+    }
+}
+
+fn set_claude_permission_owned(value: bool) -> Result<(), String> {
+    let mut preferences = load_preferences();
+    if preferences.claude_permission_owned == value {
+        return Ok(());
+    }
+    preferences.claude_permission_owned = value;
+    save_preferences(&preferences)
+}
+
+enum PermissionWritten {
+    /// iterate 加的（本次新加，或上次接入时加的仍在）。
+    Installed(PathBuf),
+    /// 用户自己放行或限制过，没有改动。
+    KeptUser(PathBuf),
+}
+
+/// 在指定文件上加白名单。返回写入结果，以及 iterate 是否新加了这一条（需要记为 owned）。
+fn write_claude_permission_at(
+    path: &Path,
+    backups: &Path,
+    owned: bool,
+) -> Result<(PermissionWritten, bool), String> {
+    resolve_write_target(path)?;
+    let original = read_optional(path)?;
+    match add_claude_permission(&original)? {
+        PermissionEdit::Added(updated) => {
+            // 文件不存在时 backup 返回 None（没有可备份的），直接新建。
+            backup_config_into(backups, ClientKind::ClaudeCode, path)?;
+            write_config(path, updated.as_bytes(), Some(&original))?;
+            Ok((PermissionWritten::Installed(path.to_path_buf()), true))
+        }
+        PermissionEdit::AlreadyAllowed if claude_permission_state(&original, owned) == "installed" => {
+            Ok((PermissionWritten::Installed(path.to_path_buf()), false))
+        }
+        PermissionEdit::AlreadyAllowed | PermissionEdit::UserRestricted => {
+            Ok((PermissionWritten::KeptUser(path.to_path_buf()), false))
+        }
+    }
+}
+
+/// 只删 iterate 自己加的那条（owned 为 true 时）；接入前用户就有的同名规则不动，
+/// 与 CLAUDE.md 里手写的 iterate 交互协议同样处理。返回是否真的改了文件。
+fn delete_claude_permission_at(path: &Path, backups: &Path, owned: bool) -> Result<bool, String> {
+    if !owned {
+        return Ok(false);
+    }
+    resolve_write_target(path)?;
+    let original = read_optional(path)?;
+    let Some(updated) = remove_claude_permission(&original)? else {
+        return Ok(false);
+    };
+    backup_config_into(backups, ClientKind::ClaudeCode, path)?;
+    write_config(path, updated.as_bytes(), Some(&original))?;
+    Ok(true)
+}
+
+fn write_claude_permission() -> Result<PermissionWritten, String> {
+    let path = claude_settings_path()?;
+    let owned = load_preferences().claude_permission_owned;
+    let (written, added) = write_claude_permission_at(&path, &backup_dir(), owned)?;
+    if added {
+        // 记下“这一条是 iterate 加的”，移除时只删自己加的。
+        set_claude_permission_owned(true)?;
+    }
+    Ok(written)
+}
+
+fn delete_claude_permission() -> Result<(), String> {
+    let owned = load_preferences().claude_permission_owned;
+    delete_claude_permission_at(&claude_settings_path()?, &backup_dir(), owned)?;
+    if owned {
+        set_claude_permission_owned(false)?;
+    }
+    Ok(())
+}
+
+fn permission_message() -> String {
+    match write_claude_permission() {
+        Ok(PermissionWritten::Installed(path)) => {
+            format!("；已在 {} 允许 call_zhi 免确认调用（{CLAUDE_ZHI_PERMISSION}）", path.display())
+        }
+        Ok(PermissionWritten::KeptUser(path)) => {
+            format!("；{} 里已有你自己设置的 call_zhi 权限，没有改动", path.display())
+        }
+        Err(error) => {
+            log::warn!("写入 Claude Code 权限白名单失败: {error}");
+            format!("；call_zhi 免确认未写入（{error}），第一次调用时 Claude Code 会先请你确认")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 检测 / 状态
 // ---------------------------------------------------------------------------
 
@@ -700,13 +1150,18 @@ fn client_detected(kind: ClientKind) -> bool {
         ClientKind::Cursor => {
             home.join(".cursor").is_dir() || Path::new("/Applications/Cursor.app").is_dir()
         }
+        ClientKind::Antigravity => {
+            find_agy_cli().is_some()
+                || home.join(".gemini").join("config").is_dir()
+                || Path::new("/Applications/Antigravity.app").is_dir()
+        }
     }
 }
 
 fn configured_command(kind: ClientKind, text: &str) -> Option<String> {
     match kind {
         ClientKind::Codex => codex_configured_command(text),
-        ClientKind::ClaudeCode | ClientKind::Cursor => json_configured_command(text),
+        ClientKind::ClaudeCode | ClientKind::Cursor | ClientKind::Antigravity => json_configured_command(text),
     }
 }
 
@@ -720,6 +1175,28 @@ fn client_status(kind: ClientKind, preferences: &ClientPreferences) -> ClientSta
     // 配置本来就指向 iterate 的稳定入口、但入口已失效：这是我们自己的条目，可以放心修复。
     let needs_repair = !points_to_current
         && command.as_deref().map(|c| Path::new(c) == stable_server_path()).unwrap_or(false);
+    let (rules_path_text, rules_state_text) = match rules_file(kind) {
+        Some(rules) => {
+            let path = rules_path(rules).ok();
+            let text = path.as_ref().and_then(|path| fs::read_to_string(path).ok()).unwrap_or_default();
+            (
+                path.map(|p| p.to_string_lossy().to_string()),
+                Some(rules_state(rules, &text).to_string()),
+            )
+        }
+        None => (None, None),
+    };
+    let (permission_path, permission_state) = match kind {
+        ClientKind::ClaudeCode => {
+            let path = claude_settings_path().ok();
+            let text = path.as_ref().and_then(|path| fs::read_to_string(path).ok()).unwrap_or_default();
+            (
+                path.map(|p| p.to_string_lossy().to_string()),
+                Some(claude_permission_state(&text, preferences.claude_permission_owned).to_string()),
+            )
+        }
+        _ => (None, None),
+    };
     ClientStatus {
         id: kind.id().to_string(),
         name: kind.display_name().to_string(),
@@ -730,6 +1207,10 @@ fn client_status(kind: ClientKind, preferences: &ClientPreferences) -> ClientSta
         opted_out: preferences.opted_out.get(kind.id()).copied().unwrap_or(false),
         config_path: path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
         configured_command: command,
+        rules_path: rules_path_text,
+        rules_state: rules_state_text,
+        permission_path,
+        permission_state,
     }
 }
 
@@ -755,7 +1236,7 @@ fn verify_points_to(kind: ClientKind, path: &Path, command: &str) -> Result<(), 
         ClientKind::Codex => {
             parse_codex_document(&text)?;
         }
-        ClientKind::ClaudeCode | ClientKind::Cursor => {
+        ClientKind::ClaudeCode | ClientKind::Cursor | ClientKind::Antigravity => {
             parse_json_object(&text)?;
         }
     }
@@ -780,7 +1261,7 @@ fn connect_client(kind: ClientKind, command: &str) -> Result<Option<PathBuf>, St
     // 坏文件一律不碰：先解析成功，再备份、再写。
     let merged = match kind {
         ClientKind::Codex => Some(merge_codex_config(&original, command)?),
-        ClientKind::Cursor => Some(merge_json_config(&original, command, false)?),
+        ClientKind::Cursor | ClientKind::Antigravity => Some(merge_json_config(&original, command, false)?),
         ClientKind::ClaudeCode => {
             parse_json_object(&original)?;
             None
@@ -872,7 +1353,8 @@ pub fn connect_clients(ids: &[String]) -> Vec<ClientActionResult> {
     };
     let command = stable.to_string_lossy().to_string();
 
-    ids.iter()
+    let results: Vec<ClientActionResult> = ids
+        .iter()
         .map(|id| {
             let Some(kind) = ClientKind::from_id(id) else {
                 return ClientActionResult {
@@ -894,7 +1376,7 @@ pub fn connect_clients(ids: &[String]) -> Vec<ClientActionResult> {
                     id: id.clone(),
                     name: kind.display_name().to_string(),
                     ok: true,
-                    message: kind.restart_hint().to_string(),
+                    message: connected_message(kind),
                     backup_path: backup.map(|p| p.to_string_lossy().to_string()),
                 },
                 Err(error) => ClientActionResult {
@@ -906,13 +1388,96 @@ pub fn connect_clients(ids: &[String]) -> Vec<ClientActionResult> {
                 },
             }
         })
-        .collect()
+        .collect();
+
+    let connected: Vec<ClientKind> = results
+        .iter()
+        .filter(|result| result.ok)
+        .filter_map(|result| ClientKind::from_id(&result.id))
+        .collect();
+    let mut results = results;
+    if !connected.is_empty() {
+        // 首次建库时把说明（含对话记录告知）挂在第一个成功项上，避免每个客户端重复一遍。
+        if let Some(notice) = super::knowledge_starter::ensure_for_clients(&connected) {
+            if let Some(first) = results.iter_mut().find(|result| result.ok) {
+                first.message = format!("{}\n{}", first.message, notice);
+            }
+        }
+    }
+    results
+}
+
+/// MCP 已接入后的提示。Codex / Claude Code 还要写调用规则；规则写失败不回滚 MCP，只在提示里说明。
+/// Claude Code 另外把 call_zhi 加进权限白名单；同样失败不回滚，只在提示里说明。
+fn connected_message(kind: ClientKind) -> String {
+    let mut message = kind.restart_hint().to_string();
+    if let Some(rules) = rules_file(kind) {
+        message.push_str(&match write_rules(rules) {
+            Ok(RulesWritten::Installed(path)) => format!("；已在 {} 写入 call_zhi 调用规则", path.display()),
+            Ok(RulesWritten::KeptManual(path)) => {
+                format!("；{} 里已有你手写的 iterate 交互协议，没有重复写入", path.display())
+            }
+            Err(error) => format!(
+                "；调用规则未写入（{error}），{} 可能不会持续调用 call_zhi",
+                kind.display_name()
+            ),
+        });
+    }
+    if kind == ClientKind::ClaudeCode {
+        message.push_str(&permission_message());
+    }
+    message
+}
+
+/// App 启动时调用：Codex 里已经有本地 iterate-zhi 条目（不管是一键接入还是照文档手动写的）时，
+/// 补上长等待和 AGENTS.md 调用规则，用户不用再自己改配置。用户在 iterate 里断开过 Codex 就不碰。
+pub fn heal_codex_if_configured() {
+    if load_preferences().opted_out.get(ClientKind::Codex.id()).copied().unwrap_or(false) {
+        return;
+    }
+    let _guard = config_write_guard();
+    let Ok(path) = client_config_path(ClientKind::Codex) else {
+        return;
+    };
+    let original = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return,
+    };
+    match codex_configured_command(&original) {
+        Some(command) if !command.is_empty() && !command.starts_with("http") => {}
+        _ => return,
+    }
+    match heal_codex_timeout(&original) {
+        Ok(Some(healed)) => {
+            let outcome = resolve_write_target(&path)
+                .and_then(|_| backup_config(ClientKind::Codex, &path))
+                .and_then(|_| write_config(&path, healed.as_bytes(), Some(&original)));
+            match outcome {
+                Ok(()) => log::info!("已为 Codex 的 iterate-zhi 补上长等待（tool_timeout_sec），重启 Codex 后生效"),
+                Err(error) => log::warn!("补 Codex 长等待失败: {error}"),
+            }
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("Codex 配置无法解析，跳过自动修复: {error}"),
+    }
+    let rules_missing = rules_path(CODEX_RULES)
+        .ok()
+        .map(|rules| read_optional(&rules).map(|text| rules_span(&text, CODEX_RULES_BEGIN).is_none()).unwrap_or(false))
+        .unwrap_or(false);
+    if rules_missing {
+        match write_rules(CODEX_RULES) {
+            Ok(RulesWritten::Installed(rules) | RulesWritten::KeptManual(rules)) => {
+                log::info!("已在 {} 补写 call_zhi 调用规则", rules.display())
+            }
+            Err(error) => log::warn!("补写 Codex 调用规则失败: {error}"),
+        }
+    }
 }
 
 fn remove_entry(kind: ClientKind, text: &str) -> Result<Option<String>, String> {
     match kind {
         ClientKind::Codex => remove_codex_server(text),
-        ClientKind::ClaudeCode | ClientKind::Cursor => remove_json_server(text),
+        ClientKind::ClaudeCode | ClientKind::Cursor | ClientKind::Antigravity => remove_json_server(text),
     }
 }
 
@@ -957,15 +1522,29 @@ pub fn disconnect_client(id: &str) -> ClientActionResult {
     };
     // 条目移除成功后，才记住用户的选择（后续不再自动加回）。
     let result = disconnect_entry(kind).and_then(|backup| {
+        if let Some(rules) = rules_file(kind) {
+            delete_rules(rules)?;
+        }
         set_opted_out(kind, true)?;
         Ok(backup)
     });
+    // 白名单删不掉（settings.json 坏了等）不影响 MCP 条目已移除的结果，只在提示里说明。
+    let permission_note = match (&result, kind) {
+        (Ok(_), ClientKind::ClaudeCode) => match delete_claude_permission() {
+            Ok(()) => String::new(),
+            Err(error) => {
+                log::warn!("移除 Claude Code 权限白名单失败: {error}");
+                format!("；settings.json 里的 {CLAUDE_ZHI_PERMISSION} 未能删除（{error}）")
+            }
+        },
+        _ => String::new(),
+    };
     match result {
         Ok(backup) => ClientActionResult {
             id: id.to_string(),
             name: kind.display_name().to_string(),
             ok: true,
-            message: "已移除，重启客户端后生效".to_string(),
+            message: format!("已移除，重启客户端后生效{permission_note}"),
             backup_path: backup.map(|p| p.to_string_lossy().to_string()),
         },
         Err(error) => ClientActionResult {
@@ -1013,6 +1592,67 @@ mod tests {
 
     fn server<'a>(doc: &'a DocumentMut, key: &str) -> &'a dyn toml_edit::TableLike {
         doc["mcp_servers"][key].as_table_like().expect("server table")
+    }
+
+    // --- Codex：手动配置缺长等待时自动补上 ---
+
+    #[test]
+    fn codex_heal_adds_missing_timeout_and_keeps_everything_else() {
+        let input = "# 手写的注释\n[mcp_servers.iterate-zhi]\ncommand = 'C:\\Users\\username\\AppData\\Local\\iterate\\bin\\mcp-server.exe'\nargs = []\n\n[mcp_servers.other]\ncommand = \"/other\"\n";
+        let output = heal_codex_timeout(input).unwrap().expect("should heal");
+        assert!(output.starts_with("# 手写的注释\n"));
+        let doc = parse(&output);
+        let s = server(&doc, "iterate-zhi");
+        assert_eq!(s.get("tool_timeout_sec").unwrap().as_integer(), Some(315_360_000));
+        assert!(s.get("command").unwrap().as_str().unwrap().ends_with("mcp-server.exe"));
+        assert!(server(&doc, "other").get("tool_timeout_sec").is_none());
+    }
+
+    #[test]
+    fn codex_heal_raises_short_timeouts_only() {
+        let short = "[mcp_servers.\"iterate-zhi\"]\ncommand = \"/x\"\ntool_timeout_sec = 60\n";
+        let healed = heal_codex_timeout(short).unwrap().expect("60s must be raised");
+        assert_eq!(server(&parse(&healed), "iterate-zhi").get("tool_timeout_sec").unwrap().as_integer(), Some(315_360_000));
+
+        for ok in [
+            "[mcp_servers.\"iterate-zhi\"]\ncommand = \"/x\"\ntool_timeout_sec = 315360000.0\n",
+            "[mcp_servers.\"iterate-zhi\"]\ncommand = \"/x\"\ntool_timeout_sec = 604800\n",
+        ] {
+            assert_eq!(heal_codex_timeout(ok).unwrap(), None, "{ok}");
+        }
+    }
+
+    #[test]
+    fn codex_heal_leaves_unrelated_or_remote_configs_alone() {
+        for text in [
+            "",
+            "[mcp_servers.other]\ncommand = \"/other\"\n",
+            "[mcp_servers.\"iterate-zhi\"]\nurl = \"https://example.com/mcp\"\n",
+        ] {
+            assert_eq!(heal_codex_timeout(text).unwrap(), None, "{text}");
+        }
+        assert!(heal_codex_timeout("not = [valid").is_err());
+    }
+
+    #[test]
+    fn codex_heal_supports_legacy_key_and_inline_tables() {
+        let legacy = "[mcp_servers.cunzhi]\ncommand = \"/x\"\n";
+        let healed = heal_codex_timeout(legacy).unwrap().unwrap();
+        assert_eq!(server(&parse(&healed), "cunzhi").get("tool_timeout_sec").unwrap().as_integer(), Some(315_360_000));
+
+        let inline = "mcp_servers = { \"iterate-zhi\" = { command = \"/x\" } }\n";
+        let healed = heal_codex_timeout(inline).unwrap().unwrap();
+        assert_eq!(server(&parse(&healed), "iterate-zhi").get("tool_timeout_sec").unwrap().as_integer(), Some(315_360_000));
+    }
+
+    #[test]
+    fn bundled_server_name_matches_platform_executable() {
+        let name = bundled_server_file_name();
+        if cfg!(windows) {
+            assert_eq!(name, "mcp-server.exe");
+        } else {
+            assert_eq!(name, "mcp-server");
+        }
     }
 
     // --- Codex：覆盖 scripts/merge-codex-mcp-config.test.mjs 的原有场景 ---
@@ -1343,5 +1983,386 @@ command = "/other"
         let link = dir.path().join("mcp-server");
         std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
         assert!(!is_current_server_command(&link.to_string_lossy()));
+    }
+
+    // --- Codex 调用规则（AGENTS.md）---
+
+    #[test]
+    fn codex_rules_created_in_empty_agents_md() {
+        let output = upsert_codex_rules("");
+        assert!(output.starts_with(CODEX_RULES_BEGIN));
+        assert!(output.contains("call_zhi"));
+        assert!(output.ends_with(&format!("{RULES_END}\n")));
+    }
+
+    #[test]
+    fn codex_rules_appended_after_user_content_and_idempotent() {
+        let user = "# 我的规则\n\n- 用中文回答\n";
+        let once = upsert_codex_rules(user);
+        assert!(once.starts_with(user.trim_end()));
+        assert_eq!(upsert_codex_rules(&once), once, "重复接入不应叠加第二段");
+        assert_eq!(once.matches(CODEX_RULES_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn codex_rules_replaced_in_place_keeping_surrounding_text() {
+        let old = format!("前文\n\n{CODEX_RULES_BEGIN}\n旧规则\n{RULES_END}\n\n后文\n");
+        let output = upsert_codex_rules(&old);
+        assert!(output.starts_with("前文\n\n"));
+        assert!(output.ends_with("\n\n后文\n"));
+        assert!(!output.contains("旧规则"));
+        assert!(output.contains(IZHI_RULES_BODY));
+    }
+
+    #[test]
+    fn codex_rules_removal_restores_user_content() {
+        let user = "# 我的规则\n\n- 用中文回答\n";
+        assert_eq!(remove_codex_rules(&upsert_codex_rules(user)).as_deref(), Some(user));
+        assert_eq!(remove_codex_rules(&upsert_codex_rules("")).as_deref(), Some(""));
+
+        let middle = format!("前文\n\n{}\n\n后文\n", rules_block(CODEX_RULES_BEGIN));
+        assert_eq!(remove_codex_rules(&middle).as_deref(), Some("前文\n\n后文\n"));
+    }
+
+    #[test]
+    fn codex_rules_removal_ignores_files_without_block() {
+        assert_eq!(remove_codex_rules("# 我的规则\n"), None);
+        // 只有开始标记、缺结束标记时不动文件，避免误删用户内容。
+        assert_eq!(remove_codex_rules(&format!("{CODEX_RULES_BEGIN}\n用户续写的内容\n")), None);
+    }
+
+    // --- Claude Code 调用规则（CLAUDE.md）---
+
+    #[test]
+    fn claude_rules_share_the_codex_protocol_text() {
+        let codex = upsert_codex_rules("");
+        let claude = upsert_claude_rules("");
+        assert!(claude.starts_with(CLAUDE_RULES_BEGIN));
+        assert!(claude.ends_with(&format!("{RULES_END}\n")));
+        // 两家只有开始标记不同，正文是同一个常量。
+        assert!(codex.contains(IZHI_RULES_BODY) && claude.contains(IZHI_RULES_BODY));
+        assert_eq!(codex.replace(CODEX_RULES_BEGIN, ""), claude.replace(CLAUDE_RULES_BEGIN, ""));
+    }
+
+    #[test]
+    fn claude_rules_created_in_empty_claude_md() {
+        let output = upsert_claude_rules("");
+        assert!(output.contains("call_zhi"));
+        assert_eq!(output.matches(CLAUDE_RULES_BEGIN).count(), 1);
+        assert_eq!(output.matches(RULES_END).count(), 1);
+    }
+
+    #[test]
+    fn claude_rules_appended_after_user_content_and_idempotent() {
+        let user = "# 我的偏好\n\n- 用中文回答\n- 不要用 emoji\n";
+        let once = upsert_claude_rules(user);
+        assert!(once.starts_with(user.trim_end()));
+        let twice = upsert_claude_rules(&once);
+        assert_eq!(twice, once, "重复接入不应叠加第二段");
+        assert_eq!(twice.matches(CLAUDE_RULES_BEGIN).count(), 1);
+        assert_eq!(twice.matches(RULES_HEADING).count(), 1);
+    }
+
+    #[test]
+    fn claude_rules_replaced_in_place_keeping_surrounding_text() {
+        let old = format!("前文\n\n{CLAUDE_RULES_BEGIN}\n旧规则\n{RULES_END}\n\n后文\n");
+        let output = upsert_claude_rules(&old);
+        assert!(output.starts_with("前文\n\n"));
+        assert!(output.ends_with("\n\n后文\n"));
+        assert!(!output.contains("旧规则"));
+        assert!(output.contains(IZHI_RULES_BODY));
+    }
+
+    #[test]
+    fn claude_rules_removal_restores_user_content() {
+        let user = "# 我的偏好\n\n- 用中文回答\n";
+        assert_eq!(remove_claude_rules(&upsert_claude_rules(user)).as_deref(), Some(user));
+        assert_eq!(remove_claude_rules(&upsert_claude_rules("")).as_deref(), Some(""));
+        let middle = format!("前文\n\n{}\n\n后文\n", rules_block(CLAUDE_RULES_BEGIN));
+        assert_eq!(remove_claude_rules(&middle).as_deref(), Some("前文\n\n后文\n"));
+    }
+
+    #[test]
+    fn claude_rules_removal_ignores_files_without_block() {
+        assert_eq!(remove_claude_rules("# 我的偏好\n"), None);
+        assert_eq!(remove_claude_rules(&format!("{CLAUDE_RULES_BEGIN}\n用户续写的内容\n")), None);
+        // Codex 的标记段不归 Claude Code 管，反之亦然。
+        assert_eq!(remove_claude_rules(&upsert_codex_rules("")), None);
+        assert_eq!(remove_codex_rules(&upsert_claude_rules("")), None);
+    }
+
+    #[test]
+    fn claude_rules_state_detects_hand_written_protocol() {
+        let manual = "# 我的偏好\n\n## iterate 交互协议（必须遵守）\n1. 每次回复都调用 call_zhi\n";
+        assert_eq!(rules_state(CLAUDE_RULES, manual), "manual");
+        assert_eq!(rules_state(CLAUDE_RULES, &upsert_claude_rules(manual)), "installed");
+        assert_eq!(rules_state(CLAUDE_RULES, "# 我的偏好\n"), "missing");
+        assert_eq!(rules_state(CLAUDE_RULES, ""), "missing");
+        // Codex 保持原行为：没有标记段就算缺失，接入时照常补写。
+        assert_eq!(rules_state(CODEX_RULES, manual), "missing");
+    }
+
+    // --- Claude Code 权限白名单（~/.claude/settings.json）---
+
+    fn allow_list(text: &str) -> Vec<String> {
+        let root: Value = serde_json::from_str(text).unwrap();
+        root["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn added(edit: PermissionEdit) -> String {
+        match edit {
+            PermissionEdit::Added(text) => text,
+            other => panic!("应当新加白名单，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_entry_is_the_narrow_call_zhi_rule() {
+        assert_eq!(CLAUDE_ZHI_PERMISSION, format!("mcp__{SERVER_NAME}__call_zhi"));
+    }
+
+    #[test]
+    fn permission_added_to_missing_or_empty_settings() {
+        for text in ["", "  \n", "{}"] {
+            let output = added(add_claude_permission(text).unwrap());
+            assert_eq!(allow_list(&output), vec![CLAUDE_ZHI_PERMISSION]);
+            assert!(output.ends_with('\n'));
+        }
+    }
+
+    #[test]
+    fn permission_add_preserves_other_keys_and_entries() {
+        let original = r#"{
+  "model": "opus",
+  "permissions": {
+    "allow": ["Bash(git status)", "mcp__other__tool"],
+    "deny": ["Bash(rm -rf /)"],
+    "defaultMode": "acceptEdits"
+  },
+  "hooks": {"Stop": []},
+  "env": {"FOO": "1"}
+}"#;
+        let output = added(add_claude_permission(original).unwrap());
+        let root: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            allow_list(&output),
+            vec!["Bash(git status)", "mcp__other__tool", CLAUDE_ZHI_PERMISSION]
+        );
+        assert_eq!(root["model"], "opus");
+        assert_eq!(root["permissions"]["deny"], json!(["Bash(rm -rf /)"]));
+        assert_eq!(root["permissions"]["defaultMode"], "acceptEdits");
+        assert_eq!(root["hooks"], json!({"Stop": []}));
+        assert_eq!(root["env"], json!({"FOO": "1"}));
+    }
+
+    #[test]
+    fn permission_add_is_deduped() {
+        let once = added(add_claude_permission("{}").unwrap());
+        assert_eq!(add_claude_permission(&once).unwrap(), PermissionEdit::AlreadyAllowed);
+        // 用户自己的整服务器放行或通配也已覆盖 call_zhi，不再追加更窄的一条。
+        for rule in ["mcp__iterate-zhi", "mcp__iterate-zhi__*", " mcp__iterate-zhi__call_zhi "] {
+            let text = json!({"permissions": {"allow": [rule]}}).to_string();
+            assert_eq!(add_claude_permission(&text).unwrap(), PermissionEdit::AlreadyAllowed, "{rule}");
+        }
+    }
+
+    #[test]
+    fn permission_add_respects_user_deny_or_ask() {
+        for list in ["deny", "ask"] {
+            let text = json!({"permissions": {list: ["mcp__iterate-zhi__call_zhi"]}}).to_string();
+            assert_eq!(add_claude_permission(&text).unwrap(), PermissionEdit::UserRestricted);
+            assert_eq!(claude_permission_state(&text, false), "manual");
+        }
+    }
+
+    #[test]
+    fn permission_add_refuses_invalid_settings() {
+        for text in [
+            "{ not json",
+            "[]",
+            r#"{"permissions": []}"#,
+            r#"{"permissions": {"allow": "mcp__iterate-zhi__call_zhi,Bash"}}"#,
+        ] {
+            assert!(add_claude_permission(text).is_err(), "{text}");
+        }
+        assert_eq!(claude_permission_state("{ not json", false), "invalid");
+    }
+
+    #[test]
+    fn permission_remove_only_drops_our_exact_entry() {
+        let text = json!({
+            "permissions": {"allow": ["Bash(ls)", CLAUDE_ZHI_PERMISSION, "mcp__iterate-zhi", "mcp__other__call_zhi"]},
+            "model": "opus"
+        })
+        .to_string();
+        let output = remove_claude_permission(&text).unwrap().unwrap();
+        assert_eq!(allow_list(&output), vec!["Bash(ls)", "mcp__iterate-zhi", "mcp__other__call_zhi"]);
+        assert_eq!(serde_json::from_str::<Value>(&output).unwrap()["model"], "opus");
+        assert_eq!(remove_claude_permission(&output).unwrap(), None);
+        assert_eq!(remove_claude_permission("").unwrap(), None);
+        assert_eq!(remove_claude_permission(r#"{"model":"opus"}"#).unwrap(), None);
+        assert!(remove_claude_permission("{ not json").is_err());
+    }
+
+    #[test]
+    fn permission_state_distinguishes_ours_from_users() {
+        let ours = added(add_claude_permission("{}").unwrap());
+        assert_eq!(claude_permission_state(&ours, true), "installed");
+        assert_eq!(claude_permission_state(&ours, false), "manual");
+        assert_eq!(claude_permission_state(r#"{"permissions":{"allow":["mcp__iterate-zhi"]}}"#, true), "manual");
+        assert_eq!(claude_permission_state("", false), "missing");
+        assert_eq!(claude_permission_state(r#"{"permissions":{"allow":["Bash(ls)"]}}"#, true), "missing");
+    }
+
+    #[test]
+    fn permission_file_round_trip_backs_up_dedupes_and_removes_only_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let settings = dir.path().join(".claude").join("settings.json");
+
+        // 1. 文件不存在：新建，没有可备份的原文件
+        let (written, added_now) = write_claude_permission_at(&settings, &backups, false).unwrap();
+        assert!(matches!(written, PermissionWritten::Installed(_)));
+        assert!(added_now);
+        assert_eq!(allow_list(&fs::read_to_string(&settings).unwrap()), vec![CLAUDE_ZHI_PERMISSION]);
+        assert!(!backups.exists());
+
+        // 2. 再点一次：不重复、不改文件、不再备份
+        let before = fs::read_to_string(&settings).unwrap();
+        let (written, added_now) = write_claude_permission_at(&settings, &backups, true).unwrap();
+        assert!(matches!(written, PermissionWritten::Installed(_)));
+        assert!(!added_now);
+        assert_eq!(fs::read_to_string(&settings).unwrap(), before);
+        assert!(!backups.exists());
+
+        // 3. 已有用户配置：先备份原文，再追加；其他内容保留
+        let user = "{\n  \"permissions\": {\n    \"allow\": [\"Bash(ls)\"]\n  },\n  \"model\": \"opus\"\n}\n";
+        fs::write(&settings, user).unwrap();
+        let (_, added_now) = write_claude_permission_at(&settings, &backups, true).unwrap();
+        assert!(added_now);
+        let backup_files: Vec<_> = fs::read_dir(&backups).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(backup_files.len(), 1);
+        let backup_name = backup_files[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(backup_name.starts_with("claude-code-") && backup_name.ends_with("-settings.json"), "{backup_name}");
+        assert_eq!(fs::read_to_string(&backup_files[0]).unwrap(), user);
+        assert_eq!(allow_list(&fs::read_to_string(&settings).unwrap()), vec!["Bash(ls)", CLAUDE_ZHI_PERMISSION]);
+
+        // 4. 移除：只删我们那条，用户条目和其他键原样
+        // （与 ~/.claude.json 的直接合并一样经 render_json 输出：两格缩进、末尾换行；serde_json 未开 preserve_order，键按字母序）
+        assert!(delete_claude_permission_at(&settings, &backups, true).unwrap());
+        let after_remove = fs::read_to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&after_remove).unwrap(),
+            serde_json::from_str::<Value>(user).unwrap()
+        );
+        assert!(after_remove.ends_with("}\n"));
+        assert_eq!(fs::read_dir(&backups).unwrap().count(), 2);
+
+        // 5. 接入前用户就有同一条：不记为 iterate 的，移除时保留
+        let users_own = json!({"permissions": {"allow": [CLAUDE_ZHI_PERMISSION]}}).to_string();
+        fs::write(&settings, &users_own).unwrap();
+        let (written, added_now) = write_claude_permission_at(&settings, &backups, false).unwrap();
+        assert!(matches!(written, PermissionWritten::KeptUser(_)));
+        assert!(!added_now);
+        assert!(!delete_claude_permission_at(&settings, &backups, false).unwrap());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), users_own);
+
+        // 6. 坏 JSON：报错，文件原样，不备份
+        let broken = "{ \"permissions\": { \"allow\": [ ";
+        fs::write(&settings, broken).unwrap();
+        let backups_before = fs::read_dir(&backups).unwrap().count();
+        assert!(write_claude_permission_at(&settings, &backups, false).is_err());
+        assert!(delete_claude_permission_at(&settings, &backups, true).is_err());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), broken);
+        assert_eq!(fs::read_dir(&backups).unwrap().count(), backups_before);
+    }
+
+    #[test]
+    fn preferences_keep_permission_ownership_alongside_opt_outs() {
+        let parsed: ClientPreferences = serde_json::from_str(r#"{"opted_out":{"codex":true}}"#).unwrap();
+        assert!(!parsed.claude_permission_owned, "旧版偏好文件默认不是 iterate 加的");
+        let mut prefs = parsed;
+        prefs.claude_permission_owned = true;
+        let text = serde_json::to_string(&prefs).unwrap();
+        let back: ClientPreferences = serde_json::from_str(&text).unwrap();
+        assert!(back.claude_permission_owned);
+        assert_eq!(back.opted_out.get("codex"), Some(&true));
+    }
+
+    /// 端到端：在隔离的 HOME 里走真实的写入 / 断开路径（不会碰真实的 ~/.claude/CLAUDE.md）。
+    /// 运行：HOME=<临时目录> ITERATE_CONFIG_DIR=<临时目录>/cfg ITERATE_ISOLATED_HOME=<同一临时目录> \
+    ///       cargo test --lib isolated_home_rules_round_trip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn isolated_home_rules_round_trip() {
+        let home = std::env::var("HOME").unwrap();
+        let isolated = std::env::var("ITERATE_ISOLATED_HOME").expect("需要 ITERATE_ISOLATED_HOME");
+        assert_eq!(home, isolated, "HOME 必须指向隔离目录");
+        assert!(std::env::var("ITERATE_CONFIG_DIR").unwrap().starts_with(&isolated));
+        assert_eq!(dirs::home_dir().unwrap(), PathBuf::from(&isolated));
+
+        let claude_md = PathBuf::from(&isolated).join(".claude").join("CLAUDE.md");
+        let agents_md = PathBuf::from(&isolated).join(".codex").join("AGENTS.md");
+        assert_eq!(rules_path(CLAUDE_RULES).unwrap(), claude_md);
+
+        // 1. 文件不存在：创建
+        let _ = fs::remove_file(&claude_md);
+        println!("[1] {}", connected_message(ClientKind::ClaudeCode));
+        let first = fs::read_to_string(&claude_md).unwrap();
+        assert_eq!(first.matches(CLAUDE_RULES_BEGIN).count(), 1);
+        println!("--- CLAUDE.md（新建）---\n{first}--- end ---");
+
+        // 2. 二次接入：内容不变
+        println!("[2] {}", connected_message(ClientKind::ClaudeCode));
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), first);
+
+        // 3. 用户已有内容：追加在后面，保留原文
+        let user = "# 我的偏好\n\n- 用中文回答\n";
+        fs::write(&claude_md, user).unwrap();
+        println!("[3] {}", connected_message(ClientKind::ClaudeCode));
+        println!("[3] {}", connected_message(ClientKind::ClaudeCode));
+        let merged = fs::read_to_string(&claude_md).unwrap();
+        assert!(merged.starts_with(user.trim_end()));
+        assert_eq!(merged.matches(RULES_HEADING).count(), 1);
+        let status = overview().clients.into_iter().find(|c| c.id == "claude-code").unwrap();
+        println!("[3] overview: rules_path={:?} rules_state={:?}", status.rules_path, status.rules_state);
+        assert_eq!(status.rules_state.as_deref(), Some("installed"));
+
+        // 4. 断开：整段删除，用户原文原样留下
+        let settings = PathBuf::from(&isolated).join(".claude").join("settings.json");
+        let with_permission = fs::read_to_string(&settings).unwrap();
+        println!("--- settings.json（接入后）---\n{with_permission}--- end ---");
+        assert_eq!(with_permission.matches(CLAUDE_ZHI_PERMISSION).count(), 1, "多次接入只留一条");
+        assert_eq!(status.permission_state.as_deref(), Some("installed"));
+        let result = disconnect_client("claude-code");
+        println!("[4] disconnect ok={} {}", result.ok, result.message);
+        assert!(result.ok);
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), user);
+        assert!(!fs::read_to_string(&settings).unwrap().contains(CLAUDE_ZHI_PERMISSION));
+
+        // 5. 手写过同名章节：不重复写入，断开时也不动
+        let manual = "## iterate 交互协议（必须遵守）\n1. 每次回复都调用 call_zhi\n";
+        fs::write(&claude_md, manual).unwrap();
+        println!("[5] {}", connected_message(ClientKind::ClaudeCode));
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), manual);
+        assert!(disconnect_client("claude-code").ok);
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), manual);
+
+        // 6. Codex 走同一套函数，写 AGENTS.md
+        fs::create_dir_all(agents_md.parent().unwrap()).unwrap();
+        fs::write(&agents_md, "# codex 偏好\n").unwrap();
+        println!("[6] {}", connected_message(ClientKind::Codex));
+        println!("[6] {}", connected_message(ClientKind::Codex));
+        let codex = fs::read_to_string(&agents_md).unwrap();
+        assert_eq!(codex.matches(CODEX_RULES_BEGIN).count(), 1);
+        assert!(codex.contains(IZHI_RULES_BODY));
+        assert!(disconnect_client("codex").ok);
+        assert_eq!(fs::read_to_string(&agents_md).unwrap(), "# codex 偏好\n");
+        println!("[ok] 隔离 HOME 端到端通过：{isolated}");
     }
 }

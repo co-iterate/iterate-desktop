@@ -16,16 +16,16 @@ use super::tools::cron_manage::CronManageTool;
 use super::tools::task::TaskTool;
 use super::tools::web_fetch::WebFetchTool;
 use super::tools::{
-    CiTool, DispatchTool, InteractionTool, MemoryTool, PhoneActionTool, PtyExecTool, SmartTool,
+    CiTool, DispatchTool, InteractionTool, PhoneActionTool, PtyExecTool, SmartTool,
 };
 use super::types::{
-    AskSmartFriendRequest, CiRequest, JiyiRequest, PaiRequest, PtyExecRequest, ZhiRequest,
+    AskSmartFriendRequest, CiRequest, PaiRequest, PtyExecRequest, ZhiRequest,
 };
 use crate::config::load_standalone_config;
 use crate::{log_debug, log_important};
 
 /// 需要 zhi 前置确认的工具（写入/危险操作）
-const TOOLS_REQUIRING_ZHI: &[&str] = &["ji", "pai", "cron_manage"];
+const TOOLS_REQUIRING_ZHI: &[&str] = &["pai", "cron_manage"];
 
 /// zhi 授权有效期（秒）
 const ZHI_AUTH_TIMEOUT_SECS: u64 = 300; // 5 分钟
@@ -186,41 +186,6 @@ impl ServerHandler for ZhiServer {
                 input_schema: Arc::new(schema_map),
                 annotations: None,
             });
-        }
-
-        // 记忆管理工具 - 仅在启用时添加
-        if self.is_tool_enabled("ji") {
-            let ji_schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "操作类型：记忆(添加记忆), 回忆(获取项目信息), 沉淀(写入knowledge), 摘要(添加会话摘要)"
-                    },
-                    "project_path": {
-                        "type": "string",
-                        "description": "项目路径（必需）"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "记忆内容（记忆操作时必需）"
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "记忆分类：rule(规范规则), preference(用户偏好), pattern(最佳实践), context(项目上下文)"
-                    }
-                },
-                "required": ["action", "project_path"]
-            });
-
-            if let serde_json::Value::Object(schema_map) = ji_schema {
-                tools.push(Tool {
-                    name: Cow::Borrowed("ji"),
-                    description: Some(Cow::Borrowed("全局记忆管理工具。支持 4 种 action：回忆/记忆/沉淀/摘要。必须绑定 git 根目录。用于存储开发规范、用户偏好和最佳实践。")),
-                    input_schema: Arc::new(schema_map),
-                    annotations: None,
-                });
-            }
         }
 
         // 提示词库搜索工具 - 仅在启用时添加
@@ -712,27 +677,6 @@ impl ServerHandler for ZhiServer {
                 }
 
                 result
-            }
-            "ji" => {
-                // 检查记忆管理工具是否启用
-                if !self.is_tool_enabled("ji") {
-                    return Err(McpError::internal_error(
-                        "记忆管理工具已被禁用".to_string(),
-                        None,
-                    ));
-                }
-
-                // 解析请求参数
-                let arguments_value = request
-                    .arguments
-                    .map(serde_json::Value::Object)
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-                let ji_request: JiyiRequest = serde_json::from_value(arguments_value)
-                    .map_err(|e| McpError::invalid_params(format!("参数解析失败: {}", e), None))?;
-
-                // 调用记忆工具
-                MemoryTool::jiyi(ji_request).await
             }
             "pai" => {
                 // 检查 Pai Room 编排工具是否启用

@@ -3,9 +3,6 @@
 /// iterate 工具标识符
 pub const TOOL_ZHI: &str = "zhi";
 
-/// 记忆管理工具标识符
-pub const TOOL_JI: &str = "ji";
-
 /// 代码搜索工具标识符
 pub const TOOL_SOU: &str = "sou";
 
@@ -36,7 +33,6 @@ pub const TOOL_CRON_MANAGE: &str = "cron_manage";
 /// 默认启用的工具列表
 pub const DEFAULT_ENABLED_TOOLS: &[&str] = &[
     TOOL_ZHI,
-    TOOL_JI,
     TOOL_SOU,
     TOOL_PAI,
     TOOL_XI,
@@ -49,6 +45,9 @@ pub const DEFAULT_ENABLED_TOOLS: &[&str] = &[
 
 /// 继续回复默认启用状态
 pub const DEFAULT_CONTINUE_REPLY_ENABLED: bool = true;
+
+/// 发送或继续时将当前输入备份到剪贴板，默认由用户主动开启
+pub const DEFAULT_COPY_SUBMISSION_TO_CLIPBOARD: bool = false;
 
 /// 默认自动继续阈值
 pub const DEFAULT_AUTO_CONTINUE_THRESHOLD: u32 = 1000;
@@ -104,7 +103,6 @@ impl Default for McpConfig {
         Self {
             tools: vec![
                 McpToolConfig::new(TOOL_ZHI, true, false), // iterate 工具不可禁用
-                McpToolConfig::new(TOOL_JI, false, true),  // 记忆管理工具可禁用，默认关闭
                 McpToolConfig::new(TOOL_SOU, false, true), // 代码搜索工具可禁用，默认关闭
                 McpToolConfig::new(TOOL_PAI, false, true), // room 编排工具可禁用，默认关闭
                 McpToolConfig::new(TOOL_XI, false, true),  // 经验查找工具可禁用，默认关闭
@@ -182,7 +180,6 @@ pub fn is_valid_tool_id(tool_id: &str) -> bool {
     matches!(
         tool_id,
         TOOL_ZHI
-            | TOOL_JI
             | TOOL_SOU
             | TOOL_PAI
             | TOOL_XI

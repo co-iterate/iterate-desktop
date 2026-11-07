@@ -207,18 +207,35 @@ fn frpc_config(service: &ManagedService, identity: &Identity, enrollment: &Enrol
     Ok(config)
 }
 
+/// 服务端以 `{"error": reason}` 拒绝请求。准入关闭、不在名单要和网络故障分开，界面才能给出对应的下一步。
+fn rejection_code(status: reqwest::StatusCode, body: &[u8]) -> String {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS { return "managed_service_busy".into(); }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        let reason = serde_json::from_slice::<Value>(body).ok()
+            .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned));
+        match reason.as_deref() {
+            Some("enrollment_closed") => return "managed_enrollment_closed".into(),
+            Some("enrollment_not_allowed") => return "managed_enrollment_not_allowed".into(),
+            _ => {}
+        }
+    }
+    "managed_service_unavailable".into()
+}
+
 async fn post_json(service: &ManagedService, client: &reqwest::Client, suffix: &str, body: Value) -> Result<Value, String> {
     let response = client.post(format!("{}{suffix}", service.api_origin())).json(&body).send().await
         .map_err(|_| "managed_service_unavailable")?;
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS { return Err("managed_service_busy".into()); }
-    if !response.status().is_success() { return Err("managed_service_unavailable".into()); }
+    let status = response.status();
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| "managed_service_unavailable")?;
-        if bytes.len() + chunk.len() > 8192 { return Err("managed_service_response_invalid".into()); }
+        if bytes.len() + chunk.len() > 8192 {
+            return Err(if status.is_success() { "managed_service_response_invalid" } else { "managed_service_unavailable" }.into());
+        }
         bytes.extend_from_slice(&chunk);
     }
+    if !status.is_success() { return Err(rejection_code(status, &bytes)); }
     serde_json::from_slice(&bytes).map_err(|_| "managed_service_response_invalid".into())
 }
 
@@ -439,9 +456,10 @@ pub async fn ensure_managed_mobile_route(app: tauri::AppHandle) -> Result<super:
 #[cfg(test)]
 mod tests {
     use super::{
-        is_dns_hostname, managed_service, owned_device_base_url, resolve_managed_service,
+        is_dns_hostname, managed_service, owned_device_base_url, rejection_code, resolve_managed_service,
         ManagedService, MANAGED_CONNECT_HOST, MANAGED_DEVICE_DOMAIN,
     };
+    use reqwest::StatusCode;
 
     #[test]
     fn injected_build_configuration_is_valid() {
@@ -484,6 +502,24 @@ mod tests {
         for bad in ["https://other.example.com", "http://dabc.example.com", "https://dabc.example.com/",
             "https://dabc.example.com.evil.com", "https://dabc.example.com:8443", "https://x@dabc.example.com"] {
             assert!(!owned_device_base_url(&SERVICE, "dabc", bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn admission_rejections_are_distinguished_from_outages() {
+        assert_eq!(rejection_code(StatusCode::FORBIDDEN, br#"{"error":"enrollment_closed"}"#), "managed_enrollment_closed");
+        assert_eq!(rejection_code(StatusCode::FORBIDDEN, br#"{"error":"enrollment_not_allowed"}"#), "managed_enrollment_not_allowed");
+        assert_eq!(rejection_code(StatusCode::TOO_MANY_REQUESTS, br#"{"error":"rate_limited"}"#), "managed_service_busy");
+        // 其他 403 原因、非 JSON、非字符串 error 以及别的状态码，都不能被当成准入关闭。
+        for (status, body) in [
+            (StatusCode::FORBIDDEN, &br#"{"error":"invalid_signature"}"#[..]),
+            (StatusCode::FORBIDDEN, b"<html>forbidden</html>"),
+            (StatusCode::FORBIDDEN, br#"{"error":1}"#),
+            (StatusCode::FORBIDDEN, b""),
+            (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"enrollment_closed"}"#),
+            (StatusCode::BAD_REQUEST, br#"{"error":"invalid_request"}"#),
+        ] {
+            assert_eq!(rejection_code(status, body), "managed_service_unavailable", "{status} {body:?}");
         }
     }
 }

@@ -97,8 +97,8 @@ export function getTheme(themeName: string): GlobalTheme {
 export function applyThemeVariables(themeName: string) {
   const root = document.documentElement
 
-  // 确定实际主题（移除system模式，默认dark）
-  const effectiveTheme = themeName === 'light' ? 'light' : 'dark'
+  // 确定实际主题（移除system模式，默认light）
+  const effectiveTheme = themeName === 'dark' ? 'dark' : 'light'
 
   const colors = themeColors[effectiveTheme as keyof typeof themeColors]
 

@@ -72,28 +72,6 @@ fn default_is_markdown() -> bool {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct JiyiRequest {
-    #[schemars(
-        description = "操作类型：记忆(添加记忆), 回忆(获取项目信息), 沉淀(预览待沉淀内容), 确认沉淀(用户确认后执行), 摘要(添加会话摘要)"
-    )]
-    pub action: String,
-    #[schemars(description = "项目路径（必需）")]
-    pub project_path: String,
-    #[schemars(description = "记忆内容（记忆操作时必需）")]
-    #[serde(default)]
-    pub content: String,
-    #[schemars(
-        description = "记忆分类：rule(规范规则), preference(用户偏好), pattern(最佳实践), context(项目上下文)"
-    )]
-    #[serde(default = "default_category")]
-    pub category: String,
-}
-
-fn default_category() -> String {
-    "context".to_string()
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CiRequest {
     #[schemars(description = "提示词库目录名（如 ci、git、testing），默认为 ci")]
     pub directory: String,
@@ -149,6 +127,22 @@ pub struct PopupRequest {
     pub codex_thread_id: Option<String>,
     #[serde(default)]
     pub codex_deeplink: Option<String>,
+    /// 调用方客户端：`codex` / `claude_code`（P-2026-9373）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pid: Option<u32>,
+    /// 调用方此刻的模型原始 ID / 显示短名（弹窗头部的「clauding · Opus 5.5」）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_model_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_route_id: Option<String>,
     #[serde(default)]
     pub checkpoint_id: Option<String>,
     #[serde(default)]

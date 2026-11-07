@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { computed, ref } from 'vue'
 import { normalizeGhostSuggestionOrder } from '../utils/ghostSuggestionOrdering'
 import { shouldApplyIncomingStore, shouldPreventCacheRollback, storeTimestamp } from '../utils/ghostSuggestionStoreSync'
+import { probeTask } from '../utils/typingStallProbe'
 
 export interface GhostSuggestion {
   id: string
@@ -395,6 +396,9 @@ function setupSyncListener() {
     return
 
   syncListenerReady = true
+  window.addEventListener('iterate:settings-synced', () => {
+    void syncFromSharedFile()
+  })
   window.addEventListener('storage', (event) => {
     if (event.key === STORAGE_KEY)
       reloadFromStorage()
@@ -458,7 +462,9 @@ function setupSharedFileSyncTimer() {
     return
 
   sharedFileSyncTimer = window.setInterval(() => {
-    void syncFromSharedFile()
+    // 补全关闭时不轮询词库文件；窗口重新获得焦点时仍会同步一次
+    if (ghostSuggestionsEnabled.value)
+      void probeTask('ghostFileSync', () => syncFromSharedFile())
   }, SHARED_FILE_SYNC_INTERVAL_MS)
 
   window.addEventListener('focus', () => {

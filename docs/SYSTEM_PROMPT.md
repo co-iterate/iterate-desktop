@@ -2,6 +2,15 @@
 
 这份规则只依赖 iterate 的 MCP 交互能力，不依赖任何个人知识库、私有目录或特定 AI 客户端。
 
+## 需要手动加吗
+
+| 客户端 | 一键接入（iterate「设置 → AI 客户端」）后 | 手动配置时 |
+|---|---|---|
+| Claude Code、Cursor 等 | 不用加：客户端会读取 iterate MCP 自带的调用说明 | 同左；仍想固定规则时可加入 `~/.claude/CLAUDE.md` |
+| Codex | 不用加：一键接入已在 `~/.codex/AGENTS.md` 写入带 `iterate-zhi:begin/end` 标记的规则，断开 Codex 时自动删除 | 把本文「必须遵守的交互协议」加入 `~/.codex/AGENTS.md`，并在 `config.toml` 的 `iterate-zhi` 下写 `tool_timeout_sec = 315360000` |
+
+Codex 不会把 MCP 自带的说明放进系统提示词（只在模型搜到工具时拼进工具描述），所以 Codex 必须靠 AGENTS.md 才会连续调用。
+
 ## 适用范围
 
 - 本规则只约束用户正在查看并直接交互的前台主会话。

@@ -51,6 +51,10 @@ use super::json_cache::{
 };
 use super::json_fields::{json_string_field, nested_metadata_string_field};
 use super::markdown_documents::DocumentRegistry;
+use super::shared_media::{
+    current_media_file, encode_path_segment, media_content_type, parse_byte_range,
+    share_page_html, valid_token, MediaRegistry,
+};
 use super::markdown_images::{
     register_markdown_images_for_mcp_state_payload, registered_markdown_image_path,
 };
@@ -66,6 +70,7 @@ use super::mobile_file_upload::prepare_mcp_action_file_uploads;
 use super::mcp_state_extract::{
     extract_conversation_id_from_mcp_state, extract_project_path_from_mcp_state,
     extract_request_id_from_mcp_state, extract_timeline_route_id_from_mcp_state,
+    mcp_state_has_request_message,
 };
 use super::network_parse::{
     is_tailscale_ipv4, is_valid_ipv4, parse_first_ipv4_line, parse_first_tailscale_ipv4_from_ifconfig,
@@ -114,7 +119,7 @@ use super::route_debug::{
     record_last_active_route, record_last_completed_route, record_last_notification_route,
     route_debug_status_value,
 };
-use super::route_part::normalize_route_part;
+use super::route_part::{normalize_route_part, project_paths_match};
 use super::serve_request_fallback::load_live_serve_request_fallback;
 use super::tailscale_diagnostics::{
     tailscale_dns_name, tailscale_funnel_config_matches,
@@ -127,6 +132,8 @@ use crate::conversation::{
 };
 use crate::log_important;
 use crate::speech_memory;
+use super::speech_audio;
+use super::speech_refine;
 use axum::{
     body::Bytes,
     extract::{
@@ -602,6 +609,7 @@ pub(super) const MCP_ACTION_CACHE_TTL_SECS: i64 = 30 * 60;
 const MCP_STATE_CACHE_TTL_SECS: i64 = 6 * 60 * 60;
 const MCP_ACTION_CACHE_MAX_ENTRIES: usize = 256;
 const MCP_STATE_CACHE_MAX_ENTRIES: usize = 512;
+const CLOSED_MCP_STATE_ROUTE_MAX_ENTRIES: usize = 2048;
 const ROOT_TUNNEL_STATUS_FILE: &str = "/tmp/iterate-root-tunnel-status.json";
 const ROOT_TUNNEL_METRICS_URL: &str = "http://127.0.0.1:60123/metrics";
 const ROOT_TUNNEL_EXPECTED_HA_CONNECTIONS: f64 = 4.0;
@@ -1103,6 +1111,11 @@ pub static MCP_STATE_CACHE: Lazy<Arc<RwLock<HashMap<String, serde_json::Value>>>
 static MCP_STATE_CACHE_TOUCHED_AT: Lazy<
     Arc<RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 > = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+// 已关闭的 serve 请求可能还有短暂存活的回复路由文件：按精确请求号记住“已关闭”，
+// 让 request_sync 和迟到的状态发布都不会把它复活（#44）。
+static CLOSED_MCP_STATE_ROUTES: Lazy<Arc<RwLock<HashMap<String, (String, i64)>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 static ACTIVE_SESSION_REGISTRY: Lazy<Arc<RwLock<HashMap<String, ActiveSessionEntry>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
@@ -2189,6 +2202,12 @@ fn bridge_auth_error_response(error: &str) -> Response {
 }
 
 fn public_anonymous_path_allowed(method: &axum::http::Method, path: &str) -> bool {
+    // Capability URLs for media linked in a message (see handle_shared_media).
+    if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && path.starts_with("/api/shared-media/")
+    {
+        return true;
+    }
     matches!(
         (method, path),
         (&axum::http::Method::GET, "/")
@@ -2463,6 +2482,8 @@ async fn mobile_pairing_command_output(
     let mut command_builder = tokio::process::Command::new(command);
     command_builder
         .args(args)
+        // Tailscale.app 的二进制在没有 TERM 的 launchd 环境里需要它才当 CLI 用；其他命令忽略
+        .env("TAILSCALE_BE_CLI", "1")
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -4048,51 +4069,43 @@ async fn send_apns_notification(
                 return None;
             }
         };
+        // 手机铃铛只决定响不响/震不震：开着带 sound，关了照样弹横幅但不带 sound。
+        // iOS 通知震动跟随 sound，系统设置里该 App 的「声音」须保持打开。
         let notifications_enabled = device_info.notifications_enabled;
-        let apns_push_type = if notifications_enabled {
+        let apns_mode = if notifications_enabled {
             "alert"
         } else {
-            "background"
+            "alert_quiet"
         };
-        let payload = if notifications_enabled {
-            serde_json::json!({
-                "aps": {
-                    "alert": {
-                        "title": title,
-                        "body": body,
-                    },
-                    "sound": "default",
-                    "content-available": 1,
-                },
-                "project_path": project_path,
-                "request_id": request_id,
-                "source": "iterate_bridge",
-                "sent_at": sent_at_rfc3339,
-                "expires_at": expires_at_rfc3339,
-            })
-        } else {
-            serde_json::json!({
-                "aps": {
-                    "content-available": 1,
-                },
-                "project_path": project_path,
-                "request_id": request_id,
-                "source": "iterate_bridge",
-                "sent_at": sent_at_rfc3339,
-                "expires_at": expires_at_rfc3339,
-            })
-        };
+        let mut aps = serde_json::json!({
+            "alert": {
+                "title": title,
+                "body": body,
+            },
+            "content-available": 1,
+            // AI 在等人回复，属于即时通知：专注模式下即使 App 不在允许名单也能放行。
+            // App 没有 time-sensitive 权限时 iOS 会按普通通知处理，不影响送达。
+            "interruption-level": "time-sensitive",
+        });
+        if notifications_enabled {
+            aps["sound"] = serde_json::json!("default");
+        }
+        let payload = serde_json::json!({
+            "aps": aps,
+            "project_path": project_path,
+            "request_id": request_id,
+            "source": "iterate_bridge",
+            "sent_at": sent_at_rfc3339,
+            "expires_at": expires_at_rfc3339,
+        });
         let response = APNS_HTTP_CLIENT
             .post(&url)
             .header("authorization", format!("bearer {}", bearer))
             .header("apns-topic", &config.topic)
-            .header("apns-push-type", apns_push_type)
+            .header("apns-push-type", "alert")
             .header("apns-expiration", &apns_expiration)
             .header("apns-collapse-id", &apns_collapse_id)
-            .header(
-                "apns-priority",
-                if notifications_enabled { "10" } else { "5" },
-            )
+            .header("apns-priority", "10")
             .header("content-type", "application/json")
             .json(&payload)
             .send()
@@ -4105,14 +4118,14 @@ async fn send_apns_notification(
                     request_id,
                     project_path,
                     record_number,
-                    apns_push_type,
+                    apns_mode,
                     environment.as_str(),
                     apns_started_at.elapsed().as_millis()
                 ));
                 log::info!(
                     "[APNs] 远程通知已发送: record={}, mode={}, environment={}",
                     record_number,
-                    apns_push_type,
+                    apns_mode,
                     environment.as_str()
                 );
             }
@@ -4125,7 +4138,7 @@ async fn send_apns_notification(
                     project_path,
                     status,
                     record_number,
-                    apns_push_type,
+                    apns_mode,
                     environment.as_str(),
                     apns_started_at.elapsed().as_millis(),
                     text
@@ -4135,7 +4148,7 @@ async fn send_apns_notification(
                     "[APNs] 远程通知发送失败: status={}, record={}, mode={}, environment={}, body={}",
                     status,
                     record_number,
-                    apns_push_type,
+                    apns_mode,
                     environment.as_str(),
                     text
                 );
@@ -4149,7 +4162,7 @@ async fn send_apns_notification(
                     request_id,
                     project_path,
                     record_number,
-                    apns_push_type,
+                    apns_mode,
                     environment.as_str(),
                     apns_started_at.elapsed().as_millis(),
                     err
@@ -4158,7 +4171,7 @@ async fn send_apns_notification(
                     warn,
                     "[APNs] 请求发送失败: record={}, mode={}, environment={}, error={}",
                     record_number,
-                    apns_push_type,
+                    apns_mode,
                     environment.as_str(),
                     err
                 );
@@ -5137,6 +5150,9 @@ async fn start_bridge_server_inner(
             "/api/speech-vocabulary",
             get(handle_api_speech_vocabulary_get).post(handle_api_speech_vocabulary_post),
         )
+        .route("/api/speech-text-refine", post(handle_api_speech_text_refine))
+        .route("/api/speech-audio-capability", get(handle_api_speech_audio_capability))
+        .route("/api/speech-audio-transcribe", post(handle_api_speech_audio_transcribe))
         .route(
             "/api/prevent-sleep",
             get(handle_api_prevent_sleep_get).post(handle_api_prevent_sleep_post),
@@ -5145,6 +5161,8 @@ async fn start_bridge_server_inner(
         .route("/api/room-submit", post(handle_local_room_submit))
         .route("/image", get(handle_serve_image))
         .route("/api/markdown-documents/:id", get(handle_markdown_document))
+        .route("/api/shared-media/:token", get(handle_shared_media_page))
+        .route("/api/shared-media/:token/:name", get(handle_shared_media))
         .route(
             "/api/markdown-documents/:id/image",
             get(handle_markdown_document_image),
@@ -6293,8 +6311,43 @@ async fn handle_axum_connection(
                                                 )
                                             .await
                                         };
-                                        if handled.delivered {
-                                            log::info!("[Bridge] mcp_action 已在 Rust 端直接处理 (project: {})", target_project_path);
+                                        // Cross-device arbitration owns the outcome even when it is
+                                        // pending or rejected; the legacy frontend fallback would only
+                                        // resubmit a reply the receipt already decided.
+                                        let arbitrated = handled.attempts.iter()
+                                            .any(|attempt| attempt.method == "cross_device_source");
+                                        if arbitrated {
+                                            // This socket has no receipt to query; tell the sender
+                                            // whether its reply won, is pending, or was rejected.
+                                            let attempt = handled.attempts.iter()
+                                                .find(|attempt| attempt.method == "cross_device_source");
+                                            let reason = attempt.and_then(|attempt| attempt.reason.clone());
+                                            let status = if handled.delivered {
+                                                "delivered"
+                                            } else if reason.as_deref() == Some("source_confirmation_pending") {
+                                                "pending"
+                                            } else {
+                                                "rejected"
+                                            };
+                                            let result = serde_json::json!({
+                                                "message_type": "mcp_action_result",
+                                                "payload": {
+                                                    "request_id": request_id,
+                                                    "project_path": target_project_path,
+                                                    "client_action_id": bridge_msg.payload.get("client_action_id"),
+                                                    "action": bridge_msg.payload.get("action"),
+                                                    "status": status,
+                                                    "delivered": handled.delivered,
+                                                    "reason": reason,
+                                                    "method": "cross_device_source",
+                                                },
+                                            });
+                                            if ws_sender.send(Message::Text(result.to_string())).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        if handled.delivered || arbitrated {
+                                            log::info!("[Bridge] mcp_action 已在 Rust 端直接处理 (project: {}, delivered={})", target_project_path, handled.delivered);
                                             mcp_action_handled_by_rust = true;
                                         } else {
                                             // 回退：缓存 action，等前端轮询消费
@@ -6601,6 +6654,15 @@ async fn handle_axum_connection(
                                             }
                                         }
                                     };
+                                    // Registry and serve-file fallbacks can briefly outlive an
+                                    // explicit close; never resurrect a closed request.
+                                    let cached_payload = match cached_payload {
+                                        Some(payload) => match extract_request_id_from_mcp_state(&payload) {
+                                            Some(id) if closed_mcp_state_project_for_request(&id).await.is_some() => None,
+                                            _ => Some(payload),
+                                        },
+                                        None => None,
+                                    };
 
                                     bridge_debug_log(&format!(
                                         "[Bridge Timing] request_sync lookup: request_id={:?}, effective_request_id={:?}, project_path={:?}, fallback_route={:?}, stale_request={}, cache_hit={}, registry_fallback_hit={}, serve_request_file_fallback_hit={}, serve_request_file_fallback_miss={:?}, cache_source={:?}, cache_age_ms={:?}, sync_reason={}",
@@ -6688,12 +6750,27 @@ async fn handle_axum_connection(
                                         TimelineSyncService::sanitize_payload_timeline_nodes(
                                             &mut payload,
                                         );
+                                        let reply_has_message = mcp_state_has_request_message(&payload);
                                         let cached_msg = BridgeMessage {
                                             message_type: "mcp_state".to_string(),
                                             payload,
                                         };
                                         if let Ok(text) = serde_json::to_string(&cached_msg) {
-                                            let _ = ws_sender.send(Message::Text(text)).await;
+                                            // Log the send outcome so a phone-side switch timeout can be
+                                            // split into "bridge never sent" vs "tunnel never delivered".
+                                            let reply_bytes = text.len();
+                                            let send_started = std::time::Instant::now();
+                                            let send_result = ws_sender.send(Message::Text(text)).await;
+                                            bridge_debug_log(&format!(
+                                                "[Bridge Timing] request_sync reply: client_id={}, request_id={:?}, has_message={}, bytes={}, send_ok={}, send_ms={}, sync_reason={}",
+                                                client_id,
+                                                payload_request_id,
+                                                reply_has_message,
+                                                reply_bytes,
+                                                send_result.is_ok(),
+                                                send_started.elapsed().as_millis(),
+                                                sync_reason,
+                                            ));
                                         }
                                     } else if let Some(live_goal) =
                                         crate::ui::live_goal::live_goal_payload_for_project(
@@ -7218,6 +7295,9 @@ fn direct_network_bridge_auth_path(path: &str) -> bool {
                 | "/api/show-window"
                 | "/api/speech-correction-memory"
                 | "/api/speech-muscle-memory"
+                | "/api/speech-text-refine"
+                | "/api/speech-audio-capability"
+                | "/api/speech-audio-transcribe"
                 | "/api/test-audio"
                 | "/push/subscribe"
                 | "/push/unsubscribe"
@@ -7770,18 +7850,31 @@ async fn handle_api_mobile_pairing_claim(
                 response.scopes,
                 response.pairing_session_id,
             );
+            bridge_debug_log(&format!(
+                "[MobileAuth] pairing claim ok: device_id={}, session_id={}",
+                response.device_id, response.pairing_session_id
+            ));
             Json(response).into_response()
         }
-        Err(error) => match error.as_str() {
-            "invalid_pairing_token" | "expired_pairing_token" => {
-                json_error_response(StatusCode::UNAUTHORIZED, &error)
+        // 独立 Bridge 下 log:: 不落盘；拒绝原因写进 bridge 调试日志，否则手机只看到 pairing_claim_failed 无从查起
+        Err(error) => {
+            bridge_debug_log(&format!(
+                "[MobileAuth] pairing claim rejected: reason={}, device_id={}, device_name={:?}, client_kind={:?}",
+                error, request.device_id, request.device_name, request.client_kind
+            ));
+            match error.as_str() {
+                "invalid_pairing_token" | "expired_pairing_token" => {
+                    json_error_response(StatusCode::UNAUTHORIZED, &error)
+                }
+                "missing_device_id" | "invalid_client_kind" => {
+                    json_error_response(StatusCode::BAD_REQUEST, &error)
+                }
+                "pairing_token_already_claimed" => {
+                    json_error_response(StatusCode::CONFLICT, &error)
+                }
+                _ => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
-            "missing_device_id" | "invalid_client_kind" => {
-                json_error_response(StatusCode::BAD_REQUEST, &error)
-            }
-            "pairing_token_already_claimed" => json_error_response(StatusCode::CONFLICT, &error),
-            _ => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
-        },
+        }
     }
 }
 
@@ -8787,6 +8880,244 @@ async fn handle_api_speech_muscle_memory_get(headers: HeaderMap) -> Response {
     }
 }
 
+/// POST /api/speech-text-refine — 用本机 Ollama 整理语音转写（只给建议，手机端由用户选择用不用）
+async fn handle_api_speech_text_refine(
+    headers: HeaderMap,
+    Json(body): Json<speech_refine::SpeechTextRefineRequest>,
+) -> Response {
+    // 复用手机已有的 speech_memory.write 权限，不新增 scope，免得已配对的手机要重新授权
+    if let Err(response) = authorize_speech_memory_access(
+        &headers,
+        SCOPE_SPEECH_MEMORY_WRITE,
+        "missing_scope_speech_memory_write",
+    )
+    .await
+    {
+        return response;
+    }
+
+    let raw_text = body.transcript.trim().to_string();
+    let started = std::time::Instant::now();
+    let outcome = speech_refine::refine(&body).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        speech_refine::Outcome::Refined { text, model } => Json(serde_json::json!({
+            "ok": true,
+            "raw_text": raw_text,
+            "refined_text": text,
+            "changed": text != raw_text,
+            "provider": speech_refine::PROVIDER,
+            "model": model,
+            "elapsed_ms": elapsed_ms,
+        }))
+        .into_response(),
+        speech_refine::Outcome::Skipped { reason } => Json(serde_json::json!({
+            "ok": true,
+            "raw_text": raw_text,
+            "refined_text": raw_text,
+            "changed": false,
+            "provider": speech_refine::PROVIDER,
+            "skipped_reason": reason,
+            "elapsed_ms": elapsed_ms,
+        }))
+        .into_response(),
+        speech_refine::Outcome::Failed { error, model } => {
+            log::warn!("[Bridge][SpeechTextRefine] {}", error);
+            Json(serde_json::json!({
+                "ok": false,
+                "raw_text": raw_text,
+                "refined_text": raw_text,
+                "changed": false,
+                "provider": speech_refine::PROVIDER,
+                "model": model,
+                "error": error,
+                "elapsed_ms": elapsed_ms,
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// 「Mac 听写版」的鉴权：比 speech-memory 更严，本机回环请求也必须带设备 token。
+/// 录音是隐私数据，而且 Whisper 很吃 GPU，不能让任何本机进程不带凭证就调用。
+fn speech_audio_auth_denial(
+    principal: Option<&AuthPrincipal>,
+) -> Option<(StatusCode, &'static str)> {
+    scoped_public_route_denial(
+        principal,
+        true,
+        SCOPE_SPEECH_MEMORY_WRITE,
+        "missing_scope_speech_memory_write",
+    )
+}
+
+async fn speech_audio_authorization_error(headers: &HeaderMap) -> Option<Response> {
+    if trusted_internal_capability(headers) {
+        return None;
+    }
+    let principal = match authenticate_bridge_headers_result(headers).await {
+        Ok(principal) => principal,
+        Err(error) => return Some(bridge_auth_error_response(&error)),
+    };
+    speech_audio_auth_denial(principal.as_ref())
+        .map(|(status, error)| json_error_response(status, error))
+}
+
+/// A body-free probe lets phones avoid sending recordings to older bridges.
+async fn handle_api_speech_audio_capability(headers: HeaderMap) -> Response {
+    if let Some(response) = speech_audio_authorization_error(&headers).await {
+        return response;
+    }
+    Json(serde_json::json!({"audio_transcription": true})).into_response()
+}
+
+/// POST /api/speech-audio-transcribe — 手机上传这段语音的 m4a，Mac 用常驻 Whisper 重新识别，
+/// 再走本机 Ollama 整理，返回「Mac 听写版」建议。手机端由用户确认后才替换。
+///
+/// 先鉴权再读 body：未授权的请求不会让 bridge 读入大文件；body 读取有硬上限。
+async fn handle_api_speech_audio_transcribe(
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    if let Some(response) = speech_audio_authorization_error(&headers).await {
+        return response;
+    }
+
+    let bytes = match axum::body::to_bytes(body, speech_audio::MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return json_error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+    };
+    let decoded = match speech_audio::decode_request(&bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            let status = if error == speech_audio::RequestError::AudioTooLarge {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return json_error_response(status, error.code());
+        }
+    };
+    drop(bytes);
+
+    let request = &decoded.request;
+    let raw_text = request.transcript.trim().to_string();
+    let started = std::time::Instant::now();
+    let skipped = |reason: &'static str, elapsed_ms: u64| {
+        Json(serde_json::json!({
+            "ok": true,
+            "raw_text": raw_text,
+            "refined_text": raw_text,
+            "changed": false,
+            "source": speech_audio::PROVIDER,
+            "skipped_reason": reason,
+            "elapsed_ms": elapsed_ms,
+        }))
+        .into_response()
+    };
+
+    // 命令词、选项标签、命令模式不重听：这些由手机端的快捷逻辑处理，改字反而有害
+    let probe = speech_refine::SpeechTextRefineRequest {
+        transcript: raw_text.clone(),
+        predefined_options: request.predefined_options.clone(),
+        mode: request.mode.clone(),
+    };
+    if let Some(reason) = speech_refine::skip_reason(&probe, &raw_text) {
+        if reason != "too_short" {
+            return skipped(reason, 0);
+        }
+    }
+
+    let vocabulary = speech_audio::vocabulary(&request.hints);
+    let prompt = speech_audio::initial_prompt(&vocabulary);
+    let whisper_started = std::time::Instant::now();
+    let whisper_raw = match speech_audio::call_whisper(&decoded.audio, decoded.format, &prompt).await {
+        Ok(text) => text,
+        Err(error) => {
+            log::warn!("[Bridge][SpeechAudio] {}", error);
+            return Json(serde_json::json!({
+                "ok": false,
+                "raw_text": raw_text,
+                "refined_text": raw_text,
+                "changed": false,
+                "source": speech_audio::PROVIDER,
+                "model": speech_audio::WHISPER_MODEL,
+                "error": error,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }))
+            .into_response();
+        }
+    };
+    let whisper_ms = whisper_started.elapsed().as_millis() as u64;
+    let whisper_text = speech_audio::normalize_whisper_text(&whisper_raw, &vocabulary);
+    if speech_audio::looks_hallucinated(&raw_text, &whisper_text) {
+        return skipped("whisper_unreliable", started.elapsed().as_millis() as u64);
+    }
+
+    // Whisper 原文已经干净就不整理；新手机端要求先回 Whisper 结果、整理由它随后单独调用
+    let refine_needed = speech_audio::needs_refine(&whisper_text);
+    if !refine_needed || request.defer_refine {
+        return Json(serde_json::json!({
+            "ok": true,
+            "raw_text": raw_text,
+            "whisper_text": whisper_text,
+            "refined_text": whisper_text,
+            "changed": whisper_text != raw_text,
+            "refine_needed": refine_needed,
+            "source": speech_audio::PROVIDER,
+            "model": speech_audio::WHISPER_MODEL,
+            "refine_note": if refine_needed { "deferred" } else { "whisper_clean" },
+            "whisper_ms": whisper_ms,
+            "refine_ms": 0,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }))
+        .into_response();
+    }
+
+    // 接已有的整理流程；整理失败或跑偏就直接给 Whisper 原文
+    let refine_started = std::time::Instant::now();
+    let refine_request = speech_refine::SpeechTextRefineRequest {
+        transcript: whisper_text.clone(),
+        predefined_options: request.predefined_options.clone(),
+        mode: request.mode.clone(),
+    };
+    let (final_text, refine_model, refine_note) = match speech_refine::refine(&refine_request).await {
+        speech_refine::Outcome::Refined { text, model } => {
+            // 整理不许改掉 Whisper 听到的英文词（如 Book → 书）；改了就用 Whisper 原文
+            let dropped = speech_audio::dropped_ascii_words(&whisper_text, &text);
+            if dropped.is_empty() {
+                (text, Some(model), None)
+            } else {
+                log::info!("[Bridge][SpeechAudio] refine dropped {} terms, keep whisper text", dropped.len());
+                (whisper_text.clone(), Some(model), Some("refine_dropped_terms".to_string()))
+            }
+        }
+        speech_refine::Outcome::Skipped { reason } => (whisper_text.clone(), None, Some(reason.to_string())),
+        speech_refine::Outcome::Failed { error, model } => {
+            log::warn!("[Bridge][SpeechAudio] refine {}", error);
+            (whisper_text.clone(), Some(model), Some(error))
+        }
+    };
+    let refine_ms = refine_started.elapsed().as_millis() as u64;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "raw_text": raw_text,
+        "whisper_text": whisper_text,
+        "refined_text": final_text,
+        "changed": final_text != raw_text,
+        "source": speech_audio::PROVIDER,
+        "model": speech_audio::WHISPER_MODEL,
+        "refine_model": refine_model,
+        "refine_note": refine_note,
+        "refine_needed": false,
+        "whisper_ms": whisper_ms,
+        "refine_ms": refine_ms,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    }))
+    .into_response()
+}
+
 /// POST /api/speech-muscle-memory — 保存共享语音肌肉记忆库
 async fn handle_api_speech_muscle_memory_post(
     headers: HeaderMap,
@@ -9266,11 +9597,6 @@ async fn build_main_page_markdown(app_handle: &AppHandle, tab: &str) -> String {
             let tool_info = {
                 let tool_names: &[(&str, &str, &str)] = &[
                     ("zhi", "iterate", "智能代码审查交互工具（L0 协调者）"),
-                    (
-                        "ji",
-                        "记忆管理",
-                        "全局记忆管理工具，支持回忆/记忆/沉淀/摘要",
-                    ),
                     ("sou", "代码搜索", "语义代码搜索工具，支持增量索引"),
                     ("acemcp", "AceMCP", "MCP 代理转发工具"),
                 ];
@@ -9584,18 +9910,104 @@ async fn handle_api_codex_models(headers: HeaderMap) -> Response {
         return response;
     }
 
-    match super::codex_live::list_codex_launch_models().await {
-        Ok(result) => Json(serde_json::json!({
-            "ok": true,
-            "models": result.get("data").cloned().unwrap_or_else(|| serde_json::json!([])),
-            "next_cursor": result.get("nextCursor").cloned().unwrap_or(serde_json::Value::Null)
-        }))
-        .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok": false, "error": error})),
-        )
-            .into_response(),
+    let (codex_result, claude_models) = tokio::join!(
+        super::codex_live::list_codex_launch_models(),
+        super::claude_launch::catalog_entries()
+    );
+    let (status, body) = codex_models_response(codex_result, claude_models);
+    (status, Json(body)).into_response()
+}
+
+/// 合并 Codex 与 Claude 的模型列表。
+/// 本机没装 Codex CLI（或 Codex 查询失败）时，只要 Claude 有模型就照常返回，
+/// 否则手机 `+` 会整体报「读取模型失败」，连 Claude 也选不到。
+fn codex_models_response(
+    codex_result: Result<serde_json::Value, String>,
+    claude_models: Vec<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    match codex_result {
+        Ok(result) => {
+            let codex_models = result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            eprintln!(
+                "[Bridge] codex-models served: codex={}, claude={}",
+                codex_models.len(),
+                claude_models.len()
+            );
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "models": codex_models.into_iter().chain(claude_models).collect::<Vec<_>>(),
+                    "next_cursor": result.get("nextCursor").cloned().unwrap_or(serde_json::Value::Null)
+                }),
+            )
+        }
+        Err(error) if !claude_models.is_empty() => {
+            eprintln!(
+                "[Bridge] codex-models: codex unavailable ({error}), serving claude={} only",
+                claude_models.len()
+            );
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "models": claude_models,
+                    "next_cursor": serde_json::Value::Null,
+                    "codex_error": error
+                }),
+            )
+        }
+        Err(error) => {
+            eprintln!("[Bridge] codex-models failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"ok": false, "error": error}),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod codex_models_response_tests {
+    use super::*;
+
+    fn claude() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"id": "claude:claude-opus-5-5"})]
+    }
+
+    #[test]
+    fn merges_codex_then_claude() {
+        let codex = serde_json::json!({"data": [{"id": "gpt-x"}], "nextCursor": "c1"});
+        let (status, body) = codex_models_response(Ok(codex), claude());
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<&str> = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["gpt-x", "claude:claude-opus-5-5"]);
+        assert_eq!(body["next_cursor"], "c1");
+    }
+
+    #[test]
+    fn codex_missing_still_serves_claude() {
+        let (status, body) = codex_models_response(Err("codex not found".into()), claude());
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["models"][0]["id"], "claude:claude-opus-5-5");
+        assert_eq!(body["codex_error"], "codex not found");
+    }
+
+    #[test]
+    fn both_unavailable_is_an_error() {
+        let (status, body) = codex_models_response(Err("codex not found".into()), vec![]);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["ok"], false);
     }
 }
 
@@ -9668,6 +10080,48 @@ async fn open_codex_chat_response(
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    log::info!(
+        "[Bridge] open-codex-chat: model={}, effort={}, service_tier={}, project={}",
+        model.unwrap_or("-"),
+        effort.unwrap_or("-"),
+        service_tier.unwrap_or("-"),
+        project_path.as_deref().unwrap_or("-")
+    );
+
+    if let Some(model) = model.filter(|model| super::claude_launch::is_claude_model_id(model)) {
+        let Some(project_path) = project_path.as_deref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "选择模型启动 Claude 时必须提供有效项目路径"
+                })),
+            )
+                .into_response();
+        };
+        return match super::claude_launch::launch_in_terminal(project_path, prompt, model, effort).await {
+            Ok(result) => Json(serde_json::json!({
+                "ok": true,
+                "sent": true,
+                "mode": "claude_terminal_launch",
+                "message": if result.pending {
+                    format!("已请求在 Terminal 启动 {} · {}；如果 Mac 上弹出“iterate 想要控制终端”，请点“允许”", result.display_name, result.effort)
+                } else {
+                    format!("已请求在 Terminal 启动 {} · {}，等待 Claude 接入", result.display_name, result.effort)
+                },
+                "pending_permission": result.pending,
+                "model": model,
+                "effort": result.effort,
+                "opened": true
+            }))
+            .into_response(),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": error})),
+            )
+                .into_response(),
+        };
+    }
 
     if let Some(model) = model {
         let Some(project_path) = project_path.as_deref() else {
@@ -9720,11 +10174,14 @@ async fn open_codex_chat_response(
                 }))
                 .into_response()
             }
-            Err(error) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"ok": false, "error": error})),
-            )
-                .into_response(),
+            Err(error) => {
+                log::warn!("[Bridge] open-codex-chat codex model launch failed: model={model}, error={error}");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"ok": false, "error": error})),
+                )
+                    .into_response()
+            }
         };
     }
 
@@ -9737,6 +10194,58 @@ async fn open_codex_chat_response(
             })),
         )
             .into_response();
+    }
+
+    if !crate::ui::commands::codex_desktop_available() {
+        let fallback_project = super::claude_launch::no_model_fallback_project(
+            project_path.as_deref(),
+            dirs::home_dir(),
+        );
+        log::info!(
+            "[Bridge] open-codex-chat: no model selected and Codex desktop not found; falling back to Claude ({}) project={:?}",
+            super::claude_launch::NO_MODEL_FALLBACK_ID,
+            fallback_project
+        );
+        if let Some(fallback_project) = fallback_project {
+            return match super::claude_launch::launch_in_terminal(
+                &fallback_project,
+                prompt,
+                super::claude_launch::NO_MODEL_FALLBACK_ID,
+                None,
+            )
+            .await
+            {
+                Ok(result) => Json(serde_json::json!({
+                    "ok": true,
+                    "sent": true,
+                    "mode": "claude_terminal_launch_fallback",
+                    "message": if result.pending {
+                        format!(
+                            "Mac 上没装 Codex，已改用 {} · {} 在 Terminal 启动 Claude；如果 Mac 上弹出“iterate 想要控制终端”，请点“允许”",
+                            result.display_name, result.effort
+                        )
+                    } else {
+                        format!(
+                            "Mac 上没装 Codex，已改用 {} · {} 在 Terminal 启动 Claude，等待接入",
+                            result.display_name, result.effort
+                        )
+                    },
+                    "pending_permission": result.pending,
+                    "model": super::claude_launch::NO_MODEL_FALLBACK_ID,
+                    "effort": result.effort,
+                    "opened": true
+                }))
+                .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("Mac 上没装 Codex，改用 Claude 启动也失败了：{error}")
+                    })),
+                )
+                    .into_response(),
+            };
+        }
     }
 
     match crate::ui::commands::open_new_codex_chat_with_text(prompt.to_string(), project_path).await
@@ -10460,7 +10969,11 @@ async fn run_tailscale_command(
 ) -> serde_json::Value {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        tokio::process::Command::new(cli_path).args(args).output(),
+        // launchd 拉起的 Bridge 没有 TERM，Tailscale.app 的二进制要靠这个变量才当 CLI 用
+        tokio::process::Command::new(cli_path)
+            .args(args)
+            .env("TAILSCALE_BE_CLI", "1")
+            .output(),
     )
     .await;
 
@@ -11177,7 +11690,18 @@ async fn connect_websocket_probe(ws_url: &str) -> WebsocketProbeConnectResult {
     let mut request = ws_url
         .into_client_request()
         .map_err(WebsocketProbeError::Handshake)?;
-    if let Ok(token) = crate::bridge::auth::issue_internal_bridge_websocket_token(ws_url) {
+    // Probing our own /ws asks the token broker, which runs on this same runtime.
+    // Called synchronously, it held this worker while the broker task waited
+    // behind it, so every connection-status probe stalled the whole Bridge
+    // until the 2 s broker socket timeout.
+    let token_url = ws_url.to_string();
+    let token = tokio::task::spawn_blocking(move || {
+        crate::bridge::auth::issue_internal_bridge_websocket_token(&token_url)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    if let Ok(token) = token {
         let authorization = format!("Bearer {token}")
             .parse()
             .map_err(|_| WebsocketProbeError::TlsConnectorBuild("invalid_auth_header".into()))?;
@@ -13396,9 +13920,91 @@ fn persist_live_goal_progress_from_apns_update(request: &ApnsLiveActivityUpdateR
     }
 }
 
+/// 已关闭路由机制（#44）：显式关闭的 mcp_state 清理缓存并记住该请求，拒绝迟到的复活。
+fn is_explicit_closed_mcp_state(payload: &serde_json::Value) -> bool {
+    payload.get("request") == Some(&serde_json::Value::Null)
+        && payload.get("showMcpPopup").and_then(|value| value.as_bool()) == Some(false)
+}
+
+fn closed_mcp_state_route(payload: &serde_json::Value) -> Result<(String, String), &'static str> {
+    let request_id = normalize_route_part(payload.get("request_id").and_then(|value| value.as_str()))
+        .ok_or("closed_request_id_missing")?;
+    let raw_path = normalize_route_part(payload.get("project_path").and_then(|value| value.as_str()))
+        .ok_or("closed_project_path_missing")?;
+    if raw_path == "." || !std::path::Path::new(&raw_path).is_absolute() {
+        return Err("closed_project_path_invalid");
+    }
+    Ok((request_id, normalize_bridge_project_path(&raw_path)))
+}
+
+fn mcp_state_matches_exact_route(payload: &serde_json::Value, request_id: &str, project_path: &str) -> bool {
+    extract_request_id_from_mcp_state(payload).as_deref() == Some(request_id)
+        && extract_project_path_from_mcp_state(payload)
+            .is_some_and(|path| project_paths_match(&normalize_bridge_project_path(&path), project_path))
+}
+
+async fn closed_mcp_state_project_for_request(request_id: &str) -> Option<String> {
+    let routes = CLOSED_MCP_STATE_ROUTES.read().await;
+    let (path, closed_at) = routes.get(request_id)?;
+    (chrono::Utc::now().timestamp().saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+        .then(|| path.clone())
+}
+
+async fn cleanup_closed_mcp_state_route(request_id: &str, project_path: &str) -> Result<(usize, bool), &'static str> {
+    let mut closed_routes = CLOSED_MCP_STATE_ROUTES.write().await;
+    let now = chrono::Utc::now().timestamp();
+    closed_routes.retain(|_, (_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS);
+    if closed_routes.get(request_id).is_some_and(|(path, _)| path != project_path) {
+        return Err("closed_route_mismatch");
+    }
+    let mut cache = MCP_STATE_CACHE.write().await;
+    let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
+    let mut registry = ACTIVE_SESSION_REGISTRY.write().await;
+
+    if cache.get(request_id).is_some_and(|payload| !mcp_state_matches_exact_route(payload, request_id, project_path))
+        || registry.get(request_id).is_some_and(|entry| normalize_bridge_project_path(&entry.project_path) != project_path)
+    {
+        return Err("closed_route_mismatch");
+    }
+
+    if !closed_routes.contains_key(request_id) && closed_routes.len() >= CLOSED_MCP_STATE_ROUTE_MAX_ENTRIES {
+        if let Some(oldest_id) = closed_routes.iter()
+            .min_by_key(|(_, (_, closed_at))| *closed_at)
+            .map(|(id, _)| id.clone()) {
+            closed_routes.remove(&oldest_id);
+        }
+    }
+    closed_routes.insert(request_id.to_string(), (project_path.to_string(), now));
+
+    let mut removed = 0;
+    if cache.remove(request_id).is_some() {
+        touched_at.remove(request_id);
+        removed += 1;
+    }
+    if cache.get(project_path).is_some_and(|payload| mcp_state_matches_exact_route(payload, request_id, project_path)) {
+        cache.remove(project_path);
+        touched_at.remove(project_path);
+        removed += 1;
+    }
+    let removed_active = registry.remove(request_id).is_some();
+    Ok((removed, removed_active))
+}
+
 async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) -> bool {
     let request_id = extract_request_id_from_mcp_state(&payload);
     let project_path = extract_project_path_from_mcp_state(&payload);
+    // Hold the closed-route lock until the cache and registry writes finish, in
+    // the same order as cleanup_closed_mcp_state_route, so a close cannot slip
+    // between this check and the write.
+    let closed_routes = CLOSED_MCP_STATE_ROUTES.read().await;
+    if let Some(request_id) = request_id.as_deref() {
+        let now = chrono::Utc::now().timestamp();
+        if closed_routes.get(request_id)
+            .is_some_and(|(_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+        {
+            return false;
+        }
+    }
 
     let mut cache = MCP_STATE_CACHE.write().await;
     // A late ready notification/retry must not overwrite richer frontend state already cached.
@@ -13433,6 +14039,8 @@ async fn cache_early_mcp_state(payload: serde_json::Value, source: &str) -> bool
     record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
     let mut active_registry = ACTIVE_SESSION_REGISTRY.write().await;
     update_active_session_registry(&mut active_registry, &payload);
+    drop(active_registry);
+    drop(closed_routes);
 
     bridge_debug_log(&format!(
         "[Bridge Timing] early mcp_state cached: request_id={:?}, project_path={:?}, cache_keys={}, source={}",
@@ -13553,6 +14161,9 @@ async fn handle_apns_notify(
                 "project_path": project_path,
                 "codex_thread_id": request.codex_thread_id,
                 "codex_deeplink": request.codex_deeplink,
+                "caller_client": request.caller_client,
+                "caller_model_label": request.caller_model_label,
+                "timeline_route_id": request.timeline_route_id,
                 "loop_active": request.loop_active,
                 "force_popup": request.force_popup,
             },
@@ -13647,6 +14258,35 @@ async fn handle_bridge_publish(
         return stale_request_response();
     }
 
+    if message.message_type == "mcp_state" && is_explicit_closed_mcp_state(&message.payload) {
+        let (request_id, project_path) = match closed_mcp_state_route(&message.payload) {
+            Ok(route) => route,
+            Err(reason) => return json_error_response(StatusCode::BAD_REQUEST, reason),
+        };
+        let (removed_cache_keys, removed_active) =
+            match cleanup_closed_mcp_state_route(&request_id, &project_path).await {
+                Ok(result) => result,
+                Err(reason) => return json_error_response(StatusCode::CONFLICT, reason),
+            };
+        record_last_completed_route(Some(&request_id), Some(&project_path), "mcp-state-closed").await;
+        clear_active_desktop_popup_route(Some(&request_id), Some(&project_path), "mcp-state-closed")
+            .await;
+        bridge_debug_log(&format!(
+            "[Bridge] closed mcp_state: request_id={}, project_path={}, removed_cache_keys={}, removed_active={}",
+            request_id, project_path, removed_cache_keys, removed_active
+        ));
+        let _ = tx.send(message);
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if message.message_type == "mcp_state" {
+        if let Some(request_id) = publish_request_id.as_deref() {
+            if closed_mcp_state_project_for_request(request_id).await.is_some() {
+                return stale_request_response();
+            }
+        }
+    }
+
     if message.message_type == "mcp_action" && has_room_submit_metadata(&message.payload) {
         let action = message
             .payload
@@ -13737,6 +14377,10 @@ async fn handle_bridge_publish(
         return (status, Json(outcome)).into_response();
     }
 
+    // Held from the final closed check until the broadcast, in the same order
+    // as cleanup_closed_mcp_state_route, so a close cannot be overtaken by
+    // this publish writing the cache or broadcasting an older state.
+    let mut closed_routes_guard = None;
     if message.message_type == "mcp_state" {
         // 服务端注入 timelineNodes：从 ConversationManager 查找当前对话路径
         let has_frontend_timeline = message
@@ -13951,6 +14595,16 @@ async fn handle_bridge_publish(
         let request_id = extract_request_id_from_mcp_state(&message.payload);
         let project_path = extract_project_path_from_mcp_state(&message.payload);
         record_last_active_route(request_id.as_deref(), project_path.as_deref()).await;
+        let closed_routes = CLOSED_MCP_STATE_ROUTES.read().await;
+        if let Some(rid) = request_id.as_deref() {
+            let now = chrono::Utc::now().timestamp();
+            if closed_routes.get(rid)
+                .is_some_and(|(_, closed_at)| now.saturating_sub(*closed_at) < MCP_STATE_CACHE_TTL_SECS)
+            {
+                return stale_request_response();
+            }
+        }
+        closed_routes_guard = Some(closed_routes);
         let mut cache = MCP_STATE_CACHE.write().await;
         let mut touched_at = MCP_STATE_CACHE_TOUCHED_AT.write().await;
         prune_json_cache(
@@ -14029,6 +14683,8 @@ async fn handle_bridge_publish(
             ));
         }
     }
+
+    drop(closed_routes_guard);
 
     if let Some(web_push_message) = web_push_message {
         tokio::spawn(async move {
@@ -14378,6 +15034,18 @@ fn new_markdown_document_id() -> String {
     format!("doc_{}", uuid::Uuid::new_v4().simple())
 }
 
+static SHARED_MEDIA_REGISTRY: Lazy<Mutex<MediaRegistry>> =
+    Lazy::new(|| Mutex::new(MediaRegistry::default()));
+
+// 256 random bits: the URL itself is the capability, so it must not be guessable.
+fn new_shared_media_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 fn register_markdown_documents_for_payload(payload: &mut serde_json::Value) {
     let Some(project_path) = extract_project_path_from_mcp_state(payload) else {
         return;
@@ -14386,15 +15054,22 @@ fn register_markdown_documents_for_payload(payload: &mut serde_json::Value) {
     let Ok(mut registry) = MARKDOWN_DOCUMENT_REGISTRY.lock() else {
         return;
     };
+    let Ok(mut media) = SHARED_MEDIA_REGISTRY.lock() else {
+        return;
+    };
+    // Video/audio links open in the phone's browser, which has no device
+    // credentials, so they need the public https origin to be reachable.
+    let public_base = public_bridge_base_url();
     let now = markdown_document_now();
     let mut rewrite = |value: &mut serde_json::Value| {
         if let Some(text) = value.as_str() {
-            *value = serde_json::Value::String(registry.rewrite(
-                text,
+            let text = registry.rewrite(text, root, root, now, &mut new_markdown_document_id);
+            *value = serde_json::Value::String(media.rewrite(
+                &text,
                 root,
-                root,
+                &public_base,
                 now,
-                &mut new_markdown_document_id,
+                &mut new_shared_media_token,
             ));
         }
     };
@@ -14487,6 +15162,144 @@ async fn handle_markdown_document_image(
         Ok(Err(error)) => json_error_response(StatusCode::NOT_FOUND, error),
         Err(_) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "image_unavailable"),
     }
+}
+
+// Anonymous by design: the 256-bit token in the path is the capability, and it
+// only names a file that a message explicitly linked inside its project.
+async fn handle_shared_media_page(
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    if !valid_token(&token) {
+        return json_error_response(StatusCode::NOT_FOUND, "media_not_found_or_expired");
+    }
+    let Some(entry) = SHARED_MEDIA_REGISTRY
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.get(&token, markdown_document_now()))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Html("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><p style=\"font:17px -apple-system;padding:24px\">链接已过期（12 小时）或 Mac 上的 iterate 重启过。请回到 Mac 让 AI 重新发送。</p>"),
+        )
+            .into_response();
+    };
+    if let Err(error) = current_media_file(&entry) {
+        return json_error_response(StatusCode::NOT_FOUND, error);
+    }
+    (
+        [
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; media-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+        ],
+        Html(share_page_html(&token, &entry.path)),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SharedMediaQuery {
+    download: Option<String>,
+}
+
+async fn handle_shared_media(
+    headers: HeaderMap,
+    axum::extract::Path((token, _name)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<SharedMediaQuery>,
+) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if !valid_token(&token) {
+        return json_error_response(StatusCode::NOT_FOUND, "media_not_found_or_expired");
+    }
+    let Some(entry) = SHARED_MEDIA_REGISTRY
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.get(&token, markdown_document_now()))
+    else {
+        return json_error_response(StatusCode::NOT_FOUND, "media_not_found_or_expired");
+    };
+    let (path, len) = match current_media_file(&entry) {
+        Ok(found) => found,
+        Err(error) => return json_error_response(StatusCode::NOT_FOUND, error),
+    };
+    let content_type = media_content_type(&path).unwrap_or("application/octet-stream");
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let Ok(mut file) = options.open(&path).await else {
+        return json_error_response(StatusCode::NOT_FOUND, "media_unavailable");
+    };
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let (status, start, end) = match parse_byte_range(range, len) {
+        Ok(Some((start, end))) => (StatusCode::PARTIAL_CONTENT, start, end),
+        Ok(None) => (StatusCode::OK, 0, len.saturating_sub(1)),
+        Err(()) => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+            )
+                .into_response();
+        }
+    };
+    let body_len = if len == 0 { 0 } else { end - start + 1 };
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "media_unavailable");
+    }
+    let stream = futures_util::stream::unfold(
+        (file.take(body_len), vec![0u8; 256 * 1024]),
+        |(mut reader, mut buffer)| async move {
+            match reader.read(&mut buffer).await {
+                Ok(0) => None,
+                Ok(n) => Some((Ok::<_, std::io::Error>(Bytes::copy_from_slice(&buffer[..n])), (reader, buffer))),
+                Err(error) => Some((Err(error), (reader, buffer))),
+            }
+        },
+    );
+    let mut response = Response::new(axum::body::Body::from_stream(stream));
+    *response.status_mut() = status;
+    let response_headers = response.headers_mut();
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response_headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
+        response_headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if query.download.is_some() {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("media");
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "attachment; filename=\"media{}\"; filename*=UTF-8''{}",
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!(".{value}"))
+                .unwrap_or_default(),
+            encode_path_segment(name)
+        )) {
+            response_headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+    if status == StatusCode::PARTIAL_CONTENT {
+        if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{len}")) {
+            response_headers.insert(header::CONTENT_RANGE, value);
+        }
+    }
+    response
 }
 
 /// HTTP 端点：读取本地图片并返回压缩后的图片（让手机端通过 HTTP 下载而非 WebSocket 传输）
@@ -14611,6 +15424,26 @@ fn image_content_type_for_path(file_path: &std::path::Path) -> &'static str {
 pub async fn send_to_web_bridge(message: BridgeMessage) -> Result<(), String> {
     // 只通过 HTTP POST 转发到 Bridge Server（避免重复推送）
     // handle_bridge_publish 会负责缓存写入和广播到所有 WebSocket 客户端
+    // 显式关闭状态必须确认送达，调用方据此判断其他端是否已收到关闭（#44）
+    if message.message_type == "mcp_state" && is_explicit_closed_mcp_state(&message.payload) {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|error| format!("创建 Bridge HTTP 客户端失败: {}", error))?;
+        let url = "http://127.0.0.1:8080/bridge/publish";
+        let request = client
+            .post(url)
+            .json(&message)
+            .timeout(std::time::Duration::from_secs(2));
+        let request = crate::bridge::auth::authorize_internal_bridge_request(request, "POST", url)?;
+        request
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
             .no_proxy() // 绕过代理
@@ -14729,7 +15562,7 @@ mod tests {
         revoke_all_web_login_sessions, room_submit_outcome, root_tunnel_is_authoritative_up,
         root_tunnel_supervisor_fields_from_status, route_debug_status_value,
         sanitize_recovery_transport, scoped_public_route_denial,
-        select_mobile_pairing_primary_candidate, serve_image_file, speech_memory_auth_denial,
+        select_mobile_pairing_primary_candidate, serve_image_file, speech_memory_auth_denial, speech_audio_auth_denial, handle_api_speech_audio_transcribe, handle_api_speech_audio_capability,
         status_read_full_diagnostics_denial, tailscale_dns_name, tailscale_funnel_config_matches,
         take_cached_action_for_pull, take_cached_action_for_pull_with_window_bindings,
         try_write_serve_response_file, update_active_session_registry,
@@ -15515,6 +16348,7 @@ mod tests {
             port: Some(5311),
             request_id: Some(request_id.to_string()),
             request_title: Some(request_id.to_string()),
+            request_text: None,
         }
     }
 
@@ -15970,6 +16804,7 @@ mod tests {
                 port: Some(5311),
                 request_id: Some("req-new".to_string()),
                 request_title: Some("new".to_string()),
+                request_text: None,
             },
         ]);
 
@@ -16195,6 +17030,9 @@ mod tests {
                 is_markdown: true,
                 codex_thread_id: None,
                 codex_deeplink: None,
+                caller_client: None,
+                caller_model_label: None,
+                timeline_route_id: None,
                 loop_active: true,
                 force_popup: false,
                 source: Some("early_request_test".to_string()),
@@ -16378,7 +17216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_submit_preflight_cleans_expired_serve_response_route() {
+    async fn room_submit_preflight_rejects_expired_route_without_deleting_it() {
         let _guard = ROOM_SUBMIT_TEST_LOCK.lock().await;
         clear_room_submit_outcome_cache_for_tests();
 
@@ -16462,7 +17300,9 @@ mod tests {
             outcome.delivery_attempts[0].reason.as_deref(),
             Some("response_route_expired")
         );
-        assert!(!route_file.exists());
+        // The live serve process renews this route; deleting it would make
+        // the popup permanently undeliverable after a missed renewal.
+        assert!(route_file.exists());
 
         let _ = std::fs::remove_file(&route_file);
         let _ = std::fs::remove_file(&response_file);
@@ -16939,14 +17779,14 @@ mod tests {
     fn tailscale_dns_name_trims_magic_dns_dot() {
         let status = serde_json::json!({
             "Self": {
-                "DNSName": "macbook-air.tail5b0fb3.ts.net."
+                "DNSName": "macbook-air.tail1234ab.ts.net."
             },
-            "CertDomains": ["fallback.tail5b0fb3.ts.net"]
+            "CertDomains": ["fallback.tail1234ab.ts.net"]
         });
 
         assert_eq!(
             tailscale_dns_name(&status).as_deref(),
-            Some("macbook-air.tail5b0fb3.ts.net")
+            Some("macbook-air.tail1234ab.ts.net")
         );
     }
 
@@ -16954,7 +17794,7 @@ mod tests {
     fn tailscale_funnel_config_requires_443_proxy_and_allow_funnel() {
         let status = serde_json::json!({
             "Web": {
-                "macbook-air.tail5b0fb3.ts.net:443": {
+                "macbook-air.tail1234ab.ts.net:443": {
                     "Handlers": {
                         "/": {
                             "Proxy": "http://127.0.0.1:8080"
@@ -16963,18 +17803,18 @@ mod tests {
                 }
             },
             "AllowFunnel": {
-                "macbook-air.tail5b0fb3.ts.net:443": true
+                "macbook-air.tail1234ab.ts.net:443": true
             }
         });
 
         assert!(tailscale_funnel_config_matches(
             &status,
-            "macbook-air.tail5b0fb3.ts.net",
+            "macbook-air.tail1234ab.ts.net",
             "http://127.0.0.1:8080",
         ));
         assert!(!tailscale_funnel_config_matches(
             &status,
-            "macbook-air.tail5b0fb3.ts.net",
+            "macbook-air.tail1234ab.ts.net",
             "http://127.0.0.1:9090",
         ));
     }
@@ -17745,6 +18585,8 @@ mod tests {
 
     #[test]
     fn root_tunnel_authority_rejects_stale_status_ha_without_live_metrics() {
+        // 隔离真实配置：正式路线若是 tailscale_serve，cloudflare 恢复判定会直接返回 false。
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let stale_status_only = serde_json::json!({
             "status_fresh": false,
             "metrics": {
@@ -18875,7 +19717,7 @@ mod tests {
     #[test]
     fn fallback_pairing_candidates_return_public_and_loopback_candidates() {
         let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
-        let _config_env = crate::config::paths::lock_config_env_for_test();
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
         // 用显式覆盖值，避免依赖本机真实配置（并行测试会临时替换配置路径，导致偶发失败）。
         let _env = EnvGuard::set("ITERATE_PUBLIC_BRIDGE_BASE_URL", "https://public.example.test");
@@ -18900,7 +19742,7 @@ mod tests {
     fn fallback_pairing_candidates_convert_http_public_override_to_ws_url() {
         // 公网入口自 2026-08 起只接受 https（normalize_public_origin）；https 覆盖值应换成 wss。
         let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
-        let _config_env = crate::config::paths::lock_config_env_for_test();
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
         let _env = EnvGuard::set(
             "ITERATE_PUBLIC_BRIDGE_BASE_URL",
@@ -18922,7 +19764,7 @@ mod tests {
     #[test]
     fn fallback_pairing_candidates_reject_plain_http_public_override() {
         let _lock = PUBLIC_BRIDGE_ENV_TEST_LOCK.lock().expect("env test lock");
-        let _config_env = crate::config::paths::lock_config_env_for_test();
+        let _config_env = crate::config::paths::TempConfigDirForTest::new();
         let _pairing_lock = super::pairing_session_state_tests::TEST_LOCK.blocking_lock();
         let _env = EnvGuard::set(
             "ITERATE_PUBLIC_BRIDGE_BASE_URL",
@@ -19093,6 +19935,9 @@ mod tests {
                     is_markdown: true,
                     codex_thread_id: None,
                     codex_deeplink: None,
+                    caller_client: None,
+                    caller_model_label: None,
+                    timeline_route_id: None,
                     loop_active: true,
                     force_popup: false,
                     source: Some("test".to_string()),
@@ -19234,6 +20079,105 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn speech_audio_auth_requires_token_even_on_loopback() {
+        let principal = |scopes: &[&str]| AuthPrincipal {
+            principal_id: "device:test".to_string(),
+            device_id: "test".to_string(),
+            client_kind: "ios".to_string(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            speech_audio_auth_denial(None),
+            Some((StatusCode::UNAUTHORIZED, "invalid_device_auth"))
+        );
+        assert_eq!(
+            speech_audio_auth_denial(Some(&principal(&[SCOPE_SPEECH_MEMORY_READ]))),
+            Some((StatusCode::FORBIDDEN, "missing_scope_speech_memory_write"))
+        );
+        assert!(speech_audio_auth_denial(Some(&principal(&[SCOPE_SPEECH_MEMORY_WRITE]))).is_none());
+    }
+
+    /// 真实 HTTP：不带 token 的上传（哪怕来自 127.0.0.1、哪怕 body 超大）都返回 401。
+    #[tokio::test]
+    async fn speech_audio_endpoint_rejects_missing_token_over_http() {
+        let app = axum::Router::new().route(
+            "/api/speech-audio-transcribe",
+            axum::routing::post(handle_api_speech_audio_transcribe),
+        ).route(
+            "/api/speech-audio-capability",
+            axum::routing::get(handle_api_speech_audio_capability),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let capability = client
+            .get(format!("http://{}/api/speech-audio-capability", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(capability.status().as_u16(), 401);
+        let url = format!("http://{}/api/speech-audio-transcribe", addr);
+        let small = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"transcript":"你好","audio_base64":"AAAA"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(small.status().as_u16(), 401);
+        let big = client
+            .post(&url)
+            .body(vec![b'a'; 9 * 1024 * 1024])
+            .send()
+            .await;
+        // Rejected before the body is read: either a 401 or the server closing early.
+        if let Ok(response) = big {
+            assert_eq!(response.status().as_u16(), 401);
+        }
+        server.abort();
+    }
+
+    /// 端到端（需要本机已起 speech-whisper-server.py 和 Ollama）：经真实 HTTP 打到 handler。
+    /// 这里的 mini router 没有生产里剥掉内部可信头的中间件，所以用该头绕过设备鉴权。
+    /// ITERATE_SPEECH_E2E_AUDIO=a.m4a ITERATE_SPEECH_E2E_APPLE='...' cargo test --lib speech_audio_handler_e2e -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn speech_audio_handler_e2e() {
+        use base64::Engine as _;
+        let path = std::env::var("ITERATE_SPEECH_E2E_AUDIO").expect("ITERATE_SPEECH_E2E_AUDIO");
+        let apple = std::env::var("ITERATE_SPEECH_E2E_APPLE").unwrap_or_default();
+        let app = axum::Router::new().route(
+            "/api/speech-audio-transcribe",
+            axum::routing::post(handle_api_speech_audio_transcribe),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let audio = std::fs::read(path.split(',').next().unwrap()).unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{}/api/speech-audio-transcribe", addr))
+            .header(super::TRUSTED_INTERNAL_CAPABILITY_HEADER, "1")
+            .json(&serde_json::json!({
+                "transcript": apple,
+                "audio_base64": base64::engine::general_purpose::STANDARD.encode(audio),
+                "audio_format": "m4a",
+                "hints": ["it", "Whisper"],
+                "mode": "reply",
+            }))
+            .send()
+            .await
+            .unwrap();
+        println!("status={} body={}", response.status(), response.text().await.unwrap());
+        server.abort();
     }
 
     #[test]
@@ -19622,6 +20566,7 @@ mod tests {
             port: Some(5311),
             request_id: Some("req-new".to_string()),
             request_title: Some("new".to_string()),
+            request_text: None,
         }];
 
         assert!(request_id_is_stale_for_live_window_instances(
@@ -19651,6 +20596,7 @@ mod tests {
             port: Some(5311),
             request_id: Some("req-new".to_string()),
             request_title: Some("new".to_string()),
+            request_text: None,
         }];
         let mut cache = HashMap::new();
         cache.insert(
@@ -19805,6 +20751,7 @@ mod tests {
                 registered_at: recent,
                 request_id: Some("req-a".to_string()),
                 request_title: Some("window a".to_string()),
+                request_text: None,
                 port: None,
             }],
         );
@@ -19847,6 +20794,7 @@ mod tests {
                 registered_at: recent.clone(),
                 request_id: Some("req-live".to_string()),
                 request_title: Some("window live".to_string()),
+                request_text: None,
                 port: Some(5311),
             }],
         );
@@ -19894,6 +20842,7 @@ mod tests {
                 registered_at: recent.clone(),
                 request_id: Some("req-live".to_string()),
                 request_title: Some("window live".to_string()),
+                request_text: None,
                 port: Some(5311),
             }],
         );
@@ -19935,6 +20884,7 @@ mod tests {
                     registered_at: older,
                     request_id: Some("req-old".to_string()),
                     request_title: Some("old duplicate".to_string()),
+                    request_text: None,
                     port: Some(5311),
                 },
                 crate::ui::window_registry::WindowInstance {
@@ -19944,6 +20894,7 @@ mod tests {
                     registered_at: recent,
                     request_id: Some("req-new".to_string()),
                     request_title: Some("new duplicate".to_string()),
+                    request_text: None,
                     port: Some(5312),
                 },
             ],
@@ -19994,6 +20945,7 @@ mod tests {
                     registered_at: old_window_registered_at,
                     request_id: Some("req-old".to_string()),
                     request_title: Some("old window".to_string()),
+                    request_text: None,
                     port: Some(5311),
                 },
                 crate::ui::window_registry::WindowInstance {
@@ -20003,6 +20955,7 @@ mod tests {
                     registered_at: new_window_registered_at,
                     request_id: Some("req-new".to_string()),
                     request_title: Some("new window".to_string()),
+                    request_text: None,
                     port: Some(5312),
                 },
             ],
@@ -20030,6 +20983,7 @@ mod tests {
             registered_at,
             request_id: Some("req-focus-authority".to_string()),
             request_title: Some("focus authority".to_string()),
+            request_text: None,
             port: Some(5311),
         };
         let focus_by_pid = HashMap::from([(pid, focused_at.clone())]);
@@ -20089,6 +21043,7 @@ mod tests {
                     registered_at: old_registered_at,
                     request_id: Some("req-shared-a".to_string()),
                     request_title: Some("shared a".to_string()),
+                    request_text: None,
                     port: Some(5311),
                 },
                 crate::ui::window_registry::WindowInstance {
@@ -20098,6 +21053,7 @@ mod tests {
                     registered_at: new_registered_at,
                     request_id: Some("req-shared-b".to_string()),
                     request_title: Some("shared b".to_string()),
+                    request_text: None,
                     port: Some(5312),
                 },
             ],
@@ -20838,7 +21794,9 @@ async fn handle_api_mobile_reply_status(
         .join("mobile-replies")
         .join(format!("{}.json", key));
     match super::mobile_reply::lookup(&path, &operation) {
-        Ok(Some(receipt)) => Json(receipt).into_response(),
+        Ok(Some(receipt)) => {
+            Json(super::mobile_reply::refresh_cross_device_receipt(&path, receipt)).into_response()
+        }
         Ok(None) => Json(serde_json::json!({"operation_id": operation, "status": "absent", "receipt_scope": "bridge_delivery"})).into_response(),
         Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
     }
@@ -20911,10 +21869,11 @@ async fn handle_api_mobile_reply(
         request_id,
         replay_epoch.is_some()
     ));
-    let receipt =
+    let mut receipt =
         match super::mobile_reply::reserve_with_epoch(&path, operation, &digest, replay_epoch) {
             Ok(super::mobile_reply::Reservation::Existing(value)) => {
-                return Json(value).into_response()
+                return Json(super::mobile_reply::refresh_cross_device_receipt(&path, value))
+                    .into_response()
             }
             Ok(super::mobile_reply::Reservation::New(value)) => value,
             Err(error) => {
@@ -20977,8 +21936,29 @@ async fn handle_api_mobile_reply(
             )
             .await
         };
+        let cross_pending = result.attempts.iter().any(|attempt| {
+            attempt.method == "cross_device_source"
+                && attempt.reason.as_deref() == Some(super::mobile_reply::CROSS_DEVICE_PENDING_REASON)
+        });
+        let cross_rejection = result.attempts.iter()
+            .find(|attempt| attempt.method == "cross_device_source" && !attempt.delivered)
+            .and_then(|attempt| attempt.reason.clone())
+            .filter(|reason| reason != super::mobile_reply::CROSS_DEVICE_PENDING_REASON);
         if result.delivered {
             ("delivered", None)
+        } else if let Some(reason) = cross_rejection {
+            // Arbitration decided: the request was closed or another reply won.
+            let stored = super::mobile_reply::finish(&path, receipt, "rejected", Some(&reason));
+            return match stored {
+                Ok(value) => Json(value).into_response(),
+                Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
+            };
+        } else if cross_pending {
+            receipt.cross_device_route = Some(super::mobile_reply::CrossDeviceRoute {
+                request_id: request_id.to_string(),
+                project_path: project.clone(),
+            });
+            ("uncertain", Some(super::mobile_reply::CROSS_DEVICE_PENDING_REASON))
         } else {
             ("uncertain", Some("delivery_not_confirmed"))
         }
@@ -20986,5 +21966,85 @@ async fn handle_api_mobile_reply(
     match super::mobile_reply::finish(&path, receipt, status, reason) {
         Ok(value) => Json(value).into_response(),
         Err(error) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
+    }
+}
+
+#[cfg(test)]
+mod shared_media_route_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn linked_media_is_served_anonymously_with_byte_ranges() {
+        let root = std::env::temp_dir().join(format!("iterate-media-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"0123456789").unwrap();
+        let text = SHARED_MEDIA_REGISTRY.lock().unwrap().rewrite(
+            "[clip](clip.mp4)",
+            &root,
+            "https://iterate.example.com",
+            markdown_document_now(),
+            &mut new_shared_media_token,
+        );
+        let page_path = text
+            .strip_prefix("[clip](https://iterate.example.com")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap()
+            .to_string();
+        let path = format!("{page_path}/clip.mp4");
+        assert!(public_anonymous_path_allowed(&axum::http::Method::GET, &page_path));
+        assert!(public_anonymous_path_allowed(&axum::http::Method::GET, &path));
+        assert!(public_anonymous_path_allowed(&axum::http::Method::HEAD, &path));
+        assert!(!public_anonymous_path_allowed(&axum::http::Method::POST, &path));
+        let token = path.split('/').nth(3).unwrap().to_string();
+
+        let page = handle_shared_media_page(axum::extract::Path(token.clone())).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(page.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("default-src 'none'"));
+        let html = axum::body::to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&html).contains(&format!("/api/shared-media/{token}/clip.mp4")));
+        let expired = handle_shared_media_page(axum::extract::Path("1".repeat(64))).await;
+        assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+
+        let call_with = |range: Option<&'static str>, token: String, download: bool| async move {
+            let mut headers = HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(header::RANGE, HeaderValue::from_static(range));
+            }
+            handle_shared_media(
+                headers,
+                axum::extract::Path((token, "clip.mp4".to_string())),
+                axum::extract::Query(SharedMediaQuery {
+                    download: download.then(|| "1".to_string()),
+                }),
+            )
+            .await
+        };
+        let response = call_with(None, token.clone(), true).await;
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"media.mp4\"; filename*=UTF-8''clip.mp4"
+        );
+        let call = |range: Option<&'static str>, token: String| call_with(range, token, false);
+        let response = call(None, token.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"0123456789");
+
+        let response = call(Some("bytes=2-4"), token.clone()).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "3");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"234");
+
+        let response = call(Some("bytes=20-"), token.clone()).await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        let unknown = "0".repeat(64);
+        assert_eq!(call(None, unknown).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(call(None, "../etc".to_string()).await.status(), StatusCode::NOT_FOUND);
     }
 }

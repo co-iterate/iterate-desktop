@@ -2,12 +2,40 @@ import { invoke } from '@tauri-apps/api/core'
 import { computed, ref } from 'vue'
 import { applyThemeVariables, getTheme } from '../theme'
 
-export function useTheme() {
-  const DEFAULT_THEME = 'dark'
+type ThemeName = 'light' | 'dark'
 
-  // 先同步应用默认深色变量，避免异步读取配置期间 popup 使用到浅色占位变量而发白
-  applyThemeVariables(DEFAULT_THEME)
-  const currentTheme = ref(DEFAULT_THEME)
+// 新用户默认浅色；已选过深色的用户由本地缓存 + 后端配置还原
+const DEFAULT_THEME: ThemeName = 'light'
+// 仅用于启动瞬间同步上色，避免深色用户在读取配置前闪一下白；以后端配置为准
+const THEME_CACHE_KEY = 'iterate.theme.last'
+
+function normalizeTheme(value: unknown): ThemeName {
+  return value === 'dark' || value === 'light' ? value : DEFAULT_THEME
+}
+
+function readCachedTheme(): ThemeName {
+  try {
+    return normalizeTheme(localStorage.getItem(THEME_CACHE_KEY))
+  }
+  catch {
+    return DEFAULT_THEME
+  }
+}
+
+function writeCachedTheme(theme: ThemeName) {
+  try {
+    localStorage.setItem(THEME_CACHE_KEY, theme)
+  }
+  catch {
+    // 存不下只影响启动瞬间的颜色，不影响最终主题
+  }
+}
+
+export function useTheme() {
+  // 先同步应用上次的主题（首次打开为浅色），再异步读取后端配置校正
+  const initialTheme = readCachedTheme()
+  applyThemeVariables(initialTheme)
+  const currentTheme = ref<string>(initialTheme)
 
   // 计算 Naive UI 主题
   const naiveTheme = computed(() => {
@@ -17,9 +45,10 @@ export function useTheme() {
 
   // 应用主题
   function applyTheme(theme: string) {
-    // 应用主题变量和类
-    applyThemeVariables(theme)
-    currentTheme.value = theme
+    const validTheme = normalizeTheme(theme)
+    applyThemeVariables(validTheme)
+    currentTheme.value = validTheme
+    writeCachedTheme(validTheme)
   }
 
   // 切换主题
@@ -40,24 +69,18 @@ export function useTheme() {
   async function loadTheme() {
     try {
       const theme = await invoke('get_theme')
-      // 确保主题值有效
-      const validTheme = (theme === 'light' || theme === 'dark') ? theme : 'dark'
-
       // 应用后端主题（无论是否与当前主题相同，确保状态同步）
-      applyTheme(validTheme as string)
+      applyTheme(normalizeTheme(theme))
     }
     catch (error) {
       console.error('加载主题失败:', error)
-      // 加载失败时使用默认深色主题
-      applyTheme(DEFAULT_THEME)
+      // 加载失败时保持启动时已应用的主题
+      applyTheme(initialTheme)
     }
   }
 
   // 立即尝试加载主题，避免延迟
-  loadTheme().catch(() => {
-    // 如果加载失败，应用默认主题
-    applyTheme(DEFAULT_THEME)
-  })
+  void loadTheme()
 
   return {
     currentTheme,

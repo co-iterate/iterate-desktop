@@ -922,9 +922,15 @@ pub fn issue_desktop_bridge_token(method: &str, path: &str) -> Result<String, St
 /// Native-only entry point used by the trusted Tauri renderer. Web companions
 /// served by the Bridge do not have access to Tauri IPC and therefore cannot
 /// mint this local capability.
+///
+/// Async on purpose: on macOS this waits on the token broker socket (up to 2 s)
+/// and the action poll calls it every 400 ms. A sync command would run on the
+/// main thread and freeze typing/IME while it waits.
 #[tauri::command]
-pub fn get_bridge_desktop_token(method: String, path: String) -> Result<String, String> {
-    issue_desktop_bridge_token(&method, &path)
+pub async fn get_bridge_desktop_token(method: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || issue_desktop_bridge_token(&method, &path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 pub(crate) fn issue_internal_bridge_token(method: &str, path: &str) -> Result<String, String> {

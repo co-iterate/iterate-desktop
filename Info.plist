@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>LSUIElement</key>
+  <false/>
   <key>NSMicrophoneUsageDescription</key>
   <string>iterate 需要使用麦克风来把你的语音转换为文字。</string>
   <key>NSSpeechRecognitionUsageDescription</key>

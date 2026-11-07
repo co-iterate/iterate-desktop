@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import type { UnlistenFn } from '@tauri-apps/api/event'
+import type { WindowInstance } from '../common/WindowOverview.vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useMessage } from 'naive-ui'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { crossDeviceSendError, useCrossDevice } from '../../composables/useCrossDevice'
+import { useMcpDelivery } from '../../composables/useMcpDelivery'
 import { hasOpenModifier } from '../../utils/clickModifiers'
+import { probeTask } from '../../utils/typingStallProbe'
 import ThemeIcon from '../common/ThemeIcon.vue'
-import UsageQuotaPopover from '../common/UsageQuotaPopover.vue'
+import WindowOverview from '../common/WindowOverview.vue'
 
 interface QuotaMetric {
   label: string
@@ -34,6 +38,13 @@ interface Props {
   isMuted?: boolean
   projectPath?: string
   codexThreadId?: string
+  callerClient?: string
+  callerSessionId?: string
+  callerCwd?: string
+  callerPid?: number
+  callerModel?: string
+  callerModelLabel?: string
+  conversationTitle?: string
   linkUrl?: string
   linkTitle?: string
   quotaProviders?: UsageProvider[]
@@ -67,11 +78,111 @@ const props = withDefaults(defineProps<Props>(), {
 
 const emit = defineEmits<Emits>()
 const message = useMessage()
+const { mcpDeliveryError } = useMcpDelivery()
+const { crossState } = useCrossDevice()
 let suppressNextProjectPathClick = false
 const preventSleepEnabled = ref(false)
 const preventSleepPending = ref(false)
 let unlistenPreventSleepStatus: UnlistenFn | null = null
 let preventSleepPollTimer: number | null = null
+
+const overviewVisible = ref(false)
+const overviewInteractive = ref(false)
+const overviewTrigger = ref<HTMLElement | null>(null)
+const overviewAnchor = ref({ top: 52, left: 12 })
+let overviewHoverTrigger = false
+let overviewHoverPanel = false
+let overviewHoverTimer: number | null = null
+const windowInstances = ref<WindowInstance[]>([])
+const currentWindowPid = ref(0)
+
+async function refreshWindowInstances() {
+  try {
+    const [instances, pid] = await Promise.all([
+      invoke<WindowInstance[]>('get_all_window_instances'),
+      currentWindowPid.value ? Promise.resolve(currentWindowPid.value) : invoke<number>('get_current_window_pid'),
+    ])
+    windowInstances.value = instances
+    currentWindowPid.value = pid
+  }
+  catch (error) {
+    console.error('读取窗口列表失败:', error)
+  }
+}
+
+function clearOverviewHoverTimer() {
+  if (overviewHoverTimer !== null)
+    window.clearTimeout(overviewHoverTimer)
+  overviewHoverTimer = null
+}
+
+function closeWindowOverview() {
+  clearOverviewHoverTimer()
+  overviewVisible.value = false
+  overviewInteractive.value = false
+}
+
+async function openWindowOverview(interactive: boolean) {
+  clearOverviewHoverTimer()
+  await refreshWindowInstances()
+  const rect = overviewTrigger.value?.getBoundingClientRect()
+  if (rect)
+    overviewAnchor.value = { top: Math.round(rect.bottom + 8), left: Math.max(12, Math.round(rect.left - 4)) }
+  overviewVisible.value = true
+  if (interactive)
+    overviewInteractive.value = true
+}
+
+function toggleWindowOverview() {
+  if (overviewVisible.value && overviewInteractive.value)
+    closeWindowOverview()
+  else
+    void openWindowOverview(true)
+}
+
+// 悬停「∞ iterate」只展示列表，鼠标离开标题和面板后收起；点击过就一直开着直到 Esc 或点外面。
+function scheduleOverviewHover() {
+  clearOverviewHoverTimer()
+  if (overviewHoverTrigger && !overviewVisible.value) {
+    overviewHoverTimer = window.setTimeout(() => void openWindowOverview(false), 150)
+    return
+  }
+  if (!overviewHoverTrigger && !overviewHoverPanel && overviewVisible.value && !overviewInteractive.value)
+    overviewHoverTimer = window.setTimeout(closeWindowOverview, 250)
+}
+
+function handleOverviewTriggerHover(hovering: boolean) {
+  overviewHoverTrigger = hovering
+  scheduleOverviewHover()
+}
+
+function handleOverviewPanelHover(hovering: boolean) {
+  overviewHoverPanel = hovering
+  scheduleOverviewHover()
+}
+
+function handleOverviewOutsidePointer(event: PointerEvent) {
+  if (!overviewVisible.value)
+    return
+  const target = event.target as Element | null
+  if (target?.closest('.overview-panel, .window-overview-trigger'))
+    return
+  closeWindowOverview()
+}
+
+// ⌘⇧A 打开全部窗口；静音时和其他窗口快捷键一样停用。
+function handleOverviewShortcut(event: KeyboardEvent) {
+  if (props.isMuted || overviewInteractive.value || event.isComposing)
+    return
+  if (event.key.toLowerCase() === 'a' && event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey) {
+    event.preventDefault()
+    void openWindowOverview(true)
+  }
+}
+
+function handleWindowFocusForOverview() {
+  void refreshWindowInstances()
+}
 
 async function refreshPreventSleepStatus(logFailure = false) {
   if (preventSleepPending.value)
@@ -106,6 +217,10 @@ async function handleTogglePreventSleep() {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', handleOverviewShortcut)
+  document.addEventListener('pointerdown', handleOverviewOutsidePointer, true)
+  window.addEventListener('focus', handleWindowFocusForOverview)
+  void refreshWindowInstances()
   try {
     unlistenPreventSleepStatus = await listen<{ enabled?: boolean }>(
       'prevent_sleep_status',
@@ -121,11 +236,15 @@ onMounted(async () => {
 
   await refreshPreventSleepStatus(true)
   preventSleepPollTimer = window.setInterval(() => {
-    void refreshPreventSleepStatus()
+    void probeTask('preventSleep', () => refreshPreventSleepStatus())
   }, 3000)
 })
 
 onUnmounted(() => {
+  window.removeEventListener('keydown', handleOverviewShortcut)
+  document.removeEventListener('pointerdown', handleOverviewOutsidePointer, true)
+  clearOverviewHoverTimer()
+  window.removeEventListener('focus', handleWindowFocusForOverview)
   cancelCodexLiveHold()
   unlistenPreventSleepStatus?.()
   unlistenPreventSleepStatus = null
@@ -149,16 +268,27 @@ const displayProjectPath = computed(() => {
   return props.projectPath
 })
 
+// 调用方是 Claude Code 时，⌘+点击回到对应 Claude 会话，而不是 Codex（P-2026-9373）
+const isClaudeCaller = computed(() => props.callerClient === 'claude_code' && Boolean(props.callerSessionId?.trim()))
+// agy 调用方带着会话 ID 时，⌘+点击回到 agy 会话（`agy --conversation <id>`）
+const isAgyCaller = computed(() => props.callerClient === 'antigravity' && Boolean(props.callerSessionId?.trim()))
+
 const projectPathTitle = computed(() => {
   if (!props.projectPath)
     return ''
 
-  const cmdAction = props.codexThreadId
-    ? '⌘+点击回到调用本次 MCP 的 Codex 会话'
-    : '⌘+点击在 Codex 中打开项目'
+  const cmdAction = isClaudeCaller.value
+    ? '⌘+点击回到调用本次 MCP 的 Claude 会话'
+    : isAgyCaller.value
+      ? '⌘+点击回到调用本次 MCP 的 agy 会话'
+      : props.codexThreadId
+        ? '⌘+点击回到调用本次 MCP 的 Codex 会话'
+        : '⌘+点击在 Codex 中打开项目'
 
   return `${props.projectPath}\n(点击复制完整路径)\n(${cmdAction})`
 })
+
+const displayConversationTitle = computed(() => props.conversationTitle?.trim() || null)
 
 async function openCodexTarget() {
   if (props.codexThreadId)
@@ -182,6 +312,57 @@ async function openCodexTargetFromEvent(event: MouseEvent | PointerEvent) {
   }
 }
 
+async function openClaudeSessionFromEvent(event: MouseEvent | PointerEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  message.info('正在回到 Claude 会话')
+
+  try {
+    const result = await invoke<string>('open_claude_session', {
+      sessionId: props.callerSessionId,
+      cwd: props.callerCwd ?? null,
+      pid: typeof props.callerPid === 'number' ? props.callerPid : null,
+    })
+    message.success(result === 'resumed' ? '已在新终端中恢复 Claude 会话' : '已切到 Claude 会话所在终端')
+  }
+  catch (error) {
+    console.error('打开 Claude 会话失败:', error)
+    message.error(`打开 Claude 会话失败：${String(error)}`)
+  }
+}
+
+async function openAgySessionFromEvent(event: MouseEvent | PointerEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  message.info('正在回到 agy 会话')
+
+  try {
+    const result = await invoke<string>('open_agy_session', {
+      conversationId: props.callerSessionId,
+      cwd: props.callerCwd ?? null,
+      pid: typeof props.callerPid === 'number' ? props.callerPid : null,
+    })
+    message.success(result === 'resumed' ? '已在新终端中恢复 agy 会话' : '已切到 agy 会话所在终端')
+  }
+  catch (error) {
+    console.error('打开 agy 会话失败:', error)
+    message.error(`打开 agy 会话失败：${String(error)}`)
+  }
+}
+
+// 按调用方分支：Claude Code / agy → 回到各自会话；其余（Codex）保持原逻辑
+async function openCallerTargetFromEvent(event: MouseEvent | PointerEvent) {
+  if (isClaudeCaller.value) {
+    await openClaudeSessionFromEvent(event)
+    return
+  }
+  if (isAgyCaller.value) {
+    await openAgySessionFromEvent(event)
+    return
+  }
+  await openCodexTargetFromEvent(event)
+}
+
 // Cmd+按下项目路径时提前打开，避免 WebKit 吞掉修饰键 click
 async function handleProjectPathPointerDown(event: MouseEvent | PointerEvent) {
   if (!props.projectPath || !hasOpenModifier(event))
@@ -193,7 +374,7 @@ async function handleProjectPathPointerDown(event: MouseEvent | PointerEvent) {
   }
 
   suppressNextProjectPathClick = true
-  await openCodexTargetFromEvent(event)
+  await openCallerTargetFromEvent(event)
 }
 
 // 点击项目路径：普通点击复制；Cmd/Ctrl 点击作为 pointerdown 未触发时的回退
@@ -209,7 +390,7 @@ async function handleProjectPathClick(event: MouseEvent) {
   }
 
   if (hasOpenModifier(event)) {
-    await openCodexTargetFromEvent(event)
+    await openCallerTargetFromEvent(event)
     return
   }
 
@@ -267,6 +448,8 @@ function handleToggleAlwaysOnTop() {
 function handleToggleMute() {
   emit('toggleMute')
 }
+
+const windowsPlatform = navigator.platform.toUpperCase().includes('WIN')
 
 function handleCloseCurrentDialog() {
   emit('closeCurrentDialog')
@@ -337,30 +520,37 @@ function handleCodexLiveClick() {
 
 <template>
   <div class="popup-header-root px-4 py-3 select-none">
+    <WindowOverview
+      :visible="overviewVisible"
+      :instances="windowInstances"
+      :current-pid="currentWindowPid"
+      :quota-providers="props.quotaProviders"
+      :interactive="overviewInteractive"
+      :anchor="overviewAnchor"
+      @close="closeWindowOverview"
+      @hover-change="handleOverviewPanelHover"
+    />
+    <div v-if="mcpDeliveryError" role="alert" style="color: #dc2626; font-weight: 700; margin-bottom: 8px">
+      {{ mcpDeliveryError }}
+    </div>
     <div class="flex items-center justify-between">
       <!-- 左侧：标题和项目路径/链接 -->
       <div class="flex items-center gap-3 min-w-0 flex-1">
-        <UsageQuotaPopover
-          v-if="props.quotaProviders?.length"
-          :providers="props.quotaProviders"
-          title="额度"
-          subtitle="本机用量"
-          :status-label="props.quotaStatusLabel || '实时'"
-          class="popup-header-quota"
+        <button
+          ref="overviewTrigger"
+          type="button"
+          class="window-overview-trigger"
+          title="全部窗口（⌘⇧A）"
+          :aria-label="`全部窗口，共 ${windowInstances.length} 个`"
+          :aria-expanded="overviewVisible"
+          @mouseenter="handleOverviewTriggerHover(true)"
+          @mouseleave="handleOverviewTriggerHover(false)"
+          @click="toggleWindowOverview"
         >
-          <template #trigger>
-            <span class="text-xl font-bold text-white flex-shrink-0 leading-none">∞</span>
-            <h1 class="text-base font-medium text-white flex-shrink-0">
-              iterate
-            </h1>
-          </template>
-        </UsageQuotaPopover>
-        <template v-else>
           <span class="text-xl font-bold text-white flex-shrink-0 leading-none">∞</span>
-          <h1 class="text-base font-medium text-white flex-shrink-0">
-            iterate
-          </h1>
-        </template>
+          <span class="text-base font-medium text-white flex-shrink-0">iterate</span>
+          <span v-if="windowInstances.length > 1" class="window-overview-count">{{ windowInstances.length }}</span>
+        </button>
         <!-- 链接标题 (cmd+点击打开) -->
         <a
           v-if="props.linkUrl"
@@ -387,6 +577,7 @@ function handleCodexLiveClick() {
 
       <!-- 右侧：操作按钮 -->
       <n-space size="small">
+        <span v-if="crossDeviceSendError" role="alert" style="color: #dc2626; font-size: 12px; max-width: 180px">{{ crossDeviceSendError }}</span>
         <n-button
           size="small"
           quaternary
@@ -413,6 +604,7 @@ function handleCodexLiveClick() {
           quaternary
           circle
           title="在当前项目打开终端"
+          :disabled="crossState.mirror"
           aria-label="在当前项目打开终端"
           @click="handleOpenTerminal"
         >
@@ -437,6 +629,9 @@ function handleCodexLiveClick() {
           quaternary
           circle
           :title="props.isMuted ? '静音已开启，窗口快捷键已停用（Esc 恢复）' : '通知与窗口快捷键已开启（Esc 静音）'"
+          :aria-label="props.isMuted ? '静音已开启，窗口快捷键已停用（Esc 恢复）' : '通知与窗口快捷键已开启（Esc 静音）'"
+          :aria-pressed="props.isMuted"
+          data-guide="notification-mute"
           @click="handleToggleMute"
         >
           <template #icon>
@@ -470,6 +665,7 @@ function handleCodexLiveClick() {
           quaternary
           circle
           title="在 Codex 中打开当前项目"
+          :disabled="crossState.mirror"
           @click="handleNewChat"
         >
           <template #icon>
@@ -519,7 +715,10 @@ function handleCodexLiveClick() {
             <ThemeIcon :theme="props.currentTheme" class="w-4 h-4" style="color: #111827;" />
           </template>
         </n-button>
+        <!-- Windows only: its native title-bar X exits iterate, so the popup
+             needs a separate way to end just this interaction. -->
         <n-button
+          v-if="windowsPlatform"
           size="small"
           quaternary
           circle
@@ -535,41 +734,69 @@ function handleCodexLiveClick() {
         </n-button>
       </n-space>
     </div>
+    <div
+      v-if="displayConversationTitle || crossState.mirror"
+      class="conversation-title-row mt-2 flex min-w-0 items-center gap-2 border-t pt-2"
+      :class="[props.currentTheme === 'light' ? 'border-gray-200' : 'border-white/10', { 'origin-remote': crossState.mirror }]"
+      :title="displayConversationTitle"
+      data-guide="conversation-title"
+    >
+      <span
+        v-if="crossState.mirror"
+        class="origin-badge flex-shrink-0 text-xs"
+      >异端 · {{ crossState.origin_name || '另一设备' }}</span>
+      <span
+        class="truncate text-sm font-medium"
+        :style="{
+          color: props.currentTheme === 'light' ? '#111827' : '#f9fafb',
+          textDecoration: 'underline',
+          textUnderlineOffset: '3px',
+        }"
+      >{{ displayConversationTitle }}</span>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.popup-header-quota :deep(.usage-trigger) {
-  min-width: 0;
-  height: auto;
-  gap: 10px;
-  padding: 2px 6px 2px 4px;
+.window-overview-trigger {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 6px;
+  margin-left: -6px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
-  color: inherit;
-  box-shadow: none;
-  line-height: 1;
+  cursor: pointer;
 }
 
-.popup-header-quota :deep(.usage-trigger:hover),
-.popup-header-quota :deep(.usage-trigger:focus-visible),
-.popup-header-quota :deep(.usage-trigger[aria-expanded='true']) {
-  background: rgba(255, 255, 255, 0.08);
-  box-shadow: none;
-  transform: none;
+.window-overview-trigger:hover,
+.window-overview-trigger:focus-visible {
+  background: rgb(0 0 0 / 0.05);
+  outline: none;
 }
 
-.popup-header-quota :deep(.usage-panel) {
-  top: calc(100% + 16px);
-  left: -4px;
+:root.dark .window-overview-trigger:hover,
+:root.dark .window-overview-trigger:focus-visible {
+  background: rgb(255 255 255 / 0.08);
 }
 
-.popup-header-quota h1 {
-  margin: 0;
-  line-height: 1.15;
+.window-overview-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--color-on-surface);
+  color: var(--color-surface);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
 }
 
+.conversation-title-row.origin-remote { border-left: 3px solid #a855f7; padding-left: 8px; }
+.origin-badge { padding: 2px 6px; border-radius: 4px; }
+.origin-remote .origin-badge { background: #f3e8ff; color: #6b21a8; }
 .popup-header-root {
   position: relative;
   z-index: 5000;

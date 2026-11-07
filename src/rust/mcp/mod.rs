@@ -1,8 +1,11 @@
 pub mod client_install;
+pub mod caller_identity;
+pub mod caller_model;
 pub mod codex_deeplink;
 pub mod codex_home;
 pub mod commands;
 pub mod handlers;
+pub mod knowledge_starter;
 pub mod server;
 pub mod tools;
 pub mod types;

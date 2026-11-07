@@ -24,6 +24,16 @@ pub(super) fn extract_request_id_from_mcp_state(payload: &serde_json::Value) -> 
     })
 }
 
+/// Whether the payload carries a body the iOS client will render; the client
+/// drops sync replies whose `request.message` is blank.
+pub(super) fn mcp_state_has_request_message(payload: &serde_json::Value) -> bool {
+    payload
+        .get("request")
+        .and_then(|request| request.get("message"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|message| !message.trim().is_empty())
+}
+
 pub(super) fn extract_timeline_route_id_from_mcp_state(
     payload: &serde_json::Value,
 ) -> Option<String> {
@@ -109,4 +119,23 @@ pub(super) fn extract_conversation_id_from_mcp_state(
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_state_has_request_message;
+
+    #[test]
+    fn request_message_presence_ignores_blank_bodies() {
+        assert!(mcp_state_has_request_message(
+            &serde_json::json!({ "request": { "message": "hi" } })
+        ));
+        assert!(!mcp_state_has_request_message(
+            &serde_json::json!({ "request": { "message": "  \n" } })
+        ));
+        assert!(!mcp_state_has_request_message(
+            &serde_json::json!({ "request": { "request_id": "r1" } })
+        ));
+        assert!(!mcp_state_has_request_message(&serde_json::json!({})));
+    }
 }

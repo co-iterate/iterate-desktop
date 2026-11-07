@@ -29,7 +29,7 @@ pub(super) struct DocumentPreview {
     pub content: String,
 }
 
-fn decode_path(value: &str) -> Option<String> {
+pub(super) fn decode_path(value: &str) -> Option<String> {
     let mut output = Vec::new();
     let bytes = value.as_bytes();
     let mut i = 0;
@@ -124,7 +124,7 @@ fn resolve_path(destination: &str, root: &Path, base: &Path, image: bool) -> Opt
 }
 
 // Return link or image destinations, leaving escaped syntax and code untouched.
-fn destination_ranges(text: &str, images: bool) -> Vec<std::ops::Range<usize>> {
+pub(super) fn destination_ranges(text: &str, images: bool) -> Vec<std::ops::Range<usize>> {
     let bytes = text.as_bytes();
     let mut ranges = Vec::new();
     let mut i = 0;

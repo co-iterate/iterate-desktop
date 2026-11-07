@@ -23,6 +23,9 @@ pub struct WindowInstance {
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_title: Option<String>,
+    /// 消息全文（有上限），只给窗口总览搜索用；标题仍是截短后的 `request_title`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
@@ -65,8 +68,7 @@ impl WindowRegistry {
         let pid = process::id();
         let normalized_project_path = normalize_project_path(project_path, pid);
         let normalized_request_id = normalize_optional_trimmed(request_id);
-        let normalized_request_title =
-            normalize_optional_trimmed(request_title).map(|title| truncate_request_title(&title));
+        let normalized_request_title = normalize_optional_trimmed(request_title);
         let port = serve_port_for_pid(pid);
 
         *self = register_instance_at_path(
@@ -111,6 +113,7 @@ impl WindowRegistry {
             registry.instances.retain(|instance| instance.pid != pid);
             registry.last_focused_at_by_pid.remove(&pid);
         })?;
+        write_request_text(&Self::registry_path(), pid, None);
         log_important!(info, "窗口已注销: PID={}", pid);
         Ok(())
     }
@@ -141,8 +144,10 @@ impl WindowRegistry {
             {
                 instance.request_id = None;
                 instance.request_title = None;
+                instance.request_text = None;
             }
         })?;
+        write_request_text(&Self::registry_path(), pid, None);
         log_important!(info, "窗口请求绑定已清除: PID={}", pid);
         Ok(())
     }
@@ -156,7 +161,14 @@ impl WindowRegistry {
             Ok(registry) => *self = registry,
             Err(error) => log_important!(warn, "读取窗口注册表失败: {}", error),
         }
-        self.instances.clone()
+        let mut instances = self.instances.clone();
+        for instance in &mut instances {
+            if instance.request_text.is_none() && instance.request_id.is_some() {
+                instance.request_text = read_request_text(path, instance.pid);
+            }
+        }
+        prune_request_texts(path, &instances);
+        instances
     }
 
     fn cleanup_stale_instances(&mut self) {
@@ -289,7 +301,7 @@ fn register_spawned_popup_at_path(
         pid,
         &normalize_project_path(project_path, pid),
         Some(request_id),
-        Some(&truncate_request_title(request_title)),
+        Some(request_title),
         None,
     )?;
     Ok(())
@@ -305,8 +317,10 @@ fn register_instance_at_path(
 ) -> Result<WindowRegistry, String> {
     let project_path = project_path.to_string();
     let request_id = normalize_optional_trimmed(request_id);
+    let request_text = normalize_optional_trimmed(request_title).map(|text| truncate_request_text(&text));
     let request_title =
         normalize_optional_trimmed(request_title).map(|title| truncate_request_title(&title));
+    write_request_text(path, pid, request_text.as_deref());
     update_registry_at_path(path, true, move |registry| {
         if let Some(instance) = registry
             .instances
@@ -318,6 +332,7 @@ fn register_instance_at_path(
             instance.port = port;
             instance.request_id = request_id.clone();
             instance.request_title = request_title.clone();
+            instance.request_text = request_text.clone();
         } else {
             registry.instances.push(WindowInstance {
                 pid,
@@ -327,6 +342,7 @@ fn register_instance_at_path(
                 port,
                 request_id,
                 request_title,
+                request_text,
             });
         }
     })
@@ -393,6 +409,60 @@ fn normalize_optional_trimmed(value: Option<&str>) -> Option<String> {
 
 fn truncate_request_title(title: &str) -> String {
     title.trim().chars().take(80).collect()
+}
+
+/// 注册表是各进程共享、频繁读写的文件，全文设上限，免得几十个窗口把它撑大。
+fn truncate_request_text(text: &str) -> String {
+    text.trim().chars().take(10_000).collect()
+}
+
+/// 全文另存一份 `<注册表名>_texts/<pid>.txt`：还在运行的旧版进程改写注册表时
+/// 不认识 `request_text`，会把它丢掉；这份旁路文件旧进程不会碰。
+fn request_text_dir(registry_path: &Path) -> PathBuf {
+    let stem = registry_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("iterate_windows");
+    registry_path.with_file_name(format!("{stem}_texts"))
+}
+
+fn write_request_text(registry_path: &Path, pid: u32, text: Option<&str>) {
+    let dir = request_text_dir(registry_path);
+    let file = dir.join(format!("{pid}.txt"));
+    let result = match text {
+        Some(text) => fs::create_dir_all(&dir).and_then(|_| fs::write(&file, text)),
+        None => match fs::remove_file(&file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    if let Err(error) = result {
+        log_important!(warn, "写入窗口全文失败: PID={}, {}", pid, error);
+    }
+}
+
+fn read_request_text(registry_path: &Path, pid: u32) -> Option<String> {
+    fs::read_to_string(request_text_dir(registry_path).join(format!("{pid}.txt")))
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// 窗口已不在注册表里（进程退出、被清理）的旁路文件顺手删掉。
+fn prune_request_texts(registry_path: &Path, instances: &[WindowInstance]) {
+    let Ok(entries) = fs::read_dir(request_text_dir(registry_path)) else {
+        return;
+    };
+    let live = instances.iter().map(|instance| instance.pid).collect::<HashSet<_>>();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".txt"))
+            .and_then(|pid| pid.parse::<u32>().ok());
+        if pid.is_some_and(|pid| !live.contains(&pid)) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn is_process_running(pid: u32) -> bool {
@@ -525,6 +595,96 @@ fn process_parent_pid(_pid: u32) -> Option<u32> {
     None
 }
 
+const FOCUS_REQUEST_TTL_MS: u128 = 5_000;
+
+fn focus_request_path() -> PathBuf {
+    std::env::temp_dir().join("iterate_focus_request.json")
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
+}
+
+/// 每个弹窗进程都在 200ms 的原生 tick 里查看这份请求，命中自己就把窗口拉到前台。
+fn write_focus_request(pid: u32) -> Result<(), String> {
+    let content = serde_json::json!({ "pid": pid, "requested_at_ms": unix_millis() as u64 });
+    fs::write(focus_request_path(), content.to_string())
+        .map_err(|error| format!("写入聚焦请求失败: {}", error))
+}
+
+pub fn take_focus_request_for_current_process() -> bool {
+    let path = focus_request_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&content) else {
+        let _ = fs::remove_file(&path);
+        return false;
+    };
+    let pid = request.get("pid").and_then(|value| value.as_u64());
+    let requested_at = request
+        .get("requested_at_ms")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default() as u128;
+    if unix_millis().saturating_sub(requested_at) > FOCUS_REQUEST_TTL_MS {
+        let _ = fs::remove_file(&path);
+        return false;
+    }
+    if pid != Some(process::id() as u64) {
+        return false;
+    }
+    let _ = fs::remove_file(&path);
+    true
+}
+
+/// macOS 14 起激活是协作式的：前台进程要先把激活权让给目标，目标的自我激活才会生效。
+/// 必须在主线程调用。
+#[cfg(target_os = "macos")]
+pub fn yield_activation_to(pid: u32) {
+    use objc::runtime::{Object, BOOL, NO};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let target: *mut Object = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid as i32
+        ];
+        if application.is_null() || target.is_null() {
+            return;
+        }
+        let supported: BOOL =
+            msg_send![application, respondsToSelector: sel!(yieldActivationToApplication:)];
+        if supported != NO {
+            let _: () = msg_send![application, yieldActivationToApplication: target];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_iterate_process_natively(pid: u32) -> bool {
+    use crate::native_speech::target::{
+        activate_application, current_bundle_identifier, FrontmostApplication,
+    };
+    let Some(bundle_id) = current_bundle_identifier() else {
+        log_important!(warn, "[DEBUG] 无法读取当前 bundle id，跳过原生激活");
+        return false;
+    };
+    let target = FrontmostApplication {
+        bundle_id,
+        pid: pid as i32,
+    };
+    match activate_application(&target) {
+        Ok(()) => true,
+        Err(error) => {
+            log_important!(warn, "[DEBUG] 原生激活失败: {}", error);
+            false
+        }
+    }
+}
+
 pub fn activate_window(pid: u32) -> Result<(), String> {
     log_important!(info, "[DEBUG] activate_window 被调用，目标 PID: {}", pid);
     log_important!(info, "[DEBUG] 当前进程 PID: {}", process::id());
@@ -542,6 +702,15 @@ pub fn activate_window(pid: u32) -> Result<(), String> {
             return Err(format!("进程 {} 不存在", pid));
         }
 
+        // 先按 PID 原生激活：NSRunningApplication 不需要辅助功能权限，
+        // 也不会像 `open -a iterate` 那样落到任意一个 iterate 进程上。
+        if let Err(error) = write_focus_request(pid) {
+            log_important!(warn, "[DEBUG] {}", error);
+        }
+        let natively_activated = activate_iterate_process_natively(pid);
+
+        // AppleScript 负责取消最小化并 AXRaise；没有辅助功能权限时会失败，
+        // 原生激活已成功就不再走 `open -a` 兜底。
         // 使用 AppleScript 通过 process id 激活（更精确）
         let script = format!(
             r#"
@@ -580,7 +749,10 @@ pub fn activate_window(pid: u32) -> Result<(), String> {
             .output()
             .map_err(|e| format!("激活窗口失败: {}", e))?;
 
-        if !output.status.success() {
+        if !output.status.success() && natively_activated {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log_important!(warn, "[DEBUG] AppleScript 未能取消最小化（已原生激活）: {}", stderr);
+        } else if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             log_important!(warn, "[DEBUG] AppleScript 警告: {}", stderr);
 
@@ -621,6 +793,31 @@ pub fn activate_window(pid: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registry_keeps_full_message_for_search_while_title_stays_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windows.json");
+        let message = format!("第一行标题\n{}\n结尾关键字", "正文".repeat(100));
+        super::register_spawned_popup_at_path(
+            &path,
+            std::process::id(),
+            "/tmp/overview-search",
+            "serve-search",
+            &message,
+        )
+        .unwrap();
+        let instance = &super::load_registry_from_path(&path).instances[0];
+        assert_eq!(instance.request_title.as_deref().unwrap().chars().count(), 80);
+        assert!(instance.request_text.as_deref().unwrap().ends_with("结尾关键字"));
+
+        // 旧版进程改写注册表时会丢掉 request_text；列表仍能从旁路文件补回全文。
+        let mut stripped = super::load_registry_from_path(&path);
+        stripped.instances[0].request_text = None;
+        std::fs::write(&path, serde_json::to_vec(&stripped).unwrap()).unwrap();
+        let listed = super::WindowRegistry::default().get_all_instances_at_path(&path);
+        assert!(listed[0].request_text.as_deref().unwrap().ends_with("结尾关键字"));
+    }
+
     #[test]
     fn native_delivery_registers_real_child_identity_without_a_webview() {
         let dir = tempfile::tempdir().unwrap();
@@ -789,6 +986,7 @@ mod tests {
                 port: Some(5311),
                 request_id: Some("req-active".to_string()),
                 request_title: Some("active".to_string()),
+                request_text: None,
             }],
             ..WindowRegistry::default()
         };
@@ -858,6 +1056,7 @@ mod tests {
                     port: Some(5311),
                     request_id: Some("req-live".to_string()),
                     request_title: Some("live".to_string()),
+                    request_text: None,
                 },
                 super::WindowInstance {
                     pid: stale_pid,
@@ -867,6 +1066,7 @@ mod tests {
                     port: Some(5312),
                     request_id: Some("req-stale".to_string()),
                     request_title: Some("stale".to_string()),
+                    request_text: None,
                 },
             ],
             last_focused_at_by_pid: [

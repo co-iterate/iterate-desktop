@@ -5,8 +5,10 @@ import { emit } from '@tauri-apps/api/event'
 import { useSortable } from '@vueuse/integrations/useSortable'
 import { useMessage } from 'naive-ui'
 import { nextTick, onMounted, ref, shallowRef } from 'vue'
+import { usePopupCompactMode } from '../../composables/usePopupCompactMode'
 
 const message = useMessage()
+const { popupCompactMode, setPopupCompactMode } = usePopupCompactMode()
 
 // 配置状态
 const config = ref<CustomPromptConfig>({
@@ -284,6 +286,22 @@ onMounted(async () => {
       <n-switch
         v-model:value="config.enabled"
         @update:value="toggleEnabled"
+      />
+    </div>
+
+    <!-- 简洁弹窗开关 -->
+    <div v-if="config.enabled" class="flex items-center justify-between mb-6" data-guide="popup-compact-mode">
+      <div>
+        <div class="text-sm opacity-60">
+          简洁弹窗
+        </div>
+        <div class="text-xs opacity-40 mt-0.5">
+          弹窗里的快捷模板和上下文追加收成一行，点开才展开。追加内容照常注入，⌥1-9 照常可用。
+        </div>
+      </div>
+      <n-switch
+        :value="popupCompactMode"
+        @update:value="setPopupCompactMode"
       />
     </div>
 

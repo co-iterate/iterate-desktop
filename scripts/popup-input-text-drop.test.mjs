@@ -45,7 +45,7 @@ test('wires text dragover and drop into PopupInput', () => {
 test('uses textarea selection and restores the inserted caret', () => {
   assert.match(popupInputSource, /selectionStart/)
   assert.match(popupInputSource, /selectionEnd/)
-  assert.match(popupInputSource, /userInput\.value = result\.value/)
+  assert.match(popupInputSource, /writeUserInput\(result\.value\)/)
   assert.match(popupInputSource, /setSelectionRange\(result\.cursor, result\.cursor\)/)
 })
 

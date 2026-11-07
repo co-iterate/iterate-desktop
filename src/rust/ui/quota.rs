@@ -1,3 +1,4 @@
+use super::claude_quota::get_claude_code_usage_provider;
 use super::codex_quota::{
     get_native_codex_usage_provider, get_native_codex_usage_provider_with_options,
     CodexUsageProviderOptions,
@@ -832,12 +833,115 @@ fn antigravity_snapshot_to_provider(snapshot: AntigravitySnapshot) -> UsageProvi
         id: "antigravity".to_string(),
         name: "Antigravity".to_string(),
         account_label: None,
-        color: "#60ba7e".to_string(),
+        color: "#3589fd".to_string(),
         icon_url: Some("./icons/ai-providers/antigravity.svg".to_string()),
         summary: snapshot.account_plan.unwrap_or_else(|| "Local".to_string()),
         updated_at: Some(Local::now().format("%H:%M").to_string()),
         metrics,
     }
+}
+
+/// `agy -p "/quota"` 每行一条：`分组\t窗口\t剩余%\t重置时间(RFC3339)`。
+fn parse_agy_quota_output(output: &str) -> Vec<QuotaMetric> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').map(str::trim).collect();
+            let [group, window, remaining, reset] = fields.as_slice() else {
+                return None;
+            };
+            let remaining: f64 = remaining.strip_suffix('%')?.trim().parse().ok()?;
+            let group_lower = group.to_ascii_lowercase();
+            let group = if group_lower.starts_with("gemini") {
+                "Gemini"
+            } else if group_lower.contains("claude") {
+                "Claude/GPT"
+            } else {
+                group
+            };
+            let window_lower = window.to_ascii_lowercase();
+            let window = if window_lower.contains("five hour") {
+                "5h"
+            } else if window_lower.contains("weekly") {
+                "Weekly"
+            } else {
+                window
+            };
+            let reset_at = DateTime::parse_from_rfc3339(reset)
+                .ok()
+                .map(|date| date.with_timezone(&Local));
+            Some(QuotaMetric {
+                label: format!("{} {}", group, window),
+                remaining: clamp_percent(remaining).round() as u8,
+                reset_label: format_local_reset_label(reset_at),
+                reset_at_ms: reset_at.map(|date| date.timestamp_millis()),
+            })
+        })
+        .collect()
+}
+
+/// 读取失败后的冷却期：登录失效时不必每次刷新都再卡一次超时。
+const AGY_QUOTA_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+static AGY_QUOTA_LAST_FAILURE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// IDE 没在跑时（只用 agy CLI），改用 agy 自带的只读 `/quota` 命令。
+async fn fetch_agy_cli_provider() -> Result<UsageProvider, String> {
+    if let Some(failed_at) = *AGY_QUOTA_LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) {
+        if failed_at.elapsed() < AGY_QUOTA_FAILURE_COOLDOWN {
+            return Err("agy 上次读取额度失败（可能需要重新登录 agy），30 分钟内不再重试".to_string());
+        }
+    }
+    let result = run_agy_quota().await;
+    *AGY_QUOTA_LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) =
+        result.is_err().then(std::time::Instant::now);
+    result
+}
+
+async fn run_agy_quota() -> Result<UsageProvider, String> {
+    let agy = crate::mcp::client_install::find_agy_cli()
+        .ok_or_else(|| "未找到 agy CLI".to_string())?;
+    let mut command = Command::new(agy);
+    // 登录失效时 print 模式会自动发起 OAuth，并通过 PATH 里的 `open` 弹出浏览器；
+    // 后台刷新额度绝不能弹登录页，所以给空 PATH，让它只能超时失败。
+    command
+        .args(["-p", "/quota"])
+        .env("PATH", "/var/empty")
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // LaunchAgent 起的 bridge 没有终端里的 https_proxy，agy 连不上 Google 只会卡到超时；
+    // 和 Codex 额度一样补上 macOS 系统代理。
+    if std::env::var_os("HTTPS_PROXY").is_none() && std::env::var_os("https_proxy").is_none() {
+        if let Some(proxy_url) = super::codex_quota::macos_system_https_proxy_url() {
+            command
+                .env("HTTPS_PROXY", &proxy_url)
+                .env("HTTP_PROXY", &proxy_url)
+                .env("NO_PROXY", "localhost,127.0.0.1,::1");
+        }
+    }
+    let output = timeout(Duration::from_secs(20), command.output())
+        .await
+        .map_err(|_| "agy /quota 超时（可能需要在终端重新登录 agy）".to_string())?
+        .map_err(|e| format!("运行 agy 失败: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let metrics = parse_agy_quota_output(stdout.as_ref());
+    if metrics.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().lines().last().unwrap_or("未返回额度");
+        return Err(format!("agy /quota 没有额度数据：{}", detail));
+    }
+
+    Ok(UsageProvider {
+        id: "antigravity".to_string(),
+        name: "Antigravity".to_string(),
+        account_label: None,
+        color: "#3589fd".to_string(),
+        icon_url: Some("./icons/ai-providers/antigravity.svg".to_string()),
+        summary: "agy CLI".to_string(),
+        updated_at: Some(Local::now().format("%H:%M").to_string()),
+        metrics,
+    })
 }
 
 async fn get_antigravity_usage_provider(
@@ -846,9 +950,12 @@ async fn get_antigravity_usage_provider(
     if config.source != "local" && config.source != "auto" {
         return Err(format!("Antigravity 暂不支持 source={}", config.source));
     }
-    Ok(antigravity_snapshot_to_provider(
-        fetch_antigravity_snapshot().await?,
-    ))
+    match fetch_antigravity_snapshot().await {
+        Ok(snapshot) => Ok(antigravity_snapshot_to_provider(snapshot)),
+        Err(ide_error) => fetch_agy_cli_provider()
+            .await
+            .map_err(|cli_error| format!("{}；{}", ide_error, cli_error)),
+    }
 }
 
 #[tauri::command]
@@ -896,6 +1003,19 @@ pub async fn get_usage_quota_providers_from_config(
         }
     }
 
+    // Saved configs predate the Claude provider, so an absent entry means enabled.
+    let claude_enabled = usage_config.enabled
+        && usage_config
+            .providers
+            .get("claude")
+            .map_or(true, |config| config.enabled);
+    if claude_enabled {
+        match get_claude_code_usage_provider().await {
+            Ok(provider) => providers.push(provider),
+            Err(error) => errors.push(format!("无法获取 Claude Code 额度：{}", error)),
+        }
+    }
+
     if providers.is_empty() && !errors.is_empty() {
         return Err(errors.join("；"));
     }
@@ -906,6 +1026,21 @@ pub async fn get_usage_quota_providers_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_agy_quota_lines() {
+        let metrics = parse_agy_quota_output(
+            "Gemini Models\tFive Hour Limit Remaining\t99%\t2026-10-29T07:51:39Z\n\
+             Claude and GPT models\tWeekly Limit Remaining\t42%\t2026-11-05T03:10:21Z\n\
+             noise line\n",
+        );
+        let labels: Vec<(&str, u8)> = metrics
+            .iter()
+            .map(|metric| (metric.label.as_str(), metric.remaining))
+            .collect();
+        assert_eq!(labels, vec![("Gemini 5h", 99), ("Claude/GPT Weekly", 42)]);
+        assert_eq!(metrics[0].reset_at_ms, Some(1_793_260_299_000));
+    }
 
     fn codex_account(id: &str) -> UsageProviderAccountConfig {
         UsageProviderAccountConfig {

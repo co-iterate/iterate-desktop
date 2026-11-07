@@ -4,6 +4,13 @@
 
 use anyhow::{Context, Result};
 use chrono::Local;
+use cunzhi::mcp::caller_identity::{
+    detect_antigravity_cli_caller, detect_claude_code_parent, AntigravityCaller, ClaudeCodeCaller,
+    CALLER_CLIENT_ANTIGRAVITY, CALLER_CLIENT_CLAUDE_CODE, CALLER_CLIENT_CODEX,
+};
+use cunzhi::mcp::caller_model::{
+    antigravity_cli_model, claude_session_model, codex_thread_model, CallerModel,
+};
 use cunzhi::mcp::codex_deeplink::{
     codex_thread_deeplink, extract_codex_thread_id_from_metas, extract_codex_thread_id_from_value,
     normalize_codex_thread_deeplink, normalize_codex_thread_id,
@@ -22,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,6 +79,29 @@ struct DialogRequest {
     codex_thread_id: Option<String>,
     #[serde(default)]
     codex_deeplink: Option<String>,
+    /// 调用方客户端：`codex` / `claude_code`（P-2026-9373）
+    #[serde(default)]
+    caller_client: Option<String>,
+    /// Claude Code 调用方的会话 ID（只给 Claude 用，不进 codex_thread_id）
+    #[serde(default)]
+    caller_session_id: Option<String>,
+    /// Claude Code 调用方会话的启动目录（用于 `claude --resume`）
+    #[serde(default)]
+    caller_cwd: Option<String>,
+    /// Claude Code 调用方进程号（用于 ⌘+点击回到对应终端标签页）
+    #[serde(default)]
+    caller_pid: Option<u32>,
+    /// 调用方此刻的模型原始 ID（如 `claude-opus-5-5`）；读不到为空
+    #[serde(default)]
+    caller_model: Option<String>,
+    /// 弹窗头部显示用的模型短名（如 `Opus 5.5`）
+    #[serde(default)]
+    caller_model_label: Option<String>,
+    /// 稳定的时间线 route；Claude 调用方为 `claude-code:<sessionId>`，Codex 调用方留空沿用 codex_thread_id
+    #[serde(default)]
+    timeline_route_id: Option<String>,
+    #[serde(default)]
+    conversation_title: Option<String>,
     #[serde(default)]
     checkpoint_id: Option<String>,
     #[serde(default)]
@@ -101,6 +131,39 @@ fn default_codex_home() -> Option<PathBuf> {
     codex_home_from_env()
         .map(PathBuf::from)
         .or_else(|| iterate_home_dir().map(|home| home.join(".codex")))
+}
+
+fn normalize_conversation_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn codex_thread_title_from_session_index(codex_home: &Path, thread_id: &str) -> Option<String> {
+    let file = std::fs::File::open(codex_home.join("session_index.jsonl")).ok()?;
+    let mut matched_title = None;
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("id").and_then(|value| value.as_str()) != Some(thread_id) {
+            continue;
+        }
+
+        if let Some(title) =
+            normalize_conversation_title(entry.get("thread_name").and_then(|value| value.as_str()))
+        {
+            matched_title = Some(title);
+        }
+    }
+
+    matched_title
+}
+
+fn codex_thread_title(thread_id: &str) -> Option<String> {
+    default_codex_home().and_then(|home| codex_thread_title_from_session_index(&home, thread_id))
 }
 
 fn codex_state_db_candidates(codex_home: &Path) -> Vec<PathBuf> {
@@ -492,6 +555,9 @@ struct CallZhiArgs {
     /// 调用本次 MCP 的 Codex 会话 deep link（可选；通常自动生成）
     #[serde(default)]
     codex_deeplink: Option<String>,
+    /// 调用本次 MCP 的对话标题（可选；未提供时按 Codex 会话 ID 自动提取）
+    #[serde(default)]
+    conversation_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1604,41 +1670,126 @@ fn record_conversation(
     append_conversation_log(&entry);
 }
 
-async fn call_zhi(
-    args: CallZhiArgs,
+struct CallZhiRouteInputs {
+    explicit_codex_thread_id: Option<String>,
     caller_codex_thread_id: Option<String>,
     argument_codex_thread_id: Option<String>,
-) -> Result<CallToolResult, ErrorData> {
-    #[cfg(target_os = "windows")]
-    cunzhi::app::windows_lifecycle::activate_mcp_launch().map_err(|error| {
-        ErrorData::internal_error(format!("重新启动 iterate 失败: {error}"), None)
-    })?;
+    claude_caller: Option<ClaudeCodeCaller>,
+    antigravity_caller: Option<AntigravityCaller>,
+}
 
-    let explicit_codex_thread_id = args
-        .codex_thread_id
+#[derive(Debug, Clone)]
+struct ResolvedCallZhiRoute {
+    caller_client: &'static str,
+    claude_caller: Option<ClaudeCodeCaller>,
+    antigravity_caller: Option<AntigravityCaller>,
+    /// 显式的稳定 route；只有 Claude 调用方会填，Codex 调用方沿用 codex_thread_id。
+    timeline_route_id: Option<String>,
+    explicit_codex_thread_id: Option<String>,
+    caller_codex_thread_id: Option<String>,
+    argument_codex_thread_id: Option<String>,
+    latest_state_codex_thread: Option<CodexThreadFallback>,
+    live_goal_codex_thread_id: Option<String>,
+    codex_thread_id: Option<String>,
+}
+
+impl ResolvedCallZhiRoute {
+    /// Claude 是会话 ID，agy 是会话 ID（`agy --conversation`）；弹窗 ⌘+点击用它回到原会话。
+    fn caller_session_id(&self) -> Option<&str> {
+        self.claude_caller
+            .as_ref()
+            .map(|caller| caller.session_id.as_str())
+            .or_else(|| {
+                self.antigravity_caller
+                    .as_ref()
+                    .and_then(|caller| caller.conversation_id.as_deref())
+            })
+    }
+
+    fn caller_cwd(&self) -> Option<&str> {
+        self.claude_caller
+            .as_ref()
+            .and_then(|caller| caller.cwd.as_deref())
+            .or_else(|| {
+                self.antigravity_caller
+                    .as_ref()
+                    .and_then(|caller| caller.cwd.as_deref())
+            })
+    }
+
+    fn caller_pid(&self) -> Option<u32> {
+        self.claude_caller
+            .as_ref()
+            .map(|caller| caller.pid)
+            .or_else(|| self.antigravity_caller.as_ref().map(|caller| caller.pid))
+    }
+}
+
+/// call_zhi 的时间线 route 解析（P-2026-1884 / P-2026-9373）。
+///
+/// - Claude Code 调用方：route 固定为 `claude-code:<sessionId>`，`codex_thread_id` 一律为空，
+///   且**不**查 Codex state DB、**不**用 live goal 兜底，避免借用同目录 Codex 线程混线。
+/// - 其他调用方（Codex）：保持原顺序 显式参数 → MCP caller meta → 参数 `_meta` →
+///   Codex state DB 最新线程 → live goal。
+fn resolve_call_zhi_route(
+    inputs: CallZhiRouteInputs,
+    latest_state_fallback: impl FnOnce() -> Option<CodexThreadFallback>,
+    live_goal_fallback: impl FnOnce() -> Option<String>,
+) -> ResolvedCallZhiRoute {
+    let explicit_codex_thread_id = inputs
+        .explicit_codex_thread_id
         .as_deref()
         .and_then(normalize_codex_thread_id);
-    let caller_codex_thread_id =
-        caller_codex_thread_id.and_then(|value| normalize_codex_thread_id(&value));
-    let argument_codex_thread_id =
-        argument_codex_thread_id.and_then(|value| normalize_codex_thread_id(&value));
-    let latest_state_codex_thread = if explicit_codex_thread_id.is_none()
-        && caller_codex_thread_id.is_none()
-        && argument_codex_thread_id.is_none()
-    {
-        latest_codex_thread_fallback_for_project(&args.project_path)
-    } else {
+    let caller_codex_thread_id = inputs
+        .caller_codex_thread_id
+        .and_then(|value| normalize_codex_thread_id(&value));
+    let argument_codex_thread_id = inputs
+        .argument_codex_thread_id
+        .and_then(|value| normalize_codex_thread_id(&value));
+
+    if let Some(claude_caller) = inputs.claude_caller {
+        return ResolvedCallZhiRoute {
+            caller_client: CALLER_CLIENT_CLAUDE_CODE,
+            timeline_route_id: Some(claude_caller.timeline_route_id()),
+            claude_caller: Some(claude_caller),
+            antigravity_caller: None,
+            explicit_codex_thread_id,
+            caller_codex_thread_id,
+            argument_codex_thread_id,
+            latest_state_codex_thread: None,
+            live_goal_codex_thread_id: None,
+            codex_thread_id: None,
+        };
+    }
+
+    // agy 调用方同理：没有 Codex 线程，不能借用同目录最近的 Codex 线程。
+    if let Some(antigravity_caller) = inputs.antigravity_caller {
+        return ResolvedCallZhiRoute {
+            caller_client: CALLER_CLIENT_ANTIGRAVITY,
+            claude_caller: None,
+            antigravity_caller: Some(antigravity_caller),
+            timeline_route_id: None,
+            explicit_codex_thread_id,
+            caller_codex_thread_id,
+            argument_codex_thread_id,
+            latest_state_codex_thread: None,
+            live_goal_codex_thread_id: None,
+            codex_thread_id: None,
+        };
+    }
+
+    let has_direct_thread = explicit_codex_thread_id.is_some()
+        || caller_codex_thread_id.is_some()
+        || argument_codex_thread_id.is_some();
+    let latest_state_codex_thread = if has_direct_thread {
         None
+    } else {
+        latest_state_fallback()
     };
-    let live_goal_codex_thread_id = if explicit_codex_thread_id.is_none()
-        && caller_codex_thread_id.is_none()
-        && argument_codex_thread_id.is_none()
-        && latest_state_codex_thread.is_none()
-    {
-        cunzhi::ui::live_goal::live_goal_codex_thread_id_for_project(Some(&args.project_path))
-            .and_then(|value| normalize_codex_thread_id(&value))
-    } else {
+    let live_goal_codex_thread_id = if has_direct_thread || latest_state_codex_thread.is_some() {
         None
+    } else {
+        live_goal_fallback().and_then(|value| normalize_codex_thread_id(&value))
     };
     let codex_thread_id = explicit_codex_thread_id
         .clone()
@@ -1650,26 +1801,94 @@ async fn call_zhi(
                 .map(|fallback| fallback.thread_id.clone())
         })
         .or_else(|| live_goal_codex_thread_id.clone());
+
+    ResolvedCallZhiRoute {
+        caller_client: CALLER_CLIENT_CODEX,
+        claude_caller: None,
+        antigravity_caller: None,
+        timeline_route_id: None,
+        explicit_codex_thread_id,
+        caller_codex_thread_id,
+        argument_codex_thread_id,
+        latest_state_codex_thread,
+        live_goal_codex_thread_id,
+        codex_thread_id,
+    }
+}
+
+/// 调用方此刻的模型；读不到时弹窗只显示客户端名。
+fn resolve_caller_model(route: &ResolvedCallZhiRoute) -> Option<CallerModel> {
+    if let Some(caller) = &route.claude_caller {
+        return claude_session_model(&caller.session_id);
+    }
+    if route.caller_client == CALLER_CLIENT_ANTIGRAVITY {
+        return antigravity_cli_model();
+    }
+    let thread_id = route.codex_thread_id.as_deref()?;
+    let codex_home = default_codex_home()?;
+    codex_state_db_candidates(&codex_home)
+        .iter()
+        .find_map(|state_db_path| codex_thread_model(state_db_path, thread_id))
+}
+
+async fn call_zhi(
+    args: CallZhiArgs,
+    caller_codex_thread_id: Option<String>,
+    argument_codex_thread_id: Option<String>,
+) -> Result<CallToolResult, ErrorData> {
+    #[cfg(target_os = "windows")]
+    cunzhi::app::windows_lifecycle::activate_mcp_launch().map_err(|error| {
+        ErrorData::internal_error(format!("重新启动 iterate 失败: {error}"), None)
+    })?;
+
     let request_id = generate_request_id();
+    let claude_caller = detect_claude_code_parent();
+    let antigravity_caller = if claude_caller.is_none() {
+        detect_antigravity_cli_caller()
+    } else {
+        None
+    };
+    let route = resolve_call_zhi_route(
+        CallZhiRouteInputs {
+            explicit_codex_thread_id: args.codex_thread_id.clone(),
+            caller_codex_thread_id,
+            argument_codex_thread_id,
+            claude_caller,
+            antigravity_caller,
+        },
+        || latest_codex_thread_fallback_for_project(&args.project_path),
+        || cunzhi::ui::live_goal::live_goal_codex_thread_id_for_project(Some(&args.project_path)),
+    );
     append_timeline_debug_log(
         "rust/bin_mcp_server::call_zhi_route_context",
         serde_json::json!({
             "request_id": request_id.as_str(),
             "project_path": args.project_path.as_str(),
-            "explicit_codex_thread_id": explicit_codex_thread_id.as_deref(),
-            "caller_codex_thread_id": caller_codex_thread_id.as_deref(),
-            "argument_codex_thread_id": argument_codex_thread_id.as_deref(),
-            "latest_state_codex_thread_id": latest_state_codex_thread.as_ref().map(|fallback| fallback.thread_id.as_str()),
-            "latest_state_db_path": latest_state_codex_thread.as_ref().map(|fallback| fallback.state_db_path.display().to_string()),
-            "live_goal_codex_thread_id": live_goal_codex_thread_id.as_deref(),
-            "resolved_codex_thread_id": codex_thread_id.as_deref(),
+            "caller_client": route.caller_client,
+            "caller_session_id": route.caller_session_id(),
+            "caller_cwd": route.caller_cwd(),
+            "caller_pid": route.caller_pid(),
+            "timeline_route_id": route.timeline_route_id.as_deref(),
+            "explicit_codex_thread_id": route.explicit_codex_thread_id.as_deref(),
+            "caller_codex_thread_id": route.caller_codex_thread_id.as_deref(),
+            "argument_codex_thread_id": route.argument_codex_thread_id.as_deref(),
+            "latest_state_codex_thread_id": route.latest_state_codex_thread.as_ref().map(|fallback| fallback.thread_id.as_str()),
+            "latest_state_db_path": route.latest_state_codex_thread.as_ref().map(|fallback| fallback.state_db_path.display().to_string()),
+            "live_goal_codex_thread_id": route.live_goal_codex_thread_id.as_deref(),
+            "resolved_codex_thread_id": route.codex_thread_id.as_deref(),
         }),
     );
-    let codex_deeplink = args
-        .codex_deeplink
-        .as_deref()
-        .and_then(normalize_codex_thread_deeplink)
-        .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_deeplink));
+    let codex_thread_id = route.codex_thread_id.clone();
+    let codex_deeplink = if route.claude_caller.is_some() {
+        None
+    } else {
+        args.codex_deeplink
+            .as_deref()
+            .and_then(normalize_codex_thread_deeplink)
+            .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_deeplink))
+    };
+    let conversation_title = normalize_conversation_title(args.conversation_title.as_deref())
+        .or_else(|| codex_thread_id.as_deref().and_then(codex_thread_title));
     checkpoint::touch_auto_checkpoint_monitor(&args.project_path, Some(&request_id));
     let workspace_checkpoint =
         checkpoint::maybe_auto_checkpoint(&args.project_path, Some(&request_id));
@@ -1703,6 +1922,7 @@ async fn call_zhi(
         args.project_path, preferred_port, port
     );
 
+    let caller_model = resolve_caller_model(&route);
     let workspace = args.project_path.clone();
     let request = DialogRequest {
         request_id: request_id.clone(),
@@ -1713,6 +1933,14 @@ async fn call_zhi(
         codex_home: codex_home_from_env(),
         codex_thread_id,
         codex_deeplink,
+        caller_client: Some(route.caller_client.to_string()),
+        caller_session_id: route.caller_session_id().map(str::to_string),
+        caller_cwd: route.caller_cwd().map(str::to_string),
+        caller_pid: route.caller_pid(),
+        caller_model: caller_model.as_ref().map(|model| model.id.clone()),
+        caller_model_label: caller_model.map(|model| model.label),
+        timeline_route_id: route.timeline_route_id.clone(),
+        conversation_title,
         checkpoint_id: workspace_checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.checkpoint_id.clone()),
@@ -1826,7 +2054,10 @@ async fn call_zhi(
         &args.message,
         &dialog_response,
         Some(request_id),
-        request.codex_thread_id.clone(),
+        request
+            .timeline_route_id
+            .clone()
+            .or_else(|| request.codex_thread_id.clone()),
         workspace_checkpoint,
     );
 
@@ -2577,14 +2808,17 @@ impl ServerHandler for IterateZhiServer {
             },
             instructions: Some(format!(
                 "iterate 把你的阶段性结果推送到用户的桌面弹窗和手机，并取回用户的下一步指令（默认端口 {}）。\n\
+                 用 call_zhi 和用户保持连续对话：每个任务都以调用 call_zhi 交回作结，不要只用文字收尾；\
+                 拿到返回后把其中的用户输入当作新指令继续工作，做完再次调用 call_zhi，如此循环，直到返回“继续对话: false”。\n\
                  在以下时机调用 call_zhi：\n\
                  1. 一个完整任务完成，需要用户验收或决定下一步；\n\
                  2. 有多条路径或取舍，需要用户决策才能继续；\n\
                  3. 即将执行删除、覆盖、提交、推送、发布等高风险或不可逆操作之前；\n\
-                 4. 用户发送 zhi 时，立即停止当前操作并调用。\n\
+                 4. 用户最新消息正好是 zhi 时，立即停止当前操作并调用。\n\
                  不要在读取文件、搜索、构建、测试等中间步骤调用。\n\
-                 需要用户做选择时，把选项放进 predefined_options。\n\
-                 拿到返回后，把其中的用户输入当作新指令继续工作；返回“继续对话: false”时结束本轮。",
+                 message 写完整结果或待决事项；project_path 填当前项目绝对路径；需要用户做选择时，把选项放进 predefined_options。\n\
+                 返回里有附加图片时先看图片。call_zhi 会一直等用户回复，这是正常的；客户端把它转到后台时仍视为在等待，\
+                 不要另写总结代替，也不要再开第二个调用。",
                 self.default_port
             )),
         }
@@ -2624,6 +2858,10 @@ impl ServerHandler for IterateZhiServer {
                 "is_markdown": {
                     "type": "boolean",
                     "description": "消息是否使用 Markdown 格式（默认 true）"
+                },
+                "conversation_title": {
+                    "type": "string",
+                    "description": "当前对话标题（可选；Codex 会话未传时会自动提取）"
                 }
             },
             "required": ["message", "project_path"]
@@ -2895,6 +3133,49 @@ impl ServerHandler for IterateZhiServer {
     }
 }
 
+/// 新版 MCP（2026-07-28，如 agy 1.4.10）先发 `server/discover`，rmcp 只认 `initialize`，
+/// 收到别的首帧就直接断开。对 discover 回 -32601，客户端会退回 `initialize` 握手；
+/// 握手前的通知（如 roots/list_changed）rmcp 也不接受，一并丢弃。
+fn legacy_handshake_stdin() -> tokio::io::DuplexStream {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (mut forward, reader) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let mut initialized = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if !initialized {
+                let message: Option<serde_json::Value> = serde_json::from_str(&line).ok();
+                let method = message.as_ref().and_then(|m| m.get("method")).and_then(|m| m.as_str());
+                if method == Some("server/discover") {
+                    if let Some(id) = message.as_ref().and_then(|m| m.get("id")) {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": "Method not found" },
+                        });
+                        let mut stdout = tokio::io::stdout();
+                        let _ = stdout.write_all(format!("{reply}\n").as_bytes()).await;
+                        let _ = stdout.flush().await;
+                    }
+                    instance_debug_log("[stdio-discover-declined]", "replied -32601 to server/discover");
+                    continue;
+                }
+                if method != Some("initialize") {
+                    continue;
+                }
+                initialized = true;
+            }
+            if forward.write_all(line.as_bytes()).await.is_err()
+                || forward.write_all(b"\n").await.is_err()
+            {
+                break;
+            }
+        }
+    });
+    reader
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 解析命令行参数
@@ -2919,7 +3200,11 @@ async fn main() -> Result<()> {
     );
 
     // 启动 stdio 传输
-    let service = handler.serve(stdio()).await.context("MCP 服务器启动失败")?;
+    let (_, stdout) = stdio();
+    let service = handler
+        .serve((legacy_handshake_stdin(), stdout))
+        .await
+        .context("MCP 服务器启动失败")?;
     instance_debug_log("[stdio-started]", format!("default_port={}", default_port));
 
     // 等待服务器关闭或收到终止信号
@@ -3628,5 +3913,185 @@ mod tests {
             latest_codex_thread_fallback_for_project(workspace_str).expect("thread fallback");
         assert_eq!(fallback.thread_id, "019ec000-0000-7000-8000-000000000006");
         assert_eq!(fallback.state_db_path, root_state_db);
+    }
+
+    #[test]
+    fn codex_thread_title_uses_latest_non_empty_session_index_name() {
+        let codex_home = tempdir().expect("temp codex home");
+        std::fs::write(
+            codex_home.path().join("session_index.jsonl"),
+            concat!(
+                "not-json\n",
+                "{\"id\":\"thread-a\",\"thread_name\":\"旧标题\"}\n",
+                "{\"id\":\"thread-b\",\"thread_name\":\"其他标题\"}\n",
+                "{\"id\":\"thread-a\",\"thread_name\":\"   \"}\n",
+                "{\"id\":\"thread-a\",\"thread_name\":\" 当前对话标题 \"}\n",
+            ),
+        )
+        .expect("write session index");
+
+        assert_eq!(
+            codex_thread_title_from_session_index(codex_home.path(), "thread-a").as_deref(),
+            Some("当前对话标题")
+        );
+        assert_eq!(
+            codex_thread_title_from_session_index(codex_home.path(), "missing"),
+            None
+        );
+    }
+
+    fn claude_caller_fixture() -> ClaudeCodeCaller {
+        ClaudeCodeCaller {
+            session_id: "7dbca76e-c67a-4cee-ad28-52ad4d90bd28".to_string(),
+            cwd: Some("/Users/example/project".to_string()),
+            pid: 19268,
+        }
+    }
+
+    fn route_inputs(claude_caller: Option<ClaudeCodeCaller>) -> CallZhiRouteInputs {
+        CallZhiRouteInputs {
+            explicit_codex_thread_id: None,
+            caller_codex_thread_id: None,
+            argument_codex_thread_id: None,
+            claude_caller,
+            antigravity_caller: None,
+        }
+    }
+
+    #[test]
+    fn antigravity_caller_route_never_borrows_a_codex_thread() {
+        let mut inputs = route_inputs(None);
+        inputs.antigravity_caller = Some(AntigravityCaller {
+            pid: 68415,
+            conversation_id: Some("6cd1dca0-0d1f-434c-b99d-39b1281d38c4".to_string()),
+            cwd: Some("/Users/example/project".to_string()),
+        });
+        let route = resolve_call_zhi_route(
+            inputs,
+            || panic!("agy 调用方不得查 Codex state DB"),
+            || panic!("agy 调用方不得用 live goal 兜底"),
+        );
+        assert_eq!(route.caller_client, CALLER_CLIENT_ANTIGRAVITY);
+        assert_eq!(route.codex_thread_id, None);
+        assert_eq!(route.timeline_route_id, None);
+        assert!(route.claude_caller.is_none());
+    }
+
+    #[test]
+    fn claude_caller_route_uses_session_id_and_skips_codex_fallbacks() {
+        let mut inputs = route_inputs(Some(claude_caller_fixture()));
+        // 即便参数里混进了像线程 ID 的值，Claude 调用方也不得把它当作 codex_thread_id。
+        inputs.argument_codex_thread_id = Some("019ec000-0000-7000-8000-000000000001".to_string());
+        let route = resolve_call_zhi_route(
+            inputs,
+            || panic!("Claude 调用方不得查 Codex state DB"),
+            || panic!("Claude 调用方不得用 live goal 兜底"),
+        );
+        assert_eq!(route.caller_client, CALLER_CLIENT_CLAUDE_CODE);
+        assert_eq!(
+            route.timeline_route_id.as_deref(),
+            Some("claude-code:7dbca76e-c67a-4cee-ad28-52ad4d90bd28")
+        );
+        assert_eq!(route.codex_thread_id, None);
+        assert!(route.latest_state_codex_thread.is_none());
+        assert!(route.live_goal_codex_thread_id.is_none());
+        assert_eq!(route.claude_caller, Some(claude_caller_fixture()));
+    }
+
+    #[test]
+    fn codex_caller_route_keeps_existing_priority_order() {
+        let state_fallback = || {
+            Some(CodexThreadFallback {
+                thread_id: "019ec000-0000-7000-8000-00000000000a".to_string(),
+                state_db_path: PathBuf::from("/tmp/state_5.sqlite"),
+            })
+        };
+
+        let mut explicit = route_inputs(None);
+        explicit.explicit_codex_thread_id =
+            Some("019ec000-0000-7000-8000-000000000001".to_string());
+        explicit.caller_codex_thread_id = Some("019ec000-0000-7000-8000-000000000002".to_string());
+        let route = resolve_call_zhi_route(
+            explicit,
+            || panic!("已有直接线程 ID 时不查 state DB"),
+            || panic!("已有直接线程 ID 时不查 live goal"),
+        );
+        assert_eq!(route.caller_client, CALLER_CLIENT_CODEX);
+        assert_eq!(route.timeline_route_id, None);
+        assert_eq!(
+            route.codex_thread_id.as_deref(),
+            Some("019ec000-0000-7000-8000-000000000001")
+        );
+
+        let mut meta = route_inputs(None);
+        meta.caller_codex_thread_id = Some("019ec000-0000-7000-8000-000000000002".to_string());
+        meta.argument_codex_thread_id = Some("019ec000-0000-7000-8000-000000000003".to_string());
+        let route = resolve_call_zhi_route(meta, || None, || None);
+        assert_eq!(
+            route.codex_thread_id.as_deref(),
+            Some("019ec000-0000-7000-8000-000000000002")
+        );
+
+        let route = resolve_call_zhi_route(route_inputs(None), state_fallback, || {
+            panic!("state DB 命中时不查 live goal")
+        });
+        assert_eq!(
+            route.codex_thread_id.as_deref(),
+            Some("019ec000-0000-7000-8000-00000000000a")
+        );
+
+        let route = resolve_call_zhi_route(
+            route_inputs(None),
+            || None,
+            || Some("019ec000-0000-7000-8000-00000000000b".to_string()),
+        );
+        assert_eq!(
+            route.codex_thread_id.as_deref(),
+            Some("019ec000-0000-7000-8000-00000000000b")
+        );
+
+        let route = resolve_call_zhi_route(route_inputs(None), || None, || None);
+        assert_eq!(route.codex_thread_id, None);
+        assert_eq!(route.timeline_route_id, None);
+    }
+
+    #[test]
+    fn dialog_request_serializes_caller_fields_for_serve() {
+        let request = DialogRequest {
+            request_id: "req-1".to_string(),
+            message: "hi".to_string(),
+            options: vec![],
+            workspace: "/Users/example/Documents/Octer".to_string(),
+            is_markdown: true,
+            codex_home: None,
+            codex_thread_id: None,
+            codex_deeplink: None,
+            caller_client: Some(CALLER_CLIENT_CLAUDE_CODE.to_string()),
+            caller_session_id: Some("7dbca76e-c67a-4cee-ad28-52ad4d90bd28".to_string()),
+            caller_cwd: Some("/Users/example/project".to_string()),
+            caller_pid: Some(19268),
+            caller_model: Some("claude-opus-5-5".to_string()),
+            caller_model_label: Some("Opus 5.5".to_string()),
+            timeline_route_id: Some("claude-code:7dbca76e-c67a-4cee-ad28-52ad4d90bd28".to_string()),
+            conversation_title: None,
+            checkpoint_id: None,
+            checkpoint_commit: None,
+            checkpoint_message: None,
+        };
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["caller_client"], "claude_code");
+        assert_eq!(
+            value["caller_session_id"],
+            "7dbca76e-c67a-4cee-ad28-52ad4d90bd28"
+        );
+        assert_eq!(value["caller_cwd"], "/Users/example/project");
+        assert_eq!(value["caller_pid"], 19268);
+        assert_eq!(value["caller_model"], "claude-opus-5-5");
+        assert_eq!(value["caller_model_label"], "Opus 5.5");
+        assert_eq!(
+            value["timeline_route_id"],
+            "claude-code:7dbca76e-c67a-4cee-ad28-52ad4d90bd28"
+        );
+        assert!(value["codex_thread_id"].is_null());
     }
 }

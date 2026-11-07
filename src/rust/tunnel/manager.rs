@@ -608,12 +608,19 @@ fn websocket_probe_status_is_acceptable(status: reqwest::StatusCode) -> bool {
     )
 }
 
-fn public_route_proof_client(proxy_url: Option<&str>) -> Result<reqwest::Client, reqwest::Error> {
+fn public_route_proof_client(
+    proxy_url: Option<&str>,
+    tailnet_resolve: Option<(String, std::net::SocketAddr)>,
+) -> Result<reqwest::Client, reqwest::Error> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .http1_only();
+    // tailnet 地址只能直连，代理会把它带到公网入口
+    if let Some((host, address)) = tailnet_resolve {
+        return builder.resolve(&host, address).build();
+    }
     // LaunchServices need not inherit shell proxy variables. Use the user's
     // current system HTTPS proxy for both proof requests; otherwise stay direct.
     if let Some(url) = proxy_url {
@@ -628,7 +635,8 @@ async fn public_route_endpoint_proof(
     endpoint_epoch: Option<u64>,
 ) -> bool {
     let proxy_url = crate::ui::codex_quota::macos_system_https_proxy_url();
-    let Ok(client) = public_route_proof_client(proxy_url.as_deref()) else {
+    let tailnet_resolve = super::tailscale_serve::proof_resolve_override(endpoint).await;
+    let Ok(client) = public_route_proof_client(proxy_url.as_deref(), tailnet_resolve) else {
         return false;
     };
     let health_url = format!(
@@ -1530,7 +1538,7 @@ mod public_route_proxy_tests {
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; 2
         ]));
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let client = public_route_proof_client(Some(&proxy)).unwrap();
+            let client = public_route_proof_client(Some(&proxy), None).unwrap();
             for path in ["/.well-known/iterate/health", "/ws"] {
                 assert!(client.get(format!("https://public-proof.invalid{path}")).send().await.is_err());
             }
@@ -1551,7 +1559,7 @@ mod public_route_proxy_tests {
             b"HTTP/1.1 302 Found\r\nLocation: https://must-not-follow.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ]));
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let client = public_route_proof_client(None).unwrap();
+            let client = public_route_proof_client(None, None).unwrap();
             assert!(client.get(format!("{origin}/.well-known/iterate/health")).send().await.unwrap().status().is_success());
             assert!(websocket_probe_status_is_acceptable(client.get(format!("{origin}/ws")).send().await.unwrap().status()));
             assert_eq!(client.get(format!("{origin}/redirect")).send().await.unwrap().status(), reqwest::StatusCode::FOUND);

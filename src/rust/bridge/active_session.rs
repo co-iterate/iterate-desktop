@@ -1,5 +1,5 @@
 use super::mcp_state_extract::extract_timeline_route_id_from_mcp_state;
-use super::route_part::normalize_route_part;
+use super::route_part::{normalize_route_part, project_paths_match};
 use super::time_parse::parse_rfc3339;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -99,7 +99,7 @@ pub(super) fn lookup_active_session_entry(
     if let Some(path) = project_path {
         if let Some(entry) = registry
             .values()
-            .filter(|entry| entry.project_path == path)
+            .filter(|entry| project_paths_match(&entry.project_path, path))
             .max_by_key(|entry| {
                 parse_rfc3339(&entry.last_active_at)
                     .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH))
@@ -121,7 +121,7 @@ pub(super) fn lookup_active_session_entry(
         }
         if let Some(entry) = registry
             .values()
-            .filter(|entry| entry.project_path == route_key)
+            .filter(|entry| project_paths_match(&entry.project_path, route_key))
             .max_by_key(|entry| {
                 parse_rfc3339(&entry.last_active_at)
                     .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH))

@@ -165,7 +165,7 @@ fn append_goal_selected_options_context(goal_text: &str, selected_options: &[Str
     }
 }
 
-pub(super) fn build_goal_payload_parts(
+pub(crate) fn build_goal_payload_parts(
     payload: &serde_json::Value,
 ) -> (String, String, serde_json::Value) {
     let cleaned_input = strip_goal_image_reference_context(
@@ -228,16 +228,46 @@ pub(super) fn render_goal_submit_prompt(goal: &str, template: &str) -> String {
     )
 }
 
-pub(super) fn build_goal_submit_prompt(goal: &str) -> String {
+pub(crate) fn build_goal_submit_prompt(goal: &str) -> String {
     let template = crate::config::load_standalone_config()
         .map(|config| config.reply_config.goal_prompt_template)
         .unwrap_or_else(|_| crate::constants::mcp::DEFAULT_GOAL_PROMPT_TEMPLATE.to_string());
     render_goal_submit_prompt(goal, &template)
 }
 
+/// Reply text for the bridge `continue` action. Mirrors the desktop popup's
+/// continue button: the configured `reply_config.continue_prompt`, or
+/// `DEFAULT_CONTINUE_PROMPT` when it is missing or blank.
+pub(crate) fn resolve_continue_prompt(configured: Option<&str>) -> String {
+    configured
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or(crate::constants::mcp::DEFAULT_CONTINUE_PROMPT)
+        .to_string()
+}
+
+pub(crate) fn build_continue_prompt() -> String {
+    let configured = crate::config::load_standalone_config()
+        .ok()
+        .map(|config| config.reply_config.continue_prompt);
+    resolve_continue_prompt(configured.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_mcp_action_file_paths_at, render_goal_submit_prompt};
+    use super::{
+        normalize_mcp_action_file_paths_at, render_goal_submit_prompt, resolve_continue_prompt,
+    };
+
+    #[test]
+    fn continue_prompt_uses_config_and_falls_back_to_desktop_default() {
+        assert_eq!(resolve_continue_prompt(Some("继续推进，保持测试通过")), "继续推进，保持测试通过");
+        assert_eq!(resolve_continue_prompt(Some("  \n")), "请按照最佳实践继续");
+        assert_eq!(resolve_continue_prompt(None), "请按照最佳实践继续");
+        assert_eq!(
+            resolve_continue_prompt(None),
+            crate::constants::mcp::DEFAULT_CONTINUE_PROMPT
+        );
+    }
 
     #[test]
     fn goal_prompt_uses_the_configured_template_and_always_injects_xi_preflight() {

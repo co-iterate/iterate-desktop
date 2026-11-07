@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useMessage } from 'naive-ui'
 import { onMounted, onUnmounted, ref } from 'vue'
+import { OPEN_GUIDE_EVENT } from '../onboarding/firstRunGuide'
 import AudioSettings from '../settings/AudioSettings.vue'
 import BrowserSettings from '../settings/BrowserSettings.vue'
 import CheckpointSettings from '../settings/CheckpointSettings.vue'
@@ -11,6 +12,7 @@ import FontSettings from '../settings/FontSettings.vue'
 import GhostSuggestionSettings from '../settings/GhostSuggestionSettings.vue'
 import GlobalSpeechSettings from '../settings/GlobalSpeechSettings.vue'
 import IterateSettings from '../settings/IterateSettings.vue'
+import KnowledgeSettings from '../settings/KnowledgeSettings.vue'
 import McpClientSettings from '../settings/McpClientSettings.vue'
 import PromptLibrarySettings from '../settings/PromptLibrarySettings.vue'
 import ReplySettings from '../settings/ReplySettings.vue'
@@ -107,6 +109,10 @@ interface Emits {
 }
 
 // 处理窗口尺寸更新
+function reopenFirstRunGuide() {
+  window.dispatchEvent(new Event(OPEN_GUIDE_EVENT))
+}
+
 function handleWindowSizeUpdate(size: { width: number, height: number, fixed: boolean }) {
   emit('updateWindowSize', size)
 }
@@ -128,14 +134,65 @@ function handleWindowSizeUpdate(size: { width: number, height: number, fixed: bo
                   AI 客户端
                 </div>
                 <div class="text-sm opacity-60 font-normal">
-                  把 iterate 接入 Claude Code、Codex、Cursor
+                  把 iterate 接入 Claude Code、Codex、Cursor、Antigravity
                 </div>
               </div>
             </div>
           </div>
         </template>
         <div class="setting-content">
-          <McpClientSettings />
+          <McpClientSettings show-manual />
+          <n-button class="mt-3" size="small" secondary @click="reopenFirstRunGuide">
+            重新查看使用引导
+          </n-button>
+        </div>
+      </n-collapse-item>
+
+      <!-- 知识库：ji / hui / xi -->
+      <n-collapse-item name="knowledge">
+        <template #header>
+          <div class="flex items-center justify-between w-full">
+            <div class="flex items-center">
+              <div class="w-10 h-10 rounded-lg bg-amber-100 dark:bg-amber-900 flex items-center justify-center mr-4">
+                <div class="i-carbon-notebook text-lg text-amber-600 dark:text-amber-400" />
+              </div>
+              <div>
+                <div class="text-lg font-medium tracking-tight mb-1">
+                  知识库
+                </div>
+                <div class="text-sm opacity-60 font-normal">
+                  hui 恢复进度、xi 查经验、ji 沉淀问题
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+        <div class="setting-content">
+          <KnowledgeSettings />
+        </div>
+      </n-collapse-item>
+
+      <!-- iterate 远程控制 (Bridge Server + 手机同步) -->
+      <n-collapse-item name="iterate">
+        <template #header>
+          <div class="flex items-center justify-between w-full">
+            <div class="flex items-center">
+              <div class="w-10 h-10 rounded-lg bg-violet-100 dark:bg-violet-900 flex items-center justify-center mr-4">
+                <div class="i-carbon-cloud-satellite-link text-lg text-violet-600 dark:text-violet-400" />
+              </div>
+              <div>
+                <div class="text-lg font-medium tracking-tight mb-1">
+                  iterate
+                </div>
+                <div class="text-sm opacity-60 font-normal">
+                  手机连接：在 iPhone 上回复这台 Mac 的任务
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+        <div class="setting-content">
+          <IterateSettings />
         </div>
       </n-collapse-item>
 
@@ -302,30 +359,6 @@ function handleWindowSizeUpdate(size: { width: number, height: number, fixed: bo
         </template>
         <div class="setting-content">
           <CustomPromptSettings />
-        </div>
-      </n-collapse-item>
-
-      <!-- iterate 远程控制 (Bridge Server + 手机同步) -->
-      <n-collapse-item name="iterate">
-        <template #header>
-          <div class="flex items-center justify-between w-full">
-            <div class="flex items-center">
-              <div class="w-10 h-10 rounded-lg bg-violet-100 dark:bg-violet-900 flex items-center justify-center mr-4">
-                <div class="i-carbon-cloud-satellite-link text-lg text-violet-600 dark:text-violet-400" />
-              </div>
-              <div>
-                <div class="text-lg font-medium tracking-tight mb-1">
-                  iterate
-                </div>
-                <div class="text-sm opacity-60 font-normal">
-                  手机连接 / Tailscale 优先 / 公网兜底
-                </div>
-              </div>
-            </div>
-          </div>
-        </template>
-        <div class="setting-content">
-          <IterateSettings />
         </div>
       </n-collapse-item>
 

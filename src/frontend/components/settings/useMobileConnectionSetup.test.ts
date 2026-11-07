@@ -100,6 +100,42 @@ test('builds without a managed service fall back to self-hosted setup', async (t
   assert.equal(setup.error.value, '')
 })
 
+test('closed or restricted enrollment explains itself and falls back to self-hosted setup', async (t) => {
+  for (const [code, reason] of [['managed_enrollment_closed', 'closed'], ['managed_enrollment_not_allowed', 'not_allowed']]) {
+    const { setup } = fixture(t, () => empty, () => {
+      throw new Error(code)
+    })
+    await setup.bootstrap()
+    assert.equal(setup.state.value.stage, 'setup_required', code)
+    assert.equal(setup.managedAdmission.value, reason, code)
+    assert.equal(setup.error.value, '', code)
+  }
+})
+
+test('re-checking after enrollment opens connects and clears the admission notice', async (t) => {
+  let open = false
+  const { setup } = fixture(t, () => empty, () => {
+    if (!open)
+      throw new Error('managed_enrollment_closed')
+    return route
+  })
+  await setup.bootstrap()
+  assert.equal(setup.managedAdmission.value, 'closed')
+  open = true
+  await setup.retry()
+  assert.equal(setup.state.value.stage, 'waiting_for_claim')
+  assert.equal(setup.managedAdmission.value, '')
+})
+
+test('generic service failures still offer a retry instead of the setup handoff', async (t) => {
+  const { setup } = fixture(t, () => empty, () => {
+    throw new Error('managed_service_unavailable')
+  })
+  await setup.bootstrap()
+  assert.equal(setup.state.value.stage, 'error')
+  assert.equal(setup.managedAdmission.value, '')
+})
+
 test('late enrollment cannot replace the reopened route or QR', async (t) => {
   const pending = deferred()
   let status = empty as any

@@ -51,26 +51,6 @@ pub fn build_mcp_tools_config(config: &AppConfig) -> Vec<MCPToolConfig> {
         has_config: false, // iterate 工具没有配置选项
     });
 
-    // 记忆管理工具 - 始终存在，无配置选项
-    tools.push(MCPToolConfig {
-        id: mcp::TOOL_JI.to_string(),
-        name: "记忆管理".to_string(),
-        description:
-            "全局记忆管理工具。支持 4 种 action：回忆/记忆/沉淀/摘要。必须绑定 git 根目录。"
-                .to_string(),
-        enabled: config
-            .mcp_config
-            .tools
-            .get(mcp::TOOL_JI)
-            .copied()
-            .unwrap_or(false),
-        can_disable: true,
-        icon: "i-carbon-data-base text-lg text-purple-600 dark:text-purple-400".to_string(),
-        icon_bg: "bg-green-100 dark:bg-green-900".to_string(),
-        dark_icon_bg: "dark:bg-green-800".to_string(),
-        has_config: false, // 记忆管理工具没有配置选项
-    });
-
     // 代码搜索工具 - 始终存在，有配置选项
     tools.push(MCPToolConfig {
         id: mcp::TOOL_SOU.to_string(),

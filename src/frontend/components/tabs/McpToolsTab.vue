@@ -131,13 +131,6 @@ const xiQuery = ref('')
 const xiResult = ref('')
 const xiLoading = ref(false)
 
-const jiProjectPath = ref('')
-const jiAction = ref('回忆')
-const jiCategory = ref('context')
-const jiContent = ref('')
-const jiResult = ref('')
-const jiLoading = ref(false)
-
 async function runCiTool() {
   try {
     if (!ciProjectPath.value || !ciDirectory.value) {
@@ -190,35 +183,6 @@ async function runXiTool() {
   }
   finally {
     xiLoading.value = false
-  }
-}
-
-async function runJiTool() {
-  try {
-    if (!jiProjectPath.value) {
-      message.warning('请填写项目路径')
-      return
-    }
-    jiLoading.value = true
-    jiResult.value = ''
-    const result = await invoke('execute_ji_tool', {
-      args: {
-        action: jiAction.value,
-        projectPath: jiProjectPath.value,
-        category: jiCategory.value,
-        content: jiContent.value,
-      },
-    }) as string
-    jiResult.value = result
-    message.success('执行成功', { duration: 2000 })
-  }
-  catch (e: any) {
-    const errorMsg = typeof e === 'string' ? e : (e?.message || String(e))
-    jiResult.value = errorMsg
-    message.error(`执行失败: ${errorMsg}`, { duration: 5000 })
-  }
-  finally {
-    jiLoading.value = false
   }
 }
 
@@ -643,34 +607,6 @@ watch(() => acemcpConfig.value.text_extensions, (list) => {
               </n-space>
               <n-form-item v-if="xiResult" label="结果" :show-feedback="false">
                 <n-input v-model:value="xiResult" type="textarea" :autosize="{ minRows: 4, maxRows: 12 }" readonly class="result-textarea" />
-              </n-form-item>
-            </n-space>
-          </n-tab-pane>
-
-          <n-tab-pane name="ji" tab="记忆(ji)">
-            <n-space vertical size="medium">
-              <n-form-item label="项目路径" :show-feedback="false">
-                <n-input v-model:value="jiProjectPath" placeholder="/abs/path/to/project" clearable />
-              </n-form-item>
-              <n-form-item label="action" :show-feedback="false">
-                <n-input v-model:value="jiAction" placeholder="回忆 / 记忆 / 沉淀 / 确认沉淀 / 摘要 / 留空" clearable />
-              </n-form-item>
-              <n-form-item label="category" :show-feedback="false">
-                <n-input v-model:value="jiCategory" placeholder="context / preference / rule / patterns / problems / regressions" clearable />
-              </n-form-item>
-              <n-form-item label="content" :show-feedback="false">
-                <n-input v-model:value="jiContent" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }" placeholder="记忆/沉淀/摘要内容" clearable />
-              </n-form-item>
-              <n-space>
-                <n-button type="primary" :loading="jiLoading" @click="runJiTool">
-                  执行
-                </n-button>
-                <n-button :disabled="!jiResult" @click="jiResult = ''">
-                  清空
-                </n-button>
-              </n-space>
-              <n-form-item v-if="jiResult" label="结果" :show-feedback="false">
-                <n-input v-model:value="jiResult" type="textarea" :autosize="{ minRows: 4, maxRows: 12 }" readonly class="result-textarea" />
               </n-form-item>
             </n-space>
           </n-tab-pane>

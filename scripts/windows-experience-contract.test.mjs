@@ -90,7 +90,7 @@ test('close flow exits without recursively closing the window', () => {
   assert.match(exit, /exit_in_progress\.swap/)
   assert.match(exit, /#\[cfg\(target_os = "windows"\)\][\s\S]*?window\.hide\(\)/)
   assert.match(exit, /#\[cfg\(not\(target_os = "windows"\)\)\][\s\S]*?window\.close\(\)/)
-  assert.match(exit, /request_global_shutdown\(\)/)
+  assert.doesNotMatch(exit, /request_global_shutdown\(|terminate_registered_instances\(/)
   assert.match(lifecycle, /CreateEventW/)
   assert.match(lifecycle, /QueryFullProcessImageNameW/)
   assert.match(lifecycle, /GetProcessTimes/)

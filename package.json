@@ -1,7 +1,7 @@
 {
   "name": "cunzhi",
   "type": "module",
-  "version": "0.6.7",
+  "version": "0.7.2",
   "packageManager": "pnpm@10.12.1",
   "scripts": {
     "dev": "vite",
@@ -32,16 +32,17 @@
     "smoke:macos-manifest:latest:downloads": "CHECK_URLS=1 CHECK_DOWNLOADS=1 HTTP_TIMEOUT_SECS=60 MANIFEST_URL=https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest bash ./scripts/macos-manifest-smoke.sh",
     "smoke:macos-manifest:latest:checksums": "CHECK_URLS=1 CHECK_DOWNLOADS=1 REQUIRE_CHECKSUM_ASSETS=1 HTTP_TIMEOUT_SECS=60 MANIFEST_URL=https://api.github.com/repos/kexin94yyds/iterate-releases/releases/latest bash ./scripts/macos-manifest-smoke.sh",
     "test": "pnpm run test:frontend && pnpm run test:scripts && pnpm run test:rust",
-    "test:frontend": "pnpm run test:checkpoint-settings && pnpm run test:conversation-end && pnpm run test:popup-header-codex-open && pnpm run test:desktop-codex-live && pnpm run test:popup-selection-quote && pnpm run test:local-markdown-links && pnpm run test:external-markdown-links && pnpm run test:bridge-fetch && pnpm run test:mobile-connection && pnpm run test:mcp-response-speed && pnpm run test:speech-services",
+    "test:frontend": "pnpm run test:checkpoint-settings && pnpm run test:conversation-end && pnpm run test:submission-clipboard && pnpm run test:popup-header-codex-open && pnpm run test:desktop-codex-live && pnpm run test:popup-selection-quote && pnpm run test:local-markdown-links && pnpm run test:external-markdown-links && pnpm run test:bridge-fetch && pnpm run test:mobile-connection && pnpm run test:first-run-guide && pnpm run test:mcp-response-speed && pnpm run test:speech-services",
     "test:frontend:interactive": "pnpm run test:ui",
     "test:checkpoint-settings": "node --test src/frontend/components/settings/CheckpointSettings.test.ts",
-    "test:popup-header-codex-open": "node --test src/frontend/components/popup/PopupHeader.codexProjectOpen.test.ts",
+    "test:popup-header-codex-open": "node --test src/frontend/components/popup/PopupHeader.codexProjectOpen.test.ts src/frontend/components/popup/PopupHeader.claudeSessionOpen.test.ts",
     "test:desktop-codex-live": "node --test scripts/desktop-codex-live-source.test.mjs src/frontend/utils/latestTaskGuard.test.ts src/frontend/utils/latestValueTaskQueue.test.ts src/frontend/utils/codexLiveTranscript.test.ts src/frontend/utils/codexLiveVoiceDecision.test.ts src/frontend/utils/codexLiveHudText.test.ts src/frontend/utils/desktopCodexLiveHudGeometry.test.ts",
     "test:popup-selection-quote": "node --test src/frontend/utils/popupSelectionQuote.test.ts",
     "test:local-markdown-links": "node --test src/frontend/utils/localMarkdownLinks.test.ts",
     "test:external-markdown-links": "node --test src/frontend/utils/externalMarkdownLinks.test.ts",
     "test:bridge-fetch": "node --test src/frontend/services/bridgeFetch.test.ts",
-    "test:mobile-connection": "node --test src/frontend/components/settings/mobileConnectionMachine.test.ts src/frontend/components/settings/useMobileConnectionSetup.test.ts",
+    "test:mobile-connection": "node --test src/frontend/components/settings/mobileConnectionMachine.test.ts src/frontend/components/settings/useMobileConnectionSetup.test.ts src/frontend/components/settings/mobileAppInstall.test.ts src/frontend/components/settings/tailscaleServeRoute.test.ts src/frontend/components/settings/mobileRouteOptions.test.ts src/frontend/components/settings/phoneTestMessage.test.ts src/frontend/components/settings/aiClientSetup.test.ts",
+    "test:first-run-guide": "node --test src/frontend/components/onboarding/firstRunGuide.test.ts",
     "test:mcp-response-speed": "node --test src/frontend/composables/useMcpHandler.immediateDismiss.test.ts",
     "test:speech-services": "node --test src/frontend/services/speechContext.test.ts src/frontend/services/speechPostprocess.test.ts src/frontend/services/speechSemanticResolver.test.ts src/frontend/services/desktopSpeechRecognitionMode.test.ts src/frontend/services/globalSpeechSession.test.ts src/frontend/services/speechInsertGuard.test.ts && node --test scripts/desktop-speech-frontend-ownership.test.mjs",
     "test:bridge-daemon": "node --test scripts/install-bridge-daemon.test.mjs",
@@ -66,7 +67,8 @@
     "test:conversation-end": "node --test src/frontend/utils/conversationEndCommand.test.ts",
     "test:desktop-community-activation": "node --test scripts/desktop-community-activation.test.mjs",
     "test:windows-experience": "node --test scripts/windows-experience-contract.test.mjs",
-    "tauri:build:windows": "pwsh -NoProfile -File ./scripts/build-windows-installer.ps1"
+    "tauri:build:windows": "pwsh -NoProfile -File ./scripts/build-windows-installer.ps1",
+    "test:submission-clipboard": "node --test src/frontend/utils/submissionClipboard.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0",

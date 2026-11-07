@@ -428,3 +428,38 @@ fn authenticated_popup_writeback_bypasses_external_helper() {
     assert!(!popup_branch.contains("dispatch_with_launcher"));
     assert!(!popup_branch.contains("simulate_paste"));
 }
+
+#[test]
+fn external_paste_is_verified_by_a_transient_pasteboard_promise() {
+    let speech = include_str!("../src/rust/native_speech/mod.rs");
+    let probe = include_str!("../src/rust/native_speech/paste_probe.rs");
+    let phase1 = include_str!("../src/rust/native_speech/phase1.rs");
+
+    let paste = speech
+        .split("fn paste_text_with_identity(")
+        .nth(1)
+        .expect("external paste flow should exist");
+    let publish = paste
+        .find("paste_probe::publish(trimmed)")
+        .expect("promise publish");
+    let dispatch = paste
+        .find("dispatch_with_launcher")
+        .expect("helper dispatch");
+    let wait = paste
+        .find("wait_consumed(PASTE_CONSUME_TIMEOUT)")
+        .expect("consume wait");
+    assert!(publish < dispatch && dispatch < wait);
+    assert!(paste.contains("ExternalPasteDispatch::NotConsumed"));
+    assert!(paste.contains("dispatch != ExternalPasteDispatch::NotConsumed"));
+
+    assert!(probe.contains("org.nspasteboard.TransientType"));
+    assert!(probe.contains("setDataProvider"));
+
+    let not_consumed = phase1
+        .split("SpeechWritebackDispatch::ExternalNotConsumed) => {")
+        .nth(1)
+        .expect("phase1 handles unread pastes");
+    let branch = not_consumed.split("Ok(super::").next().unwrap();
+    assert!(branch.contains("preserve_unwritten_transcript(&recovery_text, \"not-consumed\")"));
+    assert!(branch.contains("WritebackFailed"));
+}

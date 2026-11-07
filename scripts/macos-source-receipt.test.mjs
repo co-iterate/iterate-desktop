@@ -114,7 +114,12 @@ test('installer stops only the canonical Fn owner unless background shutdown is 
   assert.doesNotMatch(installer, /is_background_app_process/)
 
   const stopCallSites = installer.match(/if should_stop_app_process "\$\{pid\}"; then/g) ?? []
-  assert.equal(stopCallSites.length, 2, 'both installed and conflicting bundle scans must use owner-scoped stopping')
+  assert.equal(stopCallSites.length, 1, 'only the installed (dest) bundle scan may stop processes')
+  assert.match(installer, /pid_in_dest_bundle "\$\{pid\}"/)
+  const foreignSource = installer.match(/warn_about_foreign_app_bundles\(\) \{[\s\S]*?\n\}/)?.[0]
+  assert.ok(foreignSource, 'expected a warn-only scan of other app bundles')
+  assert.doesNotMatch(foreignSource, /\bkill\b/)
+  assert.doesNotMatch(installer, /stop_conflicting_foreground_app_bundles/)
 
   const canonicalSource = installer.match(/is_canonical_gui_process\(\) \{[\s\S]*?\n\}/)?.[0]
   assert.ok(canonicalSource, 'expected an owner-backed canonical GUI classifier')

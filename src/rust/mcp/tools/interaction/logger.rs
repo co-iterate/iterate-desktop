@@ -1,4 +1,6 @@
 use chrono::Local;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
@@ -73,12 +75,57 @@ struct CheckpointRegistryEntry<'a> {
 }
 
 fn find_knowledge_dir(_project_path: Option<&str>) -> Option<PathBuf> {
-    let configured = std::env::var_os("CUNZHI_KNOWLEDGE_DIR")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|path| path.join(".cunzhi-knowledge")));
+    crate::config::paths::knowledge_root().filter(|path| path.is_dir())
+}
 
-    configured.filter(|path| path.is_dir())
+/// 测试里修改 CUNZHI_KNOWLEDGE_DIR，或会走到 append_conversation_log 的测试都要先拿这把锁；
+/// 否则并发测试会互相切换知识库目录，或把测试记录写进用户真实的 ~/.cunzhi-knowledge。
+#[cfg(test)]
+pub(crate) static KNOWLEDGE_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_knowledge_env_for_test() -> std::sync::MutexGuard<'static, ()> {
+    KNOWLEDGE_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 测试专用：持有知识库目录锁，并把 CUNZHI_KNOWLEDGE_DIR 指到临时目录，结束时恢复。
+/// 用于会写对话日志、但不应污染真实知识库的测试（如后台自动检查点）。
+#[cfg(test)]
+pub(crate) struct TempKnowledgeDirForTest {
+    previous: Option<std::ffi::OsString>,
+    dir: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TempKnowledgeDirForTest {
+    pub(crate) fn new() -> Self {
+        let lock = lock_knowledge_env_for_test();
+        let dir = tempfile::tempdir().expect("temp knowledge dir");
+        let previous = std::env::var_os("CUNZHI_KNOWLEDGE_DIR");
+        std::env::set_var("CUNZHI_KNOWLEDGE_DIR", dir.path());
+        Self {
+            previous,
+            dir,
+            _lock: lock,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempKnowledgeDirForTest {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => std::env::set_var("CUNZHI_KNOWLEDGE_DIR", previous),
+            None => std::env::remove_var("CUNZHI_KNOWLEDGE_DIR"),
+        }
+    }
 }
 
 fn strip_auto_prompt(input: &str) -> Cow<'_, str> {
@@ -116,6 +163,68 @@ fn strip_auto_prompt(input: &str) -> Cow<'_, str> {
         Some(pos) => Cow::Owned(input[..pos].trim_end().to_string()),
         None => Cow::Borrowed(input),
     }
+}
+
+/// 写盘前遮盖密钥：对话记录会被 git 自动提交，也会被 hui/xi 读回模型上下文（P-2026-9456）。
+/// 只认格式明确的密钥，宁可漏掉少数，也不误伤 UUID、路径、commit 这类日常内容。
+static SECRET_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
+    [
+        (
+            "private-key",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        ),
+        (
+            "jwt",
+            r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+        ),
+        ("supabase-secret", r"sb_secret_[A-Za-z0-9_-]{16,}"),
+        ("api-key", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}"),
+        ("stripe-key", r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
+        ("paddle-key", r"\bpdl_(?:live|sdbx)_[A-Za-z0-9_]{20,}"),
+        (
+            "github-token",
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})",
+        ),
+        ("google-api-key", r"\bAIza[0-9A-Za-z_-]{35}"),
+        ("aws-access-key", r"\bAKIA[0-9A-Z]{16}\b"),
+        ("slack-token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    ]
+    .into_iter()
+    .map(|(name, pattern)| (name, Regex::new(pattern).expect("secret pattern")))
+    .collect()
+});
+
+/// 连接串只遮盖密码段，保留协议、用户名和主机，排查问题时还看得出连的是哪个库。
+static CONNECTION_PASSWORD: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?)://[^:/@\s]+:)[^@\s]+@")
+        .expect("connection password pattern")
+});
+
+fn redact_secrets(input: &str) -> (Cow<'_, str>, usize) {
+    let mut text = Cow::Borrowed(input);
+    let mut hits = 0;
+    for (name, pattern) in SECRET_PATTERNS.iter() {
+        let found = pattern.find_iter(&text).count();
+        if found > 0 {
+            hits += found;
+            let replacement = format!("[REDACTED:{name}]");
+            text = Cow::Owned(
+                pattern
+                    .replace_all(&text, replacement.as_str())
+                    .into_owned(),
+            );
+        }
+    }
+    let found = CONNECTION_PASSWORD.find_iter(&text).count();
+    if found > 0 {
+        hits += found;
+        text = Cow::Owned(
+            CONNECTION_PASSWORD
+                .replace_all(&text, "${1}[REDACTED:db-password]@")
+                .into_owned(),
+        );
+    }
+    (text, hits)
 }
 
 fn resolve_project_name(project_path: Option<&str>) -> String {
@@ -330,7 +439,9 @@ pub fn commit_conversation_file(
                 "commit", "--only", "-m", &message, "--quiet", "--no-verify", "--", conv_file_str,
             ],
         );
-        if committed.lock_busy {
+        // 另一个线程的 commit --only 回写 index 时会冲掉我们刚 add 的条目，
+        // commit 就报 pathspec 不匹配；从 add 重来即可。文件真不存在时 add 那一步会直接失败。
+        if committed.lock_busy || committed.staged_entry_lost {
             continue;
         }
         return committed.ok;
@@ -344,6 +455,7 @@ const GIT_LOCK_RETRIES: u64 = 20;
 struct GitResult {
     ok: bool,
     lock_busy: bool,
+    staged_entry_lost: bool,
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> GitResult {
@@ -355,9 +467,10 @@ fn run_git(dir: &Path, args: &[&str]) -> GitResult {
                 ok: out.status.success(),
                 lock_busy: !out.status.success()
                     && (stderr.contains(".lock") || stderr.contains("cannot lock ref")),
+                staged_entry_lost: !out.status.success() && stderr.contains("did not match any file(s) known to git"),
             }
         }
-        Err(_) => GitResult { ok: false, lock_busy: false },
+        Err(_) => GitResult { ok: false, lock_busy: false, staged_entry_lost: false },
     }
 }
 
@@ -385,7 +498,7 @@ fn build_conversation_meta_comment(entry: &ConversationEntry) -> Option<String> 
     ))
 }
 
-/// 追加对话日志，写入 `.cunzhi-knowledge/conversations/YYYY-MM-DD/{project}__{device}.md`
+/// 追加对话日志，写入 `<知识库>/conversations/YYYY-MM-DD/{project}__{device}.md`
 pub fn append_conversation_log(entry: &ConversationEntry) {
     if entry.ai_message.trim().is_empty() {
         log::info!("[CHE-DEBUG][conversation] skip: empty ai_message");
@@ -402,6 +515,10 @@ pub fn append_conversation_log(entry: &ConversationEntry) {
             return;
         }
     };
+
+    if !crate::mcp::knowledge_starter::conversation_logging_enabled(&knowledge_dir) {
+        return;
+    }
 
     let conversations_dir = knowledge_dir.join("conversations");
     if fs::create_dir_all(&conversations_dir).is_err() {
@@ -448,6 +565,16 @@ pub fn append_conversation_log(entry: &ConversationEntry) {
     }
 
     content.push_str("\n---\n");
+
+    let (redacted, secret_hits) = redact_secrets(&content);
+    if secret_hits > 0 {
+        log::warn!(
+            "[CHE-DEBUG][conversation] redacted secrets count={} request_id={:?}",
+            secret_hits,
+            entry.request_id
+        );
+        content = redacted.into_owned();
+    }
 
     let date_dir = conversations_dir.join(&date_str);
     if fs::create_dir_all(&date_dir).is_err() {
@@ -526,10 +653,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
-
-    static KNOWLEDGE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     struct KnowledgeEnvGuard {
         previous: Option<OsString>,
@@ -702,12 +826,157 @@ mod tests {
         assert_eq!(strip_auto_prompt(input), "正常内容\n第二行");
     }
 
+    // 测试用密钥在运行时拼出来，避免仓库本身被密钥扫描器命中。
+    fn fake_jwt(role: &str) -> String {
+        format!(
+            "eyJ{}.eyJ{}.{}",
+            "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            format!("pc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJ{role}In0"),
+            "c2lnbmF0dXJlLXRlc3Qtb25seQ"
+        )
+    }
+
+    #[test]
+    fn redact_secrets_masks_known_secret_formats() {
+        let private_key = format!(
+            "-----BEGIN {0}-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END {0}-----",
+            "PRIVATE KEY"
+        );
+        let input = format!(
+            "service: {}\nkey:\n{}\nopenai {}\ngh {}\nsb {}",
+            fake_jwt("service_role"),
+            private_key,
+            format!("sk-{}", "proj-AbCdEfGhIjKlMnOpQrStUvWx"),
+            format!("ghp_{}", "a".repeat(36)),
+            format!("sb_secret_{}", "Z".repeat(24)),
+        );
+
+        let (output, hits) = super::redact_secrets(&input);
+
+        assert_eq!(hits, 5, "{output}");
+        assert!(output.contains("service: [REDACTED:jwt]"));
+        assert!(output.contains("key:\n[REDACTED:private-key]"));
+        assert!(output.contains("openai [REDACTED:api-key]"));
+        assert!(output.contains("gh [REDACTED:github-token]"));
+        assert!(output.contains("sb [REDACTED:supabase-secret]"));
+        assert!(!output.contains("MIIEvQ"));
+    }
+
+    #[test]
+    fn redact_secrets_keeps_connection_host_and_masks_password() {
+        let input = format!(
+            "DATABASE_URL=postgresql://loopads:{}@db.internal:5432/app",
+            "p%40ss-w0rd"
+        );
+
+        let (output, hits) = super::redact_secrets(&input);
+
+        assert_eq!(hits, 1);
+        assert_eq!(
+            output,
+            "DATABASE_URL=postgresql://loopads:[REDACTED:db-password]@db.internal:5432/app"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_leaves_everyday_text_alone() {
+        let input = "request_id 2208093c-ae7d-4b2d-91c1-cc1df3937315 commit 3da9ccb48079a23e290127135b76109617f3968f\n\
+                     路径 /Users/example/dev/cunzhi/src/rust/mcp/tools/interaction/logger.rs:443\n\
+                     https://github.com/kexin94yyds/iterate/pull/15 sk-learn task-runner";
+
+        let (output, hits) = super::redact_secrets(input);
+
+        assert_eq!(hits, 0);
+        assert!(matches!(output, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn append_conversation_log_redacts_secrets_before_writing() {
+        let _lock = super::lock_knowledge_env_for_test();
+        let temp = tempdir().unwrap();
+        let project_dir = temp.path().join("demo-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let knowledge_dir = temp.path().join("global-knowledge");
+        fs::create_dir_all(&knowledge_dir).unwrap();
+        let _env = KnowledgeEnvGuard::set(&knowledge_dir);
+        let jwt = fake_jwt("service_role");
+
+        append_conversation_log(&ConversationEntry {
+            ai_message: format!("我查到 key 是 {jwt}"),
+            user_response: format!("连接串 mysql://root:{}@10.0.0.2/app", "hunter2"),
+            project_path: Some(project_dir.to_string_lossy().to_string()),
+            image_count: 0,
+            file_paths: vec![],
+            image_paths: vec![],
+            selected_options: vec![],
+            conversation_id: None,
+            current_node_id: None,
+            timeline_route_id: None,
+            run_id: None,
+            generation: None,
+            stale_of: None,
+            superseded_by: None,
+            request_id: None,
+            checkpoint_id: None,
+            checkpoint_commit: None,
+            push_status: None,
+            response_source: None,
+            workspace_checkpoint_message: None,
+        });
+
+        let conv_path = get_conversation_log_path(Some(project_dir.to_str().unwrap()))
+            .expect("conversation path should exist");
+        let content = fs::read_to_string(conv_path).unwrap();
+        assert!(content.contains("我查到 key 是 [REDACTED:jwt]"));
+        assert!(content.contains("mysql://root:[REDACTED:db-password]@10.0.0.2/app"));
+        assert!(!content.contains(&jwt));
+        assert!(!content.contains("hunter2"));
+    }
+
+    #[test]
+    fn append_conversation_log_respects_opt_out_flag() {
+        let _lock = super::lock_knowledge_env_for_test();
+        let temp = tempdir().unwrap();
+        let project_dir = temp.path().join("demo-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let knowledge_dir = temp.path().join("global-knowledge");
+        fs::create_dir_all(&knowledge_dir).unwrap();
+        fs::write(
+            knowledge_dir.join(crate::mcp::knowledge_starter::CONVERSATION_LOG_OPT_OUT),
+            "",
+        )
+        .unwrap();
+        let _env = KnowledgeEnvGuard::set(&knowledge_dir);
+
+        append_conversation_log(&ConversationEntry {
+            ai_message: "不应被记录".to_string(),
+            user_response: "ok".to_string(),
+            project_path: Some(project_dir.to_string_lossy().to_string()),
+            image_count: 0,
+            file_paths: vec![],
+            image_paths: vec![],
+            selected_options: vec![],
+            conversation_id: None,
+            current_node_id: None,
+            timeline_route_id: None,
+            run_id: None,
+            generation: None,
+            stale_of: None,
+            superseded_by: None,
+            request_id: None,
+            checkpoint_id: None,
+            checkpoint_commit: None,
+            push_status: None,
+            response_source: None,
+            workspace_checkpoint_message: None,
+        });
+
+        assert!(!knowledge_dir.join("conversations").exists());
+    }
+
     #[test]
     fn append_conversation_log_writes_markdown_file() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("demo-project");
         let project_knowledge_dir = project_dir.join(".cunzhi-knowledge");
@@ -753,10 +1022,7 @@ mod tests {
 
     #[test]
     fn append_conversation_log_writes_attachment_paths() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("demo-project");
         let project_knowledge_dir = project_dir.join(".cunzhi-knowledge");
@@ -805,10 +1071,7 @@ mod tests {
 
     #[test]
     fn append_conversation_log_includes_workspace_checkpoint_line() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("demo-project");
         let project_knowledge_dir = project_dir.join(".cunzhi-knowledge");
@@ -868,10 +1131,7 @@ mod tests {
 
     #[test]
     fn e2e_checkpoint_subject_matches_git_log_and_conversation_md() {
-        let _lock = KNOWLEDGE_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = super::lock_knowledge_env_for_test();
         // 配置目录锁由下面的 ConfigEnvGuard 持有（同一把锁，不能重复获取）
         let temp = tempdir().unwrap();
         let project = temp.path().join("git-proj");

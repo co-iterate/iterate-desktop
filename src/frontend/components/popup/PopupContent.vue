@@ -484,10 +484,12 @@ async function openLocalMarkdownHref(href: string, event: MouseEvent) {
   }
 
   if (isOutsideCurrentProject(target, projectPath)) {
+    const platform = navigator.platform.toUpperCase()
+    const fileManager = platform.includes('WIN') ? '资源管理器' : platform.includes('MAC') ? 'Finder' : '文件管理器'
     dialog.warning({
-      title: '打开跨项目文件？',
-      content: `将在 Finder 中定位此文件，不会直接打开、执行或交给编辑器：\n${target.path}`,
-      positiveText: '在 Finder 中定位',
+      title: '打开跨项目文件或文件夹？',
+      content: `将在${fileManager}中打开文件夹或定位文件，不会执行文件或交给编辑器：\n${target.path}`,
+      positiveText: `在${fileManager}中打开`,
       negativeText: '取消',
       onPositiveClick: () => {
         void openConfirmedExternalLocalFile(target.path)
@@ -909,6 +911,7 @@ defineExpose({
         ref="requestContentRef"
         class="markdown-content prose prose-sm max-w-none prose-headings:font-semibold prose-headings:leading-tight prose-h1:!mt-4 prose-h1:!mb-2 prose-h1:!text-lg prose-h1:!font-bold prose-h1:!leading-tight prose-h2:!mt-3 prose-h2:!mb-1.5 prose-h2:!text-base prose-h2:!font-semibold prose-h2:!leading-tight prose-h3:!mt-2.5 prose-h3:!mb-1 prose-h3:!text-sm prose-h3:!font-medium prose-h3:!leading-tight prose-h4:!mt-2 prose-h4:!mb-1 prose-h4:!text-sm prose-h4:!font-medium prose-h4:!leading-tight prose-p:my-1 prose-p:leading-relaxed prose-p:text-sm prose-ul:my-1 prose-ul:text-sm prose-ul:pl-4 prose-ol:my-1 prose-ol:text-sm prose-ol:pl-4 prose-li:my-1 prose-li:text-sm prose-li:leading-relaxed prose-blockquote:my-2 prose-blockquote:text-sm prose-blockquote:pl-4 prose-blockquote:ml-0 prose-blockquote:italic prose-blockquote:border-l-4 prose-blockquote:border-primary-500 prose-pre:relative prose-pre:border prose-pre:rounded-lg prose-pre:p-4 prose-pre:my-3 prose-pre:overflow-x-auto scrollbar-code prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:cursor-pointer prose-code:font-mono prose-a:text-primary-500 prose-a:no-underline prose-a:cursor-pointer hover:prose-a:underline hover:prose-a:underline-offset-2" :class="[
           currentTheme === 'light' ? 'markdown-content--light' : 'markdown-content--dark',
+          { 'cross-device-note': request.id.startsWith('cross-') && displayMessage.endsWith('注:跨设备来源，仅支持文本和选项') },
           currentTheme === 'light' ? 'prose-slate' : 'prose-invert',
           currentTheme === 'light' ? 'prose-headings:text-gray-900' : 'prose-headings:text-white',
           currentTheme === 'light' ? 'prose-p:text-gray-700' : 'prose-p:text-white prose-p:opacity-85',
@@ -940,17 +943,13 @@ defineExpose({
           :key="artifactCardKey(artifact, index)"
           type="button"
           :aria-label="artifactCardLabel(artifact)"
-          class="group w-full rounded-lg border px-3 py-2.5 text-left transition-colors"
-          :class="currentTheme === 'light'
-            ? 'border-gray-200 bg-gray-50 hover:border-primary-400 hover:bg-white'
-            : 'border-white/10 bg-white/5 hover:border-primary-400/70 hover:bg-white/10'"
+          class="popup-artifact-card group w-full rounded-lg border px-3 py-2.5 text-left transition-colors"
           @click="emit('openArtifact', artifact)"
         >
           <div class="flex items-center justify-between gap-3">
             <div class="flex min-w-0 items-center gap-2.5">
               <div
-                class="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md"
-                :class="currentTheme === 'light' ? 'bg-gray-200 text-gray-700' : 'bg-black/30 text-gray-200'"
+                class="popup-artifact-card__badge flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md"
               >
                 <div class="i-carbon-html w-4 h-4" />
               </div>
@@ -960,14 +959,13 @@ defineExpose({
                 </div>
                 <div
                   v-if="artifact.description || artifact.path"
-                  class="mt-0.5 truncate text-xs"
-                  :class="currentTheme === 'light' ? 'text-gray-500' : 'text-gray-400'"
+                  class="popup-artifact-card__desc mt-0.5 truncate text-xs"
                 >
                   {{ artifact.description || artifact.path }}
                 </div>
               </div>
             </div>
-            <div class="inline-flex flex-shrink-0 items-center gap-1.5 text-xs font-medium text-primary-400">
+            <div class="popup-artifact-card__open inline-flex flex-shrink-0 items-center gap-1.5 text-xs font-medium">
               <span>打开</span>
               <div class="i-carbon-launch w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
             </div>
@@ -1047,6 +1045,45 @@ defineExpose({
 </template>
 
 <style scoped>
+/* HTML 卡片：颜色直接跟随根节点主题变量，不依赖 currentTheme 参数。
+   原实现按 currentTheme 二选一，而语义色把 white 映射成 on-surface 且丢了透明度，
+   参数与实际主题不一致时会变成“实心深底 + 黑字”。 */
+.popup-artifact-card {
+  color: var(--color-on-surface);
+  background: color-mix(in srgb, var(--color-on-surface) 4%, transparent);
+  border-color: color-mix(in srgb, var(--color-on-surface) 14%, transparent);
+}
+
+.popup-artifact-card:hover {
+  background: color-mix(in srgb, var(--color-on-surface) 8%, transparent);
+  border-color: color-mix(in srgb, var(--color-input-hover) 70%, transparent);
+}
+
+.popup-artifact-card__badge {
+  color: var(--color-on-surface);
+  background: color-mix(in srgb, var(--color-on-surface) 10%, transparent);
+}
+
+.popup-artifact-card__desc {
+  color: color-mix(in srgb, var(--color-on-surface) 60%, transparent);
+}
+
+.popup-artifact-card__open {
+  color: color-mix(in srgb, var(--color-on-surface) 80%, transparent);
+}
+
+.popup-artifact-card:hover .popup-artifact-card__open {
+  color: var(--color-on-surface);
+}
+.cross-device-note :deep(> hr:nth-last-child(2)) {
+  margin-block: 4px;
+}
+
+.cross-device-note :deep(> hr:nth-last-child(2) + p:last-child) {
+  margin-block: 0;
+  line-height: 1.625;
+}
+
 .popup-message-action-button {
   background-color: #ffffff !important;
   border: 1px solid #e5e7eb !important;

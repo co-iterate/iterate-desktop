@@ -17,6 +17,15 @@ BACKUP_DIR="${CUNZHI_MACOS_BACKUP_DIR:-${HOME}/.cunzhi/backups/desktop-install-$
 INSTALL_CHANGED=0
 canonical_pid=""
 FN_OWNER_LOCK_SUFFIX="/speech/fn-owner.lock"
+# Fixed loopback ports every iterate build binds (src/rust/ipc/mod.rs and
+# src/rust/mcp/handlers/popup.rs use IPC 127.0.0.1:37101; src/rust/app/setup.rs
+# uses bridge 8080). Two bundles cannot both own them.
+SHARED_IPC_PORT=37101
+SHARED_BRIDGE_PORT=8080
+# PIDs of iterate processes from *other* bundles that hold the Fn owner lock.
+# They are never stopped; the installer only warns and relaxes the post-launch
+# Fn owner check.
+FOREIGN_FN_OWNER_PIDS=""
 
 DO_BUILD=1
 DO_OPEN=1
@@ -67,6 +76,10 @@ info() {
   printf '==> %s\n' "$*"
 }
 
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
 restore_failed_install() {
   local status=$?
   trap - EXIT
@@ -99,6 +112,26 @@ resolve_path() {
   esac
 }
 
+# Physical path (symlinks resolved). Falls back to resolving the parent
+# directory when the path itself does not exist yet.
+real_path() {
+  local path="$1"
+  local dir
+
+  if realpath "${path}" 2>/dev/null; then
+    return 0
+  fi
+  if dir="$(cd "$(dirname "${path}")" 2>/dev/null && pwd -P)"; then
+    printf '%s/%s\n' "${dir}" "$(basename "${path}")"
+  else
+    printf '%s\n' "${path}"
+  fi
+}
+
+dest_app_real() {
+  real_path "${DEST_APP}"
+}
+
 regex_escape() {
   sed 's/[][(){}.^$*+?|\\]/\\&/g' <<<"$1"
 }
@@ -113,6 +146,32 @@ process_command() {
   local pid="$1"
 
   ps -p "${pid}" -o command= 2>/dev/null || true
+}
+
+# Real path of the executable image a process is running. Command lines are not
+# trusted: they can merely mention a bundle path (tail -f, open, grep, ...).
+process_executable() {
+  local pid="$1"
+  local exe
+
+  exe="$(lsof -a -p "${pid}" -d txt -Fn 2>/dev/null \
+    | sed -n 's/^n//p' \
+    | grep "/Contents/MacOS/$(regex_escape "${APP_NAME}")$" \
+    | head -n 1 || true)"
+  if [[ -z "${exe}" ]]; then
+    exe="$(ps -p "${pid}" -o comm= 2>/dev/null || true)"
+  fi
+  [[ -n "${exe}" ]] || return 1
+  real_path "${exe}"
+}
+
+# True only when the process executable lives inside the bundle being replaced.
+pid_in_dest_bundle() {
+  local pid="$1"
+  local exe
+
+  exe="$(process_executable "${pid}")" || return 1
+  [[ "${exe}" == "$(dest_app_real)/Contents/"* ]]
 }
 
 detect_sign_identity() {
@@ -168,7 +227,6 @@ wait_for_pids_exit() {
 }
 
 stop_installed_app() {
-  local dest_bin="${DEST_APP}/Contents/MacOS/${APP_NAME}"
   local pattern
   local pids
   local pid
@@ -176,7 +234,10 @@ stop_installed_app() {
   local stop_pids=()
   local preserved_pids=()
 
-  pattern="$(regex_escape "${dest_bin}")"
+  # Candidates are any ${APP_NAME} binary; pid_in_dest_bundle below keeps only
+  # those whose real executable path is inside ${DEST_APP}/Contents/ (command
+  # lines may use a symlinked or /private-less spelling of the path).
+  pattern="/Contents/MacOS/$(regex_escape "${APP_NAME}")"
   pids="$(read_matching_pids "${pattern}")"
   if [[ -z "${pids}" ]]; then
     info "No running installed app process found"
@@ -186,6 +247,14 @@ stop_installed_app() {
   for pid in ${pids}; do
     command="$(process_command "${pid}")"
     if [[ -z "${command}" ]]; then
+      continue
+    fi
+
+    # pgrep -f is an unanchored substring match on the command line; only act
+    # on processes whose executable really is inside ${DEST_APP}/Contents/.
+    # This is what keeps e.g. /Applications/iterate.app alive while installing
+    # ~/Applications/iterate-dev.app.
+    if ! pid_in_dest_bundle "${pid}"; then
       continue
     fi
 
@@ -225,58 +294,51 @@ stop_installed_app() {
   fi
 }
 
-stop_conflicting_foreground_app_bundles() {
+# Other iterate bundles (e.g. the signed /Applications/iterate.app while a test
+# build goes to ~/Applications/iterate-dev.app) are never stopped. If one of
+# them holds the Fn owner lock or the shared ports, warn instead: the installed
+# app will run without that lock/port until the other app is quit by hand.
+warn_about_foreign_app_bundles() {
   local pattern
   local pids
   local pid
-  local command
-  local stop_pids=()
-  local preserved_pids=()
+  local exe
+  local dest_real
+  local port
+  local foreign_count=0
 
+  dest_real="$(dest_app_real)"
   pattern="/Contents/MacOS/$(regex_escape "${APP_NAME}")"
   pids="$(read_matching_pids "${pattern}")"
-  if [[ -z "${pids}" ]]; then
-    return 0
-  fi
 
   for pid in ${pids}; do
-    command="$(process_command "${pid}")"
-    if [[ -z "${command}" ]]; then
-      continue
-    fi
+    exe="$(process_executable "${pid}" || true)"
+    [[ "${exe}" == */Contents/MacOS/"${APP_NAME}" ]] || continue
+    [[ "${exe}" != "${dest_real}/Contents/"* ]] || continue
 
-    if should_stop_app_process "${pid}"; then
-      stop_pids+=("${pid}")
-    else
-      preserved_pids+=("${pid}")
-    fi
-  done
-
-  if [[ "${#preserved_pids[@]}" -gt 0 ]]; then
-    info "Preserving non-owner app bundle processes: ${preserved_pids[*]}"
-  fi
-
-  if [[ "${#stop_pids[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  info "Stopping conflicting foreground app bundle processes: ${stop_pids[*]}"
-  printf '%s\n' "${stop_pids[@]}" | xargs kill 2>/dev/null || true
-
-  if wait_for_pids_exit "${stop_pids[@]}"; then
-    return 0
-  fi
-
-  local remaining_stop_pids=()
-  for pid in "${stop_pids[@]}"; do
-    if kill -0 "${pid}" 2>/dev/null; then
-      remaining_stop_pids+=("${pid}")
+    foreign_count=$((foreign_count + 1))
+    if is_canonical_gui_process "${pid}"; then
+      FOREIGN_FN_OWNER_PIDS="${FOREIGN_FN_OWNER_PIDS:+${FOREIGN_FN_OWNER_PIDS} }${pid}"
+      warn "Fn owner lock (canonical-gui speech owner) is held by pid ${pid} from another app bundle: ${exe}"
     fi
   done
 
-  if [[ "${#remaining_stop_pids[@]}" -gt 0 ]]; then
-    info "Force stopping remaining conflicting app bundle processes"
-    printf '%s\n' "${remaining_stop_pids[@]}" | xargs kill -9 2>/dev/null || true
+  for port in "${SHARED_IPC_PORT}" "${SHARED_BRIDGE_PORT}"; do
+    for pid in $(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true); do
+      exe="$(process_executable "${pid}" || true)"
+      [[ -n "${exe}" && "${exe}" != "${dest_real}/Contents/"* ]] || continue
+      warn "127.0.0.1:${port} is held by pid ${pid} (${exe}), not by ${DEST_APP}"
+    done
+  done
+
+  if [[ "${foreign_count}" -gt 0 ]]; then
+    info "Leaving ${foreign_count} process(es) of other ${APP_NAME} app bundles untouched"
+  fi
+  if [[ -n "${FOREIGN_FN_OWNER_PIDS}" ]]; then
+    warn "Not stopping pid(s) ${FOREIGN_FN_OWNER_PIDS}: the installer only stops processes inside ${DEST_APP}/Contents/."
+    warn "While that app runs, ${DEST_APP} will not get the Fn key / speech owner lock, and because every build"
+    warn "hard-codes IPC 127.0.0.1:${SHARED_IPC_PORT} and bridge port ${SHARED_BRIDGE_PORT}, the two apps cannot fully run side by side."
+    warn "Quit the other app yourself if the installed build needs those."
   fi
 }
 
@@ -488,6 +550,7 @@ restart_requested_background_processes() {
   local uid
   local label
   local service
+  local program
   local restarted=0
 
   uid="$(id -u)"
@@ -495,6 +558,12 @@ restart_requested_background_processes() {
     service="gui/${uid}/${label}"
 
     if launchctl print "${service}" >/dev/null 2>&1; then
+      program="$(launchctl print "${service}" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*program = //p' | head -n 1 || true)"
+      if [[ -z "${program}" || "$(real_path "${program}")" != "$(dest_app_real)/Contents/"* ]]; then
+        warn "Not restarting ${label}: its program (${program:-unknown}) is not inside ${DEST_APP}"
+        continue
+      fi
       info "Restarting preserved background LaunchAgent: ${label}"
       launchctl kickstart -k "${service}"
       restarted=1
@@ -606,6 +675,12 @@ print_status() {
   fi
 }
 
+# Allow tests to source the function definitions without running the install.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  trap - EXIT
+  return 0
+fi
+
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --)
@@ -688,7 +763,7 @@ if [[ -d "${DEST_APP}" ]]; then
   node "${RECOVERY_TOOL}" backup --app "${DEST_APP}" --out "${BACKUP_DIR}"
 fi
 stop_installed_app
-stop_conflicting_foreground_app_bundles
+warn_about_foreign_app_bundles
 copy_app
 clear_copied_app_attributes
 sign_app
@@ -701,7 +776,14 @@ if [[ "${DO_OPEN}" -eq 1 ]]; then
   launch_since_ms="$(node -p 'Date.now()')"
   info "Opening installed app as a new canonical GUI instance"
   open -n "${DEST_APP}"
-  if canonical_owner="$(wait_for_canonical_gui_owner)"; then
+  if [[ -n "${FOREIGN_FN_OWNER_PIDS}" ]]; then
+    for _ in {1..40}; do
+      [[ -z "$(canonical_gui_pids)" ]] || break
+      sleep 0.25
+    done
+    [[ -n "$(canonical_gui_pids)" ]] || { print_status; die "installed app did not start"; }
+    warn "Skipping canonical-gui Fn owner and readiness checks: pid(s) ${FOREIGN_FN_OWNER_PIDS} from another bundle hold the Fn owner lock"
+  elif canonical_owner="$(wait_for_canonical_gui_owner)"; then
     canonical_pid="${canonical_owner%%|*}"
     canonical_lock="${canonical_owner#*|}"
     info "canonical-gui Fn owner ready: pid=${canonical_pid} lock=${canonical_lock}"
@@ -709,11 +791,15 @@ if [[ "${DO_OPEN}" -eq 1 ]]; then
     print_status
     die "installed app did not establish a canonical-gui Fn owner"
   fi
-  node "${RECOVERY_TOOL}" wait-ready --app "${DEST_APP}" --pid "${canonical_pid}" --since "${launch_since_ms}"
+  if [[ -n "${canonical_pid}" ]]; then
+    node "${RECOVERY_TOOL}" wait-ready --app "${DEST_APP}" --pid "${canonical_pid}" --since "${launch_since_ms}"
+  fi
 fi
 
 print_status
-if [[ "${DO_OPEN}" -eq 1 ]]; then
+if [[ "${DO_OPEN}" -eq 1 && -n "${FOREIGN_FN_OWNER_PIDS}" ]]; then
+  info "Installed and launched; UI readiness not verified while another bundle owns the Fn lock"
+elif [[ "${DO_OPEN}" -eq 1 ]]; then
   info "Installed and new production UI ready; human behavior acceptance remains separate"
 else
   info "Installed; GUI readiness verification pending"

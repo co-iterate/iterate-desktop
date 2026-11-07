@@ -1,36 +1,26 @@
 <script setup lang="ts">
 import { useMessage } from 'naive-ui'
-import { computed, onMounted, ref } from 'vue'
-import { useMcpToolsReactive } from '../../composables/useMcpTools'
-import { generateFullPrompt } from '../../constants/prompts'
+import { onMounted, ref } from 'vue'
+import { useCoreSystemPrompt } from '../../composables/useCoreSystemPrompt'
 import { SETUP_PROMPT_CONTENT } from '../../constants/setupPrompt'
+import { OPEN_GUIDE_EVENT, OPEN_MOBILE_PAIRING_EVENT } from '../onboarding/firstRunGuide'
 import { buildFormalRouteSetupPrompt } from '../settings/mobileConnectionPrompts'
 
-// 使用全局MCP工具状态
-const { mcpTools, loading: mcpLoading, loadMcpTools, enabledTools } = useMcpToolsReactive()
+// 入口卡片直接打开对应的引导：AI 客户端走首次使用引导，iPhone 走连接向导
+function openGuide(kind: 'clients' | 'iphone') {
+  window.dispatchEvent(new Event(kind === 'clients' ? OPEN_GUIDE_EVENT : OPEN_MOBILE_PAIRING_EVENT))
+}
+
+// 核心系统提示词与 MCP 工具状态（连接向导、设置 → AI 客户端共用同一份）
+const {
+  mcpTools,
+  loading: mcpLoading,
+  enabledTools,
+  promptContent,
+  enabledPromptToolCount,
+  ensureMcpToolsLoaded,
+} = useCoreSystemPrompt()
 const message = useMessage()
-
-// 仅将已配置参考规则的 MCP 工具交给提示词生成器
-const promptTools = computed(() => {
-  // 将后端数据格式转换为前端格式
-  return mcpTools.value.map(tool => ({
-    id: tool.id === 'ji' ? 'memory' : tool.id, // 后端用ji，前端用memory
-    name: tool.name,
-    description: tool.description,
-    enabled: tool.enabled,
-    canDisable: tool.can_disable,
-    icon: tool.icon,
-    iconBg: tool.icon_bg,
-    darkIconBg: tool.dark_icon_bg,
-  })).filter((tool) => {
-    // 只包含有提示词配置的工具
-    return tool.id === 'zhi' || tool.id === 'memory' || tool.id === 'sou'
-  })
-})
-
-// 根据MCP工具状态动态生成提示词
-const promptContent = computed(() => generateFullPrompt(promptTools.value))
-const enabledPromptToolCount = computed(() => promptTools.value.filter(tool => tool.enabled).length)
 
 const copyButtonText = ref('复制')
 const setupCopyText = ref('复制')
@@ -97,15 +87,8 @@ async function copyPromptContent() {
 }
 
 // 组件挂载时加载MCP工具配置
-onMounted(async () => {
-  if (mcpTools.value.length === 0) {
-    try {
-      await loadMcpTools()
-    }
-    catch (error) {
-      console.error('加载MCP工具配置失败:', error)
-    }
-  }
+onMounted(() => {
+  void ensureMcpToolsLoaded()
 })
 </script>
 
@@ -115,6 +98,38 @@ onMounted(async () => {
       vertical
       size="medium"
     >
+      <!-- 两个最常用的入口：接入 AI 客户端、连接 iPhone，直接跳到设置里对应的那一项 -->
+      <div class="entry-grid">
+        <button type="button" class="entry-card" @click="openGuide('clients')">
+          <div class="entry-card__icon bg-blue-100 dark:bg-blue-900">
+            <div class="i-carbon-plug text-lg text-blue-600 dark:text-blue-400" />
+          </div>
+          <div class="min-w-0">
+            <div class="entry-card__title">
+              接入 AI 客户端
+            </div>
+            <div class="entry-card__sub">
+              让 Claude Code、Codex、Cursor、Antigravity 通过 iterate 向你提问
+            </div>
+          </div>
+          <div class="i-carbon-chevron-right entry-card__arrow" />
+        </button>
+        <button type="button" class="entry-card" @click="openGuide('iphone')">
+          <div class="entry-card__icon bg-violet-100 dark:bg-violet-900">
+            <div class="i-carbon-mobile text-lg text-violet-600 dark:text-violet-400" />
+          </div>
+          <div class="min-w-0">
+            <div class="entry-card__title">
+              连接 iPhone
+            </div>
+            <div class="entry-card__sub">
+              不在电脑前时，用手机回复这台 Mac 上的任务
+            </div>
+          </div>
+          <div class="i-carbon-chevron-right entry-card__arrow" />
+        </button>
+      </div>
+
       <!-- 使用说明书卡片 -->
       <n-card size="small">
         <template #header>
@@ -144,7 +159,7 @@ onMounted(async () => {
           </div>
           <div class="flex items-center text-sm leading-relaxed">
             <div class="w-1.5 h-1.5 bg-orange-500 rounded-full mr-3 flex-shrink-0" />
-            <span class="opacity-90">日常使用 iterate，把“核心系统提示词”加入 AI 的系统提示中</span>
+            <span class="opacity-90">一键接入后已能连续调用 iterate；手动配置的客户端，把“核心系统提示词”加入 AI 的系统提示中</span>
           </div>
           <div class="flex items-center text-sm leading-relaxed">
             <div class="w-1.5 h-1.5 bg-green-500 rounded-full mr-3 flex-shrink-0" />
@@ -358,3 +373,54 @@ onMounted(async () => {
     </n-space>
   </div>
 </template>
+
+<style scoped>
+.entry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+.entry-card {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(127, 127, 127, 0.2);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.entry-card:hover {
+  border-color: rgba(127, 127, 127, 0.45);
+  background: rgba(127, 127, 127, 0.05);
+}
+.entry-card:focus-visible {
+  outline: 2px solid #18a058;
+  outline-offset: 2px;
+}
+.entry-card__icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.entry-card__title {
+  font-size: 15px;
+  font-weight: 500;
+}
+.entry-card__sub {
+  margin-top: 2px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+.entry-card__arrow {
+  opacity: 0.4;
+}
+</style>

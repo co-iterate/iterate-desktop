@@ -107,6 +107,7 @@ scripts/**/node_modules/
 !cunzhimemory/
 !.cunzhi-knowledge/
 !.cunzhi-knowledge/rules/00-global.md
+!src/rust/assets/knowledge-starter/**/*.md
 
 # ===========================================
 # cunzhi 知识库保护规则
@@ -208,3 +209,6 @@ jailbreak/**/packages/
 /bin/managed-frpc
 /bin/managed-proxy
 /bin/managed-resources.json
+
+# Xcode DerivedData built inside the worktree
+/.dd/

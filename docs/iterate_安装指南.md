@@ -34,6 +34,7 @@
 - 首次安装时，脚本会检查 Microsoft WebView2 Runtime
 - 如果系统里没有，安装脚本会自动下载安装
 - 这一步需要联网
+- 安装后打开 iterate「设置 → AI 客户端」一键接入 Codex / Claude Code / Cursor；手动配过的 Codex，iterate 启动时会自动补上长等待
 
 ## 4. 如果安装卡住了
 
@@ -76,7 +77,9 @@ AI 会继续帮你：
 安装完成后，根据客户端类型完成 MCP 配置：
 - 如果是 Windsurf，检查并配置 `~/.codeium/windsurf/mcp_config.json`
 - 如果是 Codex，检查并配置 `~/.codex/config.toml`
-- 如果配置的是 `iterate-zhi`、`call_zhi` 这类需要长期等待用户输入的交互型 MCP，建议显式保留 `tool_timeout_sec = 315360000`，作为近似无限等待配置
+- 如果是 Codex，`iterate-zhi` 必须加 `tool_timeout_sec = 315360000`：Codex 默认只等 60 秒，超时后弹窗里点发送也送不回去
+- Windows 上 MCP command 是 `%LOCALAPPDATA%\iterate\bin\mcp-server.exe`（写进配置时展开成真实路径）
+- 最省事：iterate「设置 → AI 客户端」一键接入，会自动写好路径、长等待和调用规则
 - 如果是其他客户端，先确认该客户端的 MCP 配置位置和格式，再做最小改动
 
 ### 第四步：验证

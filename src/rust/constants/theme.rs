@@ -1,7 +1,7 @@
 // 主题相关常量
 
-/// 默认主题
-pub const DEFAULT: &str = "dark";
+/// 默认主题（新用户首次打开为浅色）
+pub const DEFAULT: &str = "light";
 
 /// 浅色主题
 pub const LIGHT: &str = "light";
