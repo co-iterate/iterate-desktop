@@ -1,4 +1,8 @@
 <p align="center">
+  <a href="README.en.md">English</a> | <strong>中文</strong>
+</p>
+
+<p align="center">
   <a href="https://iterate.xin/"><img src="assets/iterate-desktop-hero-zh.png" alt="iterate：让 AI 协作不断线" width="100%"></a>
 </p>
 
@@ -22,7 +26,7 @@
 </sub></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.4-blue?style=flat" alt="Source version 0.6.4">
+  <img src="https://img.shields.io/badge/version-0.7.2-blue?style=flat" alt="Source version 0.7.2">
   <a href="https://github.com/kexin94yyds/iterate-releases/releases/latest"><img src="https://img.shields.io/github/v/release/kexin94yyds/iterate-releases?style=flat&amp;label=release&amp;color=111111" alt="Latest release"></a>
   <a href="https://github.com/kexin94yyds/iterate-releases/releases"><img src="https://img.shields.io/github/downloads/kexin94yyds/iterate-releases/total?style=flat&amp;label=downloads&amp;color=111111" alt="Total downloads"></a>
   <a href="https://github.com/co-iterate/iterate-desktop"><img src="https://img.shields.io/github/stars/co-iterate/iterate-desktop?style=flat&amp;label=stars&amp;color=08A67A" alt="GitHub stars"></a>

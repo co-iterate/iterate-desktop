@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "project": "iterate",
   "distribution": "desktop-source",
-  "sourceCommit": "a07a3a51d5e6b754ad6278f0c0c8255f2a2337e1",
+  "sourceCommit": "f53805518e1a2ebe845baffee7bcdd9c30f9e4ff",
   "dirty": false,
-  "manifestSha256": "ee4397b014010e6ec9259567901137fdbfd9990c5a6af0c415c4503ca55cebca",
-  "fileCount": 602,
+  "manifestSha256": "c5dc33a08b7a90b6bdf76a8b171c12aee12db517b7ef65ccca74f0041df75b91",
+  "fileCount": 604,
   "prunedPackageScripts": [
     "android:init",
     "android:dev",

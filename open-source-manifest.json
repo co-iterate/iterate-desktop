@@ -35,6 +35,7 @@
     "NOTICE",
     "PRIVACY.md",
     "README.md",
+    "README.en.md",
     "SECURITY.md",
     "SUPPORT.md",
     "THIRD_PARTY_NOTICES.md",
@@ -149,6 +150,7 @@
     "assets/iterate-desktop-hero-zh.png",
     "assets/iterate-desktop-interceptor-zh.png",
     "assets/iterate-mobile-interceptor-zh.png",
+    "assets/iterate-desktop-popup-en.png",
     "scripts/windows-runtime-stress.ps1",
     "scripts/windows-watchdog-smoke.ps1",
     "resources/windows-test.manifest",
@@ -246,6 +248,7 @@
     "NOTICE",
     "PRIVACY.md",
     "README.md",
+    "README.en.md",
     "SECURITY.md",
     "SUPPORT.md",
     "THIRD_PARTY_NOTICES.md",
@@ -278,7 +281,8 @@
     "assets/community-wechat-group.png",
     "assets/iterate-desktop-hero-zh.png",
     "assets/iterate-desktop-interceptor-zh.png",
-    "assets/iterate-mobile-interceptor-zh.png"
+    "assets/iterate-mobile-interceptor-zh.png",
+    "assets/iterate-desktop-popup-en.png"
   ],
   "binaryAllowPrefixes": [
     "icons/",
